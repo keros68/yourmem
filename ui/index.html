@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>yourmem</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="layout">
+    <nav id="sidebar">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <span class="brand-name">yourmem</span>
+      </div>
+      <div class="brand-sub">本地 Agent 记忆库</div>
+      <button class="nav active" data-page="today">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="3"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+        <span class="lbl"><span class="zh">今天</span><span class="en">Today</span></span>
+      </button>
+      <button class="nav" data-page="projects">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        <span class="lbl"><span class="zh">项目</span><span class="en">Projects</span></span>
+      </button>
+      <button class="nav" data-page="sessions">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span class="lbl"><span class="zh">对话</span><span class="en">Sessions</span></span>
+      </button>
+      <button class="nav" data-page="memory">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.4 1 2.3h6c0-.9.4-1.8 1-2.3A7 7 0 0 0 12 2z"/></svg>
+        <span class="lbl"><span class="zh">记忆</span><span class="en">Memory</span></span>
+      </button>
+      <button class="nav" data-page="search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <span class="lbl"><span class="zh">搜索</span><span class="en">Search</span></span>
+      </button>
+      <button class="nav" data-page="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span class="lbl"><span class="zh">设置</span><span class="en">Settings</span></span>
+      </button>
+      <div class="spacer"></div>
+      <button id="btn-import" title="采集新对话 Import new sessions">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        <span>采集新对话</span>
+      </button>
+    </nav>
+    <main id="main">
+      <section id="page-today" class="page active"></section>
+      <section id="page-projects" class="page"></section>
+      <section id="page-sessions" class="page"></section>
+      <section id="page-memory" class="page"></section>
+      <section id="page-search" class="page"></section>
+      <section id="page-settings" class="page"></section>
+    </main>
+  </div>
+  <div id="drawer" class="hidden">
+    <div id="drawer-backdrop"></div>
+    <div id="drawer-panel">
+      <button id="drawer-close">✕</button>
+      <div id="drawer-content"></div>
+    </div>
+  </div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

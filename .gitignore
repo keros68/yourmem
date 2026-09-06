@@ -1,0 +1,11 @@
+/target
+.sandbox/
+src-tauri/target
+src-tauri/target-test
+src-tauri/gen
+
+# 内部工作文档不上公开库（2026-09-06 公开库最小面；本地保留勿删，历史见 archive/full-history）
+docs/*
+!docs/WINDOWS.md
+AGENTS.md
+/.cargo/

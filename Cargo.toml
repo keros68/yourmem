@@ -1,0 +1,26 @@
+[package]
+name = "yourmem"
+version = "1.0.3"
+edition = "2021"
+description = "Local-first session vault, memory and recall for AI coding agents"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+flate2 = "1.1.9"      # bundle .tar.gz（DESIGN-0.3 §5.1 登记）
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4.46"        # bundle .tar.gz（DESIGN-0.3 §5.1 登记）
+tempfile = "3"        # bundle 打包/解包 + 各模块暂存目录
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true
