@@ -4,19 +4,19 @@
 
 use std::process::Command;
 
-/// 精确子串黑名单：真名/邮箱/本机路径/内部课题词（含 Rust 源码转义形态）
+/// 精确子串黑名单：占位身份/邮箱/本机路径/内部课题词（含 Rust 源码转义形态）
 const DENY_SUBSTRINGS: &[&str] = &[
-    "guoxiaoyu",
-    "Xiaoyu Guo",
-    "keros68@gmail.com",
-    "C:\\Users\\keros68",
-    "C:\\\\Users\\\\keros68",
-    "C:/Users/keros68",
-    "/c/Users/keros68",
-    "/Users/guoxiaoyu",
-    "work\\yourmem",
-    "work\\\\yourmem",
-    "work/yourmem",
+    "example-user",
+    "Example User",
+    "person@example.invalid",
+    "C:\\Users\\example-user",
+    "C:\\\\Users\\\\example-user",
+    "C:/Users/example-user",
+    "/c/Users/example-user",
+    "/Users/example-user",
+    "workspace\\example-project",
+    "workspace\\\\example-project",
+    "workspace/example-project",
     "大同",
     "盐渍",
     "salinity",
@@ -26,9 +26,9 @@ const DENY_SUBSTRINGS: &[&str] = &[
 const PATH_PREFIXES: [&str; 4] = ["/Users/", "C:\\Users\\", "C:/Users/", "/c/Users/"];
 const ALLOW_USERS: &[&str] = &["test", "devuser", "a", "x", "user"];
 
-/// keros68 是公开 GitHub 用户名，唯一合法形态是仓库 slug（update 检查用）
-fn keros68_violation(line: &str) -> bool {
-    line.contains("keros68") && !line.contains("keros68/yourmem")
+/// 示例 owner 只允许出现在仓库 slug 中（模拟 update 检查用）
+fn example_owner_violation(line: &str) -> bool {
+    line.contains("example-owner") && !line.contains("example-owner/yourmem")
 }
 
 fn personal_path_hit(line: &str) -> Option<String> {
@@ -70,6 +70,10 @@ fn tracked_files_carry_no_personal_data() {
 
     let mut hits: Vec<String> = Vec::new();
     for file in &files {
+        // 该文件本身保存黑名单样例，不能把样例文本当成泄露命中。
+        if file == "tests/privacy.rs" {
+            continue;
+        }
         let Ok(content) = std::fs::read_to_string(file) else { continue };
         for (idx, line) in content.lines().enumerate() {
             for pat in DENY_SUBSTRINGS {
@@ -77,8 +81,8 @@ fn tracked_files_carry_no_personal_data() {
                     hits.push(format!("{file}:{} 含 \"{pat}\"", idx + 1));
                 }
             }
-            if keros68_violation(line) {
-                hits.push(format!("{file}:{} 含未白名单化的 keros68", idx + 1));
+            if example_owner_violation(line) {
+                hits.push(format!("{file}:{} 含未白名单化的 example-owner", idx + 1));
             }
             if let Some(desc) = personal_path_hit(line) {
                 hits.push(format!("{file}:{} {desc}", idx + 1));
