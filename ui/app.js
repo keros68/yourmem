@@ -1,6 +1,7 @@
 import { loadProjectRecall } from "./project-recall.js";
 import { graphDepths } from "./graph-layout.js";
 import { createSessionDrawer } from "./session-drawer.js";
+import { snapshotPanelHtml, bindSnapshotPanel } from "./snapshot-panel.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -907,6 +908,7 @@ async function renderSettings() {
           <span id="tools-index-state" style="color:var(--faint);font-size:12px">已索引 ${idx.indexed_tool_rows} / ${idx.tool_messages} 行</span>
         </div>
       </div>
+      ${snapshotPanelHtml()}
       <h2>完整备份与恢复</h2>
       <div class="memcard">
         <div class="meta" style="margin-top:0">完整备份包含数据库和引用的原始记录，保存为 .tar.gz；单独的数据库快照不足以恢复原件。</div>
@@ -1237,6 +1239,7 @@ async function renderSettings() {
       box.disabled = false;
     }
   };
+  bindSnapshotPanel({ invoke, root: $("#page-settings"), bundleInput: $("#bundle-path"), esc });
   snapScrollboxTables($("#page-settings"));
 }
 

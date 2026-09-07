@@ -19,6 +19,7 @@ pub mod restore;
 pub mod recall_status;
 pub mod project_review;
 pub mod setup;
+pub mod snapshots;
 pub mod update;
 pub mod trash;
 pub mod vault;

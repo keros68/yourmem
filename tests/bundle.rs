@@ -33,8 +33,14 @@ fn bundle_roundtrip_fresh_home() {
     let bundle_path = home.path().join("move.tar.gz");
 
     // create
-    let manifest = bundle::create(&conn, home.path(), &bundle_path, &bundle::BundleFilter::default()).unwrap();
-    assert_eq!(manifest["format_version"], 1);
+    let manifest = bundle::create(
+        &conn,
+        home.path(),
+        &bundle_path,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
+    assert_eq!(manifest["format_version"], bundle::FORMAT_VERSION);
     assert!(manifest["schema_version"].as_i64().unwrap() >= 2);
     assert!(manifest["objects"].as_u64().unwrap() > 0);
 
@@ -831,6 +837,53 @@ fn rewrite_bundle(path: &std::path::Path, change: impl FnOnce(&std::path::Path, 
     let mut archive = tar::Builder::new(enc);
     archive.append_dir_all(root.file_name().unwrap(), &root).unwrap();
     archive.into_inner().unwrap().finish().unwrap();
+}
+
+#[test]
+fn legacy_v1_bundle_still_restores_and_new_bundle_omits_only_derived_indexes() {
+    let (home, _src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    let out = home.path().join("legacy.tar.gz");
+    bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
+    rewrite_bundle(&out, |root, snap| {
+        assert_eq!(
+            snap.query_row("SELECT count(*) FROM messages_fts_docsize", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            snap.query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            4
+        );
+        snap.execute_batch("INSERT INTO messages_fts(rowid,content) SELECT id,content FROM messages WHERE kind <> 'tool_result';
+            INSERT INTO memories_fts(memories_fts) VALUES('rebuild');").unwrap();
+        let p = root.join("manifest.json");
+        let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        m["format_version"] = serde_json::json!(1);
+        m.as_object_mut().unwrap().remove("indexes_omitted");
+        std::fs::write(p, serde_json::to_vec(&m).unwrap()).unwrap();
+    });
+    assert_eq!(bundle::verify(&out).unwrap()["ok"], true);
+    let target = tempfile::tempdir().unwrap();
+    bundle::restore(&out, target.path(), false).unwrap();
+    let c = db::open(target.path()).unwrap();
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH '第一个'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM messages_fts_docsize", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
 }
 
 #[test]

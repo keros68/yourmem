@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::{db, vault};
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Default, Clone)]
 pub struct BundleFilter {
@@ -57,6 +57,7 @@ pub fn create(conn: &Connection, home: &Path, out: &Path, filter: &BundleFilter)
     if !filter.is_empty() {
         filter_report = prune_snapshot(&snap_path, filter)?;
     }
+    strip_indexes(&snap_path)?;
 
     // 3. Copy only the objects still referenced by the (pruned) snapshot.
     let snap = Connection::open_with_flags(&snap_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -95,6 +96,7 @@ pub fn create(conn: &Connection, home: &Path, out: &Path, filter: &BundleFilter)
         "objects": objects,
         "objects_bytes": bytes,
         "filter": filter_report,
+        "indexes_omitted": true,
     });
     std::fs::write(root.join("manifest.json"), serde_json::to_string_pretty(&manifest)?)?;
 
@@ -267,7 +269,44 @@ fn prune_snapshot(snap_path: &Path, filter: &BundleFilter) -> Result<Value> {
 }
 
 /// Hashes still referenced by a (possibly pruned) snapshot.
-fn referenced_hashes(conn: &Connection) -> Result<HashSet<String>> {
+pub(crate) fn strip_indexes(path: &Path) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch(
+        "PRAGMA secure_delete=ON;
+        INSERT INTO messages_fts(messages_fts) VALUES('delete-all');
+        INSERT INTO messages_tools_fts(messages_tools_fts) VALUES('delete-all');
+        INSERT INTO memories_fts(memories_fts) VALUES('delete-all');
+        DELETE FROM memory_fts;
+        VACUUM;",
+    )?;
+    Ok(())
+}
+
+fn rebuild_indexes(path: &Path, object_home: &Path) -> Result<()> {
+    let mut conn = Connection::open(path)?;
+    let full = db::tool_index_enabled(&conn)?;
+    let tx = conn.transaction()?;
+    tx.execute_batch("INSERT INTO messages_fts(messages_fts) VALUES('delete-all');
+        INSERT INTO messages_tools_fts(messages_tools_fts) VALUES('delete-all');
+        INSERT INTO messages_fts(rowid,content) SELECT id,content FROM messages WHERE kind <> 'tool_result';
+        INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
+        DELETE FROM memory_fts;")?;
+    if full {
+        tx.execute("INSERT INTO messages_tools_fts(rowid,content) SELECT id,content FROM messages WHERE kind='tool_result'", [])?;
+    }
+    let rows = tx
+        .prepare("SELECT id,current_hash FROM memory_files")?
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (id, hash) in rows {
+        let bytes = vault::read_object(object_home, &hash, true)?;
+        db::set_memory_fts(&tx, id, std::str::from_utf8(&bytes)?)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn referenced_hashes(conn: &Connection) -> Result<HashSet<String>> {
     let mut keep = HashSet::new();
     for sql in ["SELECT DISTINCT hash FROM vault_lines", "SELECT DISTINCT hash FROM memory_revisions"] {
         let mut stmt = conn.prepare(sql)?;
@@ -307,7 +346,7 @@ fn extract(bundle: &Path) -> Result<(tempfile::TempDir, BundleLayout)> {
     let manifest_path = found.with_context(|| "bundle 里没有 manifest.json")?;
     let manifest: Value = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
     anyhow::ensure!(
-        manifest["format_version"].as_u64() == Some(FORMAT_VERSION as u64),
+        matches!(manifest["format_version"].as_u64(), Some(1 | 2)),
         "unsupported bundle format_version: {}",
         manifest["format_version"]
     );
@@ -452,8 +491,20 @@ pub fn restore(bundle: &Path, target_home: &Path, merge: bool) -> Result<Value> 
         "bundle schema_version {bundle_schema} 比本程序（{}）新——请先升级 yourmem",
         db::SCHEMA_VERSION
     );
-    let src_db_path = layout.root.join("db").join(layout.manifest["db_snapshot"].as_str().unwrap());
-    let _lock = crate::ingest::ImportLockTx::acquire(target_home, std::time::Duration::from_secs(120))?;
+    let src_db_path = layout
+        .root
+        .join("db")
+        .join(layout.manifest["db_snapshot"].as_str().unwrap());
+    if layout.manifest["indexes_omitted"] == true {
+        anyhow::ensure!(
+            layout.manifest["format_version"] == 2,
+            "索引省略标记需要备份格式 v2"
+        );
+        rebuild_indexes(&src_db_path, &layout.root)?;
+    }
+    std::fs::create_dir_all(target_home)?;
+    let _lock =
+        crate::ingest::ImportLockTx::acquire(target_home, std::time::Duration::from_secs(120))?;
 
     if !merge {
         let target_db = target_home.join("yourmem.db");

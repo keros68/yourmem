@@ -5105,7 +5105,7 @@ dependencies = [
 
 [[package]]
 name = "yourmem"
-version = "1.0.4"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5123,7 +5123,7 @@ dependencies = [
 
 [[package]]
 name = "yourmem-app"
-version = "1.0.4"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "chrono",

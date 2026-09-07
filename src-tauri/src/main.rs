@@ -847,6 +847,31 @@ fn purge_archive_clear() -> Result<Value, String> {
     Ok(json!({ "removed": removed }))
 }
 
+#[tauri::command]
+async fn snapshot_list() -> Result<Value, String> {
+    run_blocking(|| yourmem::snapshots::list(&data_home()).map_err(|e| format!("{e:#}"))).await
+}
+#[tauri::command]
+async fn snapshot_create() -> Result<Value, String> {
+    run_blocking(|| yourmem::snapshots::create(&data_home()).map_err(|e| format!("{e:#}"))).await
+}
+#[tauri::command]
+async fn snapshot_export(id: String) -> Result<Value, String> {
+    run_blocking(move || {
+        let home = data_home();
+        let out = yourmem::backups_dir(&home).join("export").join(format!("snapshot-{id}.tar.gz"));
+        yourmem::snapshots::export(&home, &id, &out).map_err(|e|format!("{e:#}"))
+    }).await
+}
+#[tauri::command]
+async fn snapshot_cleanup_plan(keep_recent: usize, keep_monthly: usize) -> Result<Value, String> {
+    run_blocking(move || yourmem::snapshots::cleanup_plan(&data_home(),keep_recent,keep_monthly).map_err(|e|format!("{e:#}"))).await
+}
+#[tauri::command]
+async fn snapshot_cleanup(keep_recent: usize, keep_monthly: usize, token: String) -> Result<Value, String> {
+    run_blocking(move || yourmem::snapshots::cleanup(&data_home(),keep_recent,keep_monthly,&token).map_err(|e|format!("{e:#}"))).await
+}
+
 fn main() {
     // 参数路由先行：安装包主程序名与 CLI 同名（productName），无法也不必靠
     // 文件名区分身份——app 本体直接兼任 agent 端点。`mcp` 进 stdio 服务
@@ -913,6 +938,7 @@ fn main() {
             memory_files, memory_file_show,
             agents_detect, agent_add_root, agent_remove_root,
             bundle_create, bundle_verify, bundle_restore, project_review, setup_plan, setup_run, app_info,
+            snapshot_list, snapshot_create, snapshot_export, snapshot_cleanup_plan, snapshot_cleanup,
             doctor,
             index_status, index_set_tools, storage_usage, compact_db,
         ])

@@ -76,6 +76,10 @@ yourmem 提供 MCP 接口。接入后，可以在任意受支持的 AI 编程助
 
 数据目录默认为 `~/.yourmem`，可用环境变量 `YOUMEM_HOME` 修改。数据库快照、导出文件等备份可以在设置中指定到其他磁盘。原始归档对象仍保存在数据目录；异盘完整备份需使用“创建备份”，同时保存数据库和原始记录。
 
+设置 → 备份中的“日常增量快照”在备份目录的 `snapshots-v1` 中保存压缩数据库与原件。不同日期的快照共享相同原件，每份变化后的数据库仍完整保存；原件独立于正式资料库，因此需要整体保存快照仓库。按保留规则清理前会先展示计划并要求再次确认。迁移或恢复时，选择快照导出独立完整备份，再执行校验与恢复。
+
+1.1.0 起创建及导出的完整备份采用 v2 格式，省略可重建的搜索索引，恢复时重建。恢复新包需要 1.1.0 或更新版本；原有 v1 备份仍可恢复。已有备份不会自动转换或删除。
+
 yourmem 日常只读取各 AI 编程助手的原始数据。只有以下操作会写入原工具的数据目录或配置：
 
 - 一键接入；
@@ -99,6 +103,10 @@ yourmem session trash                  # 查看回收站
 yourmem memory add --type decision --content "结论"
 yourmem backup db                      # 创建数据库快照
 yourmem bundle create -o yourmem.tar.gz
+yourmem snapshot create                # 创建日常增量快照
+yourmem snapshot list                  # 查看快照及仓库占用
+yourmem snapshot export <ID> -o move.tar.gz
+yourmem snapshot plan --keep-recent 7 --keep-monthly 6
 yourmem doctor                         # 本地自检
 ```
 

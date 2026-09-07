@@ -117,6 +117,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BundleCmd,
     },
+    /// Daily snapshots sharing compressed objects in the backup directory.
+    Snapshot {
+        #[command(subcommand)]
+        cmd: SnapshotCmd,
+    },
     /// 写回 agent 数据目录（一次性迁移，知情门控：预览→确认→备份→执行）。
     /// 仅限文件型 agent（claude/codex）；opencode 等 SQLite 型不支持写回。
     RestoreAgents {
@@ -364,6 +369,31 @@ enum HandoffCmd {
 }
 
 #[derive(Subcommand)]
+enum SnapshotCmd {
+    Create,
+    List,
+    Export {
+        id: String,
+        #[arg(short, long)]
+        out: PathBuf,
+    },
+    Plan {
+        #[arg(long, default_value = "7")]
+        keep_recent: usize,
+        #[arg(long, default_value = "6")]
+        keep_monthly: usize,
+    },
+    Cleanup {
+        #[arg(long, default_value = "7")]
+        keep_recent: usize,
+        #[arg(long, default_value = "6")]
+        keep_monthly: usize,
+        #[arg(long)]
+        token: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum BundleCmd {
     /// Create a bundle (.tar.gz): DB snapshot + referenced CAS objects.
     Create {
@@ -478,6 +508,7 @@ fn main() -> Result<()> {
         Cmd::Handoff { .. } => "handoff",
         Cmd::Backup { .. } => "backup",
         Cmd::Bundle { .. } => "bundle",
+        Cmd::Snapshot { .. } => "snapshot",
         Cmd::RestoreAgents { .. } => "restore-agents",
         Cmd::Setup { .. } => "setup",
         Cmd::Agents { .. } => "agents",
@@ -491,7 +522,14 @@ fn main() -> Result<()> {
         Cmd::Doctor => "doctor",
         Cmd::Mcp => "mcp",
     };
-    if !matches!(cli.cmd, Cmd::Mcp | Cmd::Bundle { cmd: BundleCmd::Restore { .. } }) {
+    if !matches!(
+        cli.cmd,
+        Cmd::Mcp
+            | Cmd::Snapshot { .. }
+            | Cmd::Bundle {
+                cmd: BundleCmd::Restore { .. }
+            }
+    ) {
         if let Ok(conn) = db::open(&home) {
             let _ = db::log_usage(&conn, "cli", cmd_name);
         }
@@ -804,6 +842,24 @@ fn main() -> Result<()> {
             }
         }
 
+        Cmd::Snapshot { cmd } => {
+            use yourmem::snapshots;
+            let result = match cmd {
+                SnapshotCmd::Create => snapshots::create(&home)?,
+                SnapshotCmd::List => snapshots::list(&home)?,
+                SnapshotCmd::Export { id, out } => snapshots::export(&home, &id, &out)?,
+                SnapshotCmd::Plan {
+                    keep_recent,
+                    keep_monthly,
+                } => snapshots::cleanup_plan(&home, keep_recent, keep_monthly)?,
+                SnapshotCmd::Cleanup {
+                    keep_recent,
+                    keep_monthly,
+                    token,
+                } => snapshots::cleanup(&home, keep_recent, keep_monthly, &token)?,
+            };
+            print_json(&result);
+        }
         Cmd::Bundle { cmd } => match cmd {
             BundleCmd::Create { out, agent, project } => {
                 let conn = db::open(&home)?;
