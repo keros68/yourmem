@@ -139,3 +139,28 @@ test('search discloses the effective index scope', async () => {
   assert.match(f.get('#q-scope').textContent, /少于 3 字/);
   assert.match(f.get('#page-search').innerHTML, /20 万字符/);
 });
+
+test('backup picker cancels without changes and selected backup clears merge confirmation', async () => {
+  const f = app(); f.bindBundleForTest();
+  f.get('#bundle-path').value = 'old.tar.gz';
+  const canceled = f.get('#bundle-path-pick').onclick();
+  assert.equal(f.get('#bundle-restore').disabled, true);
+  f.requests.at(-1).resolve(null); await canceled;
+  assert.equal(f.get('#bundle-path').value, 'old.tar.gz');
+  const preview = f.get('#bundle-restore').onclick();
+  const report = { ok: true, manifest: {}, merge_plan: { home: '/test', sessions_added: 1, sessions_replaced: 0, sessions_skipped: 0 } };
+  f.requests.at(-1).resolve(report); await preview;
+  assert.equal(f.get('#bundle-restore').textContent, '确认合并');
+  const selected = f.get('#bundle-path-pick').onclick();
+  f.requests.at(-1).resolve('new.tar.gz'); await selected;
+  assert.equal(f.get('#bundle-restore').textContent, '合并恢复');
+  assert.equal(f.get('#bundle-path').value, 'new.tar.gz');
+  const again = f.get('#bundle-restore').onclick();
+  f.requests.at(-1).resolve(report); await again;
+  assert.ok(!f.requests.some(r => r.command === 'bundle_restore'));
+  const out = f.get('#bundle-out-pick').onclick();
+  assert.equal(f.requests.at(-1).args.save, true);
+  f.requests.at(-1).resolve('output.tar.gz'); await out;
+  assert.equal(f.get('#bundle-out').value, 'output.tar.gz');
+  assert.ok(!f.requests.some(r => r.command === 'bundle_create'));
+});

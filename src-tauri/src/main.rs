@@ -381,7 +381,7 @@ fn suggest_backup_dir() -> Option<String> {
     if !cfg!(target_os = "windows") {
         return None;
     }
-    let out = std::process::Command::new("fsutil")
+    let out = yourmem::background_command("fsutil")
         .args(["fsinfo", "drives"])
         .output()
         .ok()?;
@@ -471,8 +471,8 @@ fn open_url(url: String) -> Result<Value, String> {
         return Err(format!("只支持打开 http(s) 链接"));
     }
     if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
+        std::process::Command::new("explorer")
+            .arg(url)
             .spawn()
     } else if cfg!(target_os = "linux") {
         std::process::Command::new("xdg-open").arg(url).spawn()
@@ -486,6 +486,21 @@ fn open_url(url: String) -> Result<Value, String> {
 /// 备份位置（config.json backup_dir，落点统一走 yourmem::backups_dir）。
 /// configured 是用户填的原文（空 = 未设置），effective 是当前生效路径。
 #[tauri::command]
+async fn backup_dir_pick(window: tauri::WebviewWindow, path: String) -> Result<Value, String> {
+    use tauri_plugin_dialog::DialogExt;
+    run_blocking(move || {
+        let mut dialog = window.dialog().file().set_title("选择文件夹").set_parent(&window);
+        let initial = std::path::PathBuf::from(yourmem::expand_home(path.trim()));
+        if initial.is_absolute() && initial.is_dir() {
+            dialog = dialog.set_directory(initial);
+        }
+        dialog.blocking_pick_folder()
+            .map(|p| p.into_path().map(|p| p.to_string_lossy().into_owned()).map_err(|e| e.to_string()))
+            .transpose().map(|path| json!(path))
+    }).await
+}
+
+#[tauri::command]
 fn backup_dir_get() -> Result<Value, String> {
     let home = data_home();
     let configured = yourmem::ingest::read_config(&home)["backup_dir"]
@@ -494,6 +509,26 @@ fn backup_dir_get() -> Result<Value, String> {
         .to_string();
     let effective = yourmem::backups_dir(&home);
     Ok(json!({ "configured": configured, "effective": effective }))
+}
+
+#[tauri::command]
+async fn bundle_path_pick(window: tauri::WebviewWindow, path: String, save: bool) -> Result<Value, String> {
+    use tauri_plugin_dialog::DialogExt;
+    run_blocking(move || {
+        let mut dialog = window.dialog().file().set_parent(&window)
+            .set_title(if save { "选择备份保存位置" } else { "选择完整备份" })
+            .add_filter("yourmem 备份", &["gz"]);
+        let initial = std::path::PathBuf::from(yourmem::expand_home(path.trim()));
+        if let Some(parent) = initial.parent().filter(|p| p.is_absolute() && p.is_dir()) {
+            dialog = dialog.set_directory(parent);
+        }
+        if save {
+            if let Some(name) = initial.file_name() { dialog = dialog.set_file_name(name.to_string_lossy()); }
+        }
+        let selected = if save { dialog.blocking_save_file() } else { dialog.blocking_pick_file() };
+        selected.map(|p| p.into_path().map_err(|e| e.to_string()))
+            .transpose().map(|p| json!(p))
+    }).await
 }
 
 /// 设置备份位置：空串 = 回到默认（数据目录下的 backups）。目录会自动创建，
@@ -894,6 +929,7 @@ fn main() {
         _ => {}
     }
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             tray::show_main(app);
         }))
@@ -932,7 +968,7 @@ fn main() {
             session_delete, session_restore, trash_list, trash_purge, trash_purge_selected,
             trash_empty_overdue, purge_archives, purge_archive_delete, purge_archive_clear,
             auto_purge_get, auto_purge_set, agent_set_enabled,
-            backup_dir_get, backup_dir_set,
+            backup_dir_get, backup_dir_set, backup_dir_pick, bundle_path_pick,
             first_run_state, update_check, open_url,
             search, memories, update_memory, artifacts, import_now,
             memory_files, memory_file_show,

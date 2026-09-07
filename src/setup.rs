@@ -155,7 +155,7 @@ fn codex_registered_command(content: &str) -> Option<String> {
 /// 带超时强杀：登记的命令可能是 GUI 二进制（真机 2026-08-30：claude.json 曾
 /// 注册过桌面 app，`--version` 会启动窗口且永不退出，无超时则 setup 永久卡死）。
 fn registered_version(cmd: &str) -> Option<String> {
-    let mut child = std::process::Command::new(cmd)
+    let mut child = crate::background_command(cmd)
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

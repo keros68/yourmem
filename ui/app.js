@@ -23,6 +23,19 @@ const toast = (msg) => {
   setTimeout(() => el.remove(), 2500);
 };
 
+function bindFolderPicker(buttonId, inputId, commitId) {
+  const button = $(buttonId), input = $(inputId), commit = $(commitId);
+  button.onclick = async () => {
+    if (button.disabled || commit.disabled) return;
+    button.disabled = commit.disabled = true;
+    try {
+      const path = await invoke("backup_dir_pick", { path: input.value.trim() });
+      if (path !== null && input === $(inputId)) input.value = path;
+    } catch (e) { toast(String(e)); }
+    finally { button.disabled = commit.disabled = false; }
+  };
+}
+
 // scrollbox 内表格的行对齐吸附（用户反馈 2026-08-31：固定 max-height 与行高
 // 不整除，底部裁出半行）——渲染后按实际行高把高度收到「表头 + 整数行」；
 // 内容不满上限时不干预，保持 CSS 里的 max-height。
@@ -179,6 +192,7 @@ async function renderProjects() {
     </h1>
     <div id="proj-add-row" class="inline-add-row hidden">
       <input type="text" id="proj-add-input" placeholder="粘贴项目文件夹的绝对路径（支持 ~）" />
+      <button class="btn small" id="proj-add-pick">选择文件夹</button>
       <button class="btn primary small" id="proj-add-ok">添加</button>
       <button class="btn small" id="proj-add-cancel">取消</button>
     </div>
@@ -214,6 +228,7 @@ async function renderProjects() {
   $("#proj-add-btn").onclick = () => { addRow.classList.remove("hidden"); $("#proj-add-input").focus(); };
   const hideAdd = () => addRow.classList.add("hidden");
   $("#proj-add-cancel").onclick = hideAdd;
+  bindFolderPicker("#proj-add-pick", "#proj-add-input", "#proj-add-ok");
   const submitAdd = async () => {
     const v = $("#proj-add-input").value.trim();
     if (!v) return;
@@ -850,6 +865,7 @@ async function renderSettings() {
             <option value="zcode">zcode</option><option value="kimi">kimi</option>
           </select>
           <input type="text" id="agent-add-path" style="flex:1" placeholder="额外采集根目录（绝对路径，必须已存在）" />
+          <button class="btn" id="agent-add-pick">选择文件夹</button>
           <button class="btn" id="agent-add-btn">添加</button>
         </div>
         <button class="chip" id="toggle-watchlist" style="margin-top:10px">${showWatchlist ? "收起其他 agent 检测" : "展开其他主流 agent 检测"}</button>
@@ -884,8 +900,8 @@ async function renderSettings() {
         <div class="meta" style="margin-top:0">数据库快照、导出原件和删除档案保存到此目录。原始归档对象仍在数据目录，改到其他磁盘后也需创建完整备份。</div>
         <div class="searchbar">
           <input type="text" id="backup-dir" style="flex:1" placeholder="绝对路径，如 D:\\yourmem-backup" value="${esc(bd.configured)}" />
+          <button class="btn" id="backup-dir-pick">选择文件夹</button>
           <button class="btn primary" id="backup-dir-save">保存</button>
-          <button class="btn" id="backup-dir-open">打开位置</button>
         </div>
         <div id="backup-dir-report" class="meta" style="margin-top:8px">当前：${esc(bd.effective)}</div>
       </div>
@@ -914,10 +930,12 @@ async function renderSettings() {
         <div class="meta" style="margin-top:0">完整备份包含数据库和引用的原始记录，保存为 .tar.gz；单独的数据库快照不足以恢复原件。</div>
         <div class="searchbar">
           <input type="text" id="bundle-out" style="flex:1" value="${esc(bd.effective)}/backup-${today}.tar.gz" />
+          <button class="btn" id="bundle-out-pick">选择位置</button>
           <button class="btn primary" id="bundle-create">创建备份</button>
         </div>
         <div class="searchbar">
           <input type="text" id="bundle-path" style="flex:1" placeholder="备份路径（.tar.gz 文件）" />
+          <button class="btn" id="bundle-path-pick">选择备份</button>
           <button class="btn" id="bundle-verify">校验</button>
           <button class="btn danger" id="bundle-restore">合并恢复</button>
         </div>
@@ -997,6 +1015,7 @@ async function renderSettings() {
       renderSettings();
     } catch (e) { toast(String(e)); }
   };
+  bindFolderPicker("#agent-add-pick", "#agent-add-path", "#agent-add-btn");
   document.querySelectorAll("#page-settings [data-agent-toggle]").forEach((box) => {
     box.onchange = async () => {
       try {
@@ -1022,7 +1041,7 @@ async function renderSettings() {
   });
 
   let bundleBusy = false, pendingMerge = null;
-  const bundleButtons = ["#bundle-create", "#bundle-verify", "#bundle-restore", "#bundle-path", "#bundle-out"].map($);
+  const bundleButtons = ["#bundle-create", "#bundle-verify", "#bundle-restore", "#bundle-path", "#bundle-out", "#bundle-out-pick", "#bundle-path-pick"].map($);
   const setBundleBusy = (busy) => {
     bundleBusy = busy;
     bundleButtons.forEach(el => { el.disabled = busy; });
@@ -1032,6 +1051,22 @@ async function renderSettings() {
     $("#bundle-restore").textContent = "合并恢复";
   };
   $("#bundle-path").oninput = clearMerge;
+  for (const [button, target, save] of [["#bundle-out-pick", "#bundle-out", true], ["#bundle-path-pick", "#bundle-path", false]]) {
+    $(button).onclick = async () => {
+      if (bundleBusy) return;
+      const input = $(target), rep = $("#bundle-report");
+      setBundleBusy(true);
+      try {
+        const path = await invoke("bundle_path_pick", { path: input.value.trim(), save });
+        if (path !== null && input === $(target)) {
+          input.value = path;
+          clearMerge();
+          rep.textContent = save ? "已选择保存位置，点击“创建备份”后写入" : "已选择备份，可校验或合并恢复";
+        }
+      } catch (e) { rep.textContent = `选择失败：${String(e)}`; }
+      finally { setBundleBusy(false); }
+    };
+  }
   const bundleFailure = (r) => r.reason || (r.missing_referenced_objects?.length
     ? `缺少 ${r.missing_referenced_objects.length} 个引用对象`
     : r.database_errors?.join("；") || "对象、数据库或版本检查未通过");
@@ -1197,7 +1232,12 @@ async function renderSettings() {
     btn.disabled = true;
     try {
       const r = await invoke("backup_dir_set", { path: $("#backup-dir").value.trim() });
+      const output = $("#bundle-out");
+      const oldPrefix = curBackupDir.replaceAll("\\", "/").replace(/\/$/, "") + "/";
+      const oldOutput = output.value.replaceAll("\\", "/");
+      if (oldOutput.startsWith(oldPrefix)) output.value = r.effective.replace(/[\\/]$/, "") + "/" + oldOutput.slice(oldPrefix.length);
       curBackupDir = r.effective;
+      $("#snapshot-refresh").click();
       rep.textContent = `当前：${r.effective}（之后的备份存这里，原有文件不搬动）`;
       toast("备份位置已保存");
     } catch (e) {
@@ -1206,8 +1246,20 @@ async function renderSettings() {
       btn.disabled = false;
     }
   };
-  $("#backup-dir-open").onclick = () =>
-    invoke("open_in_finder", { path: curBackupDir }).catch((e) => toast(String(e)));
+  $("#backup-dir-pick").onclick = async () => {
+    const btn = $("#backup-dir-pick"), input = $("#backup-dir"), save = $("#backup-dir-save");
+    if (save.disabled) return;
+    btn.disabled = true;
+    save.disabled = true;
+    try {
+      const path = await invoke("backup_dir_pick", { path: input.value.trim() || curBackupDir });
+      if (path !== null && input === $("#backup-dir")) {
+        input.value = path;
+        $("#backup-dir-report").textContent = `已选择：${path}，点击“保存”后生效`;
+      }
+    } catch (e) { toast(String(e)); }
+    finally { btn.disabled = false; save.disabled = false; }
+  };
   $("#storage-compact").onclick = async () => {
     const btn = $("#storage-compact");
     btn.disabled = true;
@@ -1362,6 +1414,7 @@ function showWizard(fr) {
       <p class="meta">数据库快照、导出原件、彻底删除前的档案都存这个目录。留空用默认位置。</p>
       <div class="searchbar">
         <input type="text" id="wiz-backup-dir" style="flex:1" placeholder="绝对路径，如 D:\\yourmem-backup" value="${esc(fr.suggested || "")}" />
+        <button class="btn" id="wiz-pick">选择文件夹</button>
         <button class="btn" id="wiz-default">用默认</button>
       </div>
       <div class="meta" id="wiz-hint" style="margin:6px 0 12px">默认位置：<span id="wiz-default-path"></span></div>
@@ -1372,9 +1425,22 @@ function showWizard(fr) {
     </div>`;
   document.body.appendChild(ov);
   invoke("backup_dir_get").then((bd) => {
-    $("#wiz-default-path").textContent = bd.effective;
+    if (ov.isConnected) $("#wiz-default-path").textContent = bd.effective;
   }).catch(() => {});
   const close = () => ov.remove();
+  $("#wiz-pick").onclick = async () => {
+    const input = $("#wiz-backup-dir"), hint = $("#wiz-hint");
+    const buttons = ["#wiz-pick", "#wiz-done", "#wiz-skip", "#wiz-default"].map($);
+    buttons.forEach(b => { b.disabled = true; });
+    try {
+      const path = await invoke("backup_dir_pick", { path: input.value.trim() || fr.backup_dir || "" });
+      if (path !== null && ov.isConnected) {
+        input.value = path;
+        hint.textContent = "已选择文件夹，保存后生效";
+      }
+    } catch (e) { if (ov.isConnected) hint.textContent = `选择失败：${String(e)}`; }
+    finally { buttons.forEach(b => { b.disabled = false; }); }
+  };
   $("#wiz-default").onclick = () => { $("#wiz-backup-dir").value = ""; };
   $("#wiz-backup-dir").onkeydown = (e) => { if (e.key === "Enter") $("#wiz-done").click(); };
   $("#wiz-skip").onclick = () => { close(); toast("使用默认备份位置，之后可在 设置 → 备份 修改"); };
@@ -1710,7 +1776,7 @@ ctxOn("#projects-table tr[data-pid]", (el) => {
     { label: "打开卷宗", fn: () => showProject(pid) },
     { label: "复制项目名", fn: () => ctxCopy(name) },
     path && { label: "复制项目路径", fn: () => ctxCopy(path) },
-    path && { label: "在访达中打开", fn: () => invoke("open_in_finder", { path, reveal: false }).catch((e) => toast(String(e))) },
+    path && { label: "打开文件夹", fn: () => invoke("open_in_finder", { path, reveal: false }).catch((e) => toast(String(e))) },
     { sep: true },
     { label: "废弃项目（可恢复）", danger: true, fn: async () => {
         try { await invoke("project_archive", { id: pid }); toast("已废弃，可在已废弃列表恢复"); renderProjects(); }
@@ -1747,7 +1813,7 @@ ctxOn(".memcard", (el) => {
 // 带路径的元素（卷宗 artifact 等）：复制 / 访达定位
 ctxOn("[data-path]", (el) => [
   { label: "复制路径", fn: () => ctxCopy(el.dataset.path) },
-  { label: "在访达中显示", fn: () => invoke("open_in_finder", { path: el.dataset.path, reveal: true }).catch((e) => toast(String(e))) },
+  { label: "定位文件", fn: () => invoke("open_in_finder", { path: el.dataset.path, reveal: true }).catch((e) => toast(String(e))) },
 ]);
 
 

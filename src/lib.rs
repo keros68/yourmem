@@ -26,6 +26,18 @@ pub mod vault;
 
 use std::path::{Path, PathBuf};
 
+/// Background utilities must not create a console window in the desktop app.
+pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    command.stdin(std::process::Stdio::null());
+    command
+}
+
 /// Data home: `$YOUMEM_HOME` or `~/.yourmem`.
 pub fn data_home() -> PathBuf {
     if let Ok(p) = std::env::var("YOUMEM_HOME") {

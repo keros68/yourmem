@@ -12,7 +12,7 @@ const RELEASE_REPO: &str = "keros68/yourmem";
 /// 最新 release 的 tag / 发布页 / 发布时间（公开 API 瘦身后的结果）。
 pub fn latest_release() -> Result<Value> {
     let url = format!("https://api.github.com/repos/{RELEASE_REPO}/releases/latest");
-    let out = std::process::Command::new("curl")
+    let out = crate::background_command("curl")
         .args([
             "-sfSL",
             "--max-time",
