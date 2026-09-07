@@ -34,6 +34,7 @@ impl BundleFilter {
 
 /// Create a bundle at `out` (a .tar.gz path). Returns the manifest.
 pub fn create(conn: &Connection, home: &Path, out: &Path, filter: &BundleFilter) -> Result<Value> {
+    let _lock = crate::ingest::ImportLockTx::acquire(home, std::time::Duration::from_secs(120))?;
     let staging = tempfile::tempdir().context("create staging dir")?;
     let stem = out
         .file_stem()
@@ -101,11 +102,16 @@ pub fn create(conn: &Connection, home: &Path, out: &Path, filter: &BundleFilter)
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::File::create(out)?;
+    // Publish only a complete archive; failed compression must not truncate an older backup.
+    let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut pending = tempfile::NamedTempFile::new_in(parent)?;
+    let file = pending.as_file_mut();
     let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut tar = tar::Builder::new(enc);
     tar.append_dir_all(&stem, &root)?;
     tar.into_inner()?.finish()?;
+    pending.as_file().sync_all()?;
+    pending.persist(out).map_err(|e| e.error)?;
     Ok(manifest)
 }
 
@@ -115,7 +121,7 @@ pub fn create(conn: &Connection, home: &Path, out: &Path, filter: &BundleFilter)
 /// memory_revisions → memory_files。
 fn prune_snapshot(snap_path: &Path, filter: &BundleFilter) -> Result<Value> {
     let conn = Connection::open(snap_path)?;
-    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")?;
 
     // 1. 要保留的会话集合（agent 与 project 过滤取交集）
     let mut keep_sessions: Option<HashSet<String>> = None;
@@ -182,7 +188,22 @@ fn prune_snapshot(snap_path: &Path, filter: &BundleFilter) -> Result<Value> {
             params![proj],
         )?;
         conn.execute(
-            &format!("DELETE FROM memories WHERE project_id IS NOT NULL AND project_id NOT IN ({keep_proj})"),
+            &format!("DELETE FROM memories WHERE project_id IS NULL OR project_id NOT IN ({keep_proj})"),
+            params![proj],
+        )?;
+        conn.execute(
+            &format!("DELETE FROM memory_fts WHERE rowid IN (SELECT id FROM memory_files
+                WHERE scope NOT IN (SELECT 'project:' || path FROM projects WHERE id IN ({keep_proj})))"),
+            params![proj],
+        )?;
+        conn.execute(
+            &format!("DELETE FROM memory_revisions WHERE file_id IN (SELECT id FROM memory_files
+                WHERE scope NOT IN (SELECT 'project:' || path FROM projects WHERE id IN ({keep_proj})))"),
+            params![proj],
+        )?;
+        conn.execute(
+            &format!("DELETE FROM memory_files WHERE scope NOT IN
+                (SELECT 'project:' || path FROM projects WHERE id IN ({keep_proj}))"),
             params![proj],
         )?;
         conn.execute(
@@ -227,7 +248,22 @@ fn prune_snapshot(snap_path: &Path, filter: &BundleFilter) -> Result<Value> {
         )?;
         conn.execute("DELETE FROM memory_files WHERE agent != ?1", params![agent])?;
     }
-    Ok(json!({ "agent": filter.agent, "project": filter.project, "sessions_pruned": pruned }))
+    // Filtered archives must not retain deleted text in SQLite free pages or FTS segments.
+    if filter.project.is_some() {
+        conn.execute("DELETE FROM usage_log", [])?;
+    }
+    let full = db::tool_index_enabled(&conn)?;
+    conn.execute_batch("INSERT INTO messages_fts(messages_fts) VALUES ('delete-all');
+        INSERT INTO messages_tools_fts(messages_tools_fts) VALUES ('delete-all');
+        INSERT INTO messages_fts(rowid,content) SELECT id,content FROM messages WHERE kind <> 'tool_result';
+        INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
+        INSERT INTO memory_fts(memory_fts) VALUES ('rebuild');")?;
+    if full {
+        conn.execute("INSERT INTO messages_tools_fts(rowid,content) SELECT id,content FROM messages WHERE kind = 'tool_result'", [])?;
+    }
+    conn.execute_batch("VACUUM;")?;
+    Ok(json!({ "agent": filter.agent, "project": filter.project, "sessions_pruned": pruned,
+        "includes_global_memory": filter.project.is_none() }))
 }
 
 /// Hashes still referenced by a (possibly pruned) snapshot.
@@ -253,7 +289,12 @@ fn extract(bundle: &Path) -> Result<(tempfile::TempDir, BundleLayout)> {
     let file = std::fs::File::open(bundle).with_context(|| format!("open {}", bundle.display()))?;
     let dec = flate2::read::GzDecoder::new(file);
     let mut ar = tar::Archive::new(dec);
-    ar.unpack(tmp.path())?;
+    for entry in ar.entries()? {
+        let mut entry = entry?;
+        let kind = entry.header().entry_type();
+        anyhow::ensure!(kind.is_file() || kind.is_dir(), "bundle 含不支持的链接或特殊文件");
+        anyhow::ensure!(entry.unpack_in(tmp.path())?, "bundle 文件路径越界");
+    }
     // Locate manifest.json (one top-level dir deep by construction, but be lenient).
     let mut found = None;
     for entry in std::fs::read_dir(tmp.path())? {
@@ -270,20 +311,70 @@ fn extract(bundle: &Path) -> Result<(tempfile::TempDir, BundleLayout)> {
         "unsupported bundle format_version: {}",
         manifest["format_version"]
     );
+    let snapshot = manifest["db_snapshot"].as_str().context("bundle 缺少数据库文件名")?;
+    let mut components = Path::new(snapshot).components();
+    anyhow::ensure!(matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none() && !snapshot.contains(['/', '\\']), "非法数据库文件名");
     let root = manifest_path.parent().unwrap().to_path_buf();
     Ok((tmp, BundleLayout { root, manifest }))
 }
 
 /// Verify a bundle: re-hash every object against its content address and
-/// reconcile counts/bytes with the manifest; check the DB snapshot opens.
+/// Reconcile counts, database integrity, schema and referenced object coverage.
 pub fn verify(bundle: &Path) -> Result<Value> {
     let (_tmp, layout) = extract(bundle)?;
+    verify_layout(&layout)
+}
+
+/// Read-only restore preview. Counts use the same message-count conflict rule as merge.
+pub fn restore_plan(bundle: &Path, target_home: &Path) -> Result<Value> {
+    let (_tmp, layout) = extract(bundle)?;
+    let mut report = verify_layout(&layout)?;
+    if report["ok"] != true { return Ok(report); }
+    let schema = report["actual_schema_version"].as_i64().unwrap_or(i64::MAX);
+    if schema > i64::from(db::SCHEMA_VERSION) {
+        report["ok"] = json!(false);
+        report["reason"] = json!("备份来自更新版本，请先升级 yourmem");
+        return Ok(report);
+    }
+    let source = Connection::open_with_flags(
+        layout.root.join("db").join(layout.manifest["db_snapshot"].as_str().unwrap()),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let target_db = target_home.join("yourmem.db");
+    let target = if target_db.is_file() {
+        Some(Connection::open_with_flags(target_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?)
+    } else { None };
+    let mut added = 0u64;
+    let mut replaced = 0u64;
+    let mut skipped = 0u64;
+    let mut stmt = source.prepare("SELECT id, message_count FROM sessions")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let (sid, count) = row?;
+        let existing: Option<i64> = match &target {
+            Some(conn) => conn.query_row("SELECT message_count FROM sessions WHERE id=?1", [&sid], |r| r.get(0)).optional()?,
+            None => None,
+        };
+        match existing {
+            None => added += 1,
+            Some(n) if n < count => replaced += 1,
+            Some(_) => skipped += 1,
+        }
+    }
+    report["merge_plan"] = json!({"home": target_home, "sessions_added": added,
+        "sessions_replaced": replaced, "sessions_skipped": skipped});
+    Ok(report)
+}
+
+fn verify_layout(layout: &BundleLayout) -> Result<Value> {
     let objects_dir = layout.root.join("objects");
+    let mut present = HashSet::new();
     let mut objects = 0u64;
     let mut bytes = 0u64;
     let mut corrupted: Vec<String> = Vec::new();
     if objects_dir.is_dir() {
-        for entry in walkdir::WalkDir::new(&objects_dir).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(&objects_dir) {
+            let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -291,27 +382,58 @@ pub fn verify(bundle: &Path) -> Result<Value> {
             let data = std::fs::read(entry.path())?;
             objects += 1;
             bytes += data.len() as u64;
+            let valid = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if valid && entry.path() == objects_dir.join(&hash[..2]).join(&hash) {
+                present.insert(hash.clone());
+            } else {
+                corrupted.push(hash.clone());
+            }
             if vault::hash_bytes(&data) != hash {
                 corrupted.push(hash);
             }
         }
     }
     let db_file = layout.root.join("db").join(layout.manifest["db_snapshot"].as_str().unwrap_or_default());
-    let db_opens = Connection::open_with_flags(&db_file, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .and_then(|c| c.pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0)))
-        .is_ok();
-
+    let mut db_opens = false;
+    let mut actual_schema = None;
+    let mut database_errors = Vec::new();
+    let mut missing = Vec::new();
+    let inspection = (|| -> Result<()> {
+        let conn = Connection::open_with_flags(&db_file, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db_opens = true;
+        actual_schema = Some(conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?);
+        let mut stmt = conn.prepare("PRAGMA integrity_check")?;
+        for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            let row = row?;
+            if row != "ok" { database_errors.push(row); }
+        }
+        let foreign_key_errors = conn.prepare("PRAGMA foreign_key_check")?.query([])?.next()?.is_some();
+        if foreign_key_errors { database_errors.push("数据库存在外键错误".into()); }
+        for hash in referenced_hashes(&conn)? {
+            if !present.contains(&hash) { missing.push(hash); }
+        }
+        let stale: i64 = conn.query_row("SELECT COUNT(*) FROM memory_files f
+            WHERE NOT EXISTS (SELECT 1 FROM memory_revisions r WHERE r.file_id=f.id AND r.hash=f.current_hash)", [], |r| r.get(0))?;
+        if stale > 0 { database_errors.push(format!("{stale} 个记忆文件缺少当前修订")); }
+        Ok(())
+    })();
+    if let Err(e) = inspection { database_errors.push(e.to_string()); }
+    missing.sort();
     let expected = &layout.manifest;
     let ok = corrupted.is_empty()
         && objects == expected["objects"].as_u64().unwrap_or(u64::MAX)
         && bytes == expected["objects_bytes"].as_u64().unwrap_or(u64::MAX)
-        && db_opens;
+        && db_opens && database_errors.is_empty() && missing.is_empty()
+        && actual_schema == expected["schema_version"].as_i64();
     Ok(json!({
         "ok": ok,
         "objects": objects,
         "objects_bytes": bytes,
         "corrupted": corrupted,
         "db_snapshot_opens": db_opens,
+        "actual_schema_version": actual_schema,
+        "database_errors": database_errors,
+        "missing_referenced_objects": missing,
         "manifest": layout.manifest,
     }))
 }
@@ -319,7 +441,8 @@ pub fn verify(bundle: &Path) -> Result<Value> {
 /// Restore a bundle into `target_home`. Default: fresh home (换电脑场景);
 /// `--merge`: merge into an existing library.
 pub fn restore(bundle: &Path, target_home: &Path, merge: bool) -> Result<Value> {
-    let report = verify(bundle)?;
+    let (_tmp, layout) = extract(bundle)?;
+    let report = verify_layout(&layout)?;
     anyhow::ensure!(report["ok"] == true, "bundle 校验失败：{}", serde_json::to_string_pretty(&report)?);
     // 合并只信自己库的 schema（AGENTS.md）：更新版本产出的 bundle 直接拒绝，
     // 不让列不匹配退化成半路崩出的 SQL 错误。
@@ -329,8 +452,8 @@ pub fn restore(bundle: &Path, target_home: &Path, merge: bool) -> Result<Value> 
         "bundle schema_version {bundle_schema} 比本程序（{}）新——请先升级 yourmem",
         db::SCHEMA_VERSION
     );
-    let (_tmp, layout) = extract(bundle)?;
     let src_db_path = layout.root.join("db").join(layout.manifest["db_snapshot"].as_str().unwrap());
+    let _lock = crate::ingest::ImportLockTx::acquire(target_home, std::time::Duration::from_secs(120))?;
 
     if !merge {
         let target_db = target_home.join("yourmem.db");
@@ -340,8 +463,12 @@ pub fn restore(bundle: &Path, target_home: &Path, merge: bool) -> Result<Value> 
             target_db.display()
         );
         std::fs::create_dir_all(target_home.join("objects"))?;
-        std::fs::copy(&src_db_path, &target_db)?;
-        let copied = copy_objects(&layout.root, target_home)?;
+        let copied = copy_objects(&layout.root, target_home)
+            .context("对象恢复失败，数据库尚未写入；排除磁盘或权限问题后可重试")?;
+        let mut pending = tempfile::NamedTempFile::new_in(target_home)?;
+        std::io::copy(&mut std::fs::File::open(&src_db_path)?, pending.as_file_mut())?;
+        pending.as_file().sync_all()?;
+        pending.persist_noclobber(&target_db).map_err(|e| e.error)?;
         return Ok(json!({
             "mode": "fresh", "home": target_home, "objects_copied": copied,
             "note": "一次性迁移完成；这不是同步，源机器的后续变化不会自动过来。",
@@ -350,42 +477,35 @@ pub fn restore(bundle: &Path, target_home: &Path, merge: bool) -> Result<Value> 
 
     anyhow::ensure!(target_home.join("yourmem.db").is_file(), "--merge 需要目标已有 yourmem 库");
     let conn = db::open(target_home)?;
-    let merged = merge_db(&conn, &src_db_path)?;
-    let copied = copy_objects(&layout.root, target_home)?;
-    // 并入的原生 memory 文件立即可搜（自检 B3 + codex 评审 blocker）：memory_fts
-    // 无触发器、内容在 vault 对象里——merge 不带 fts 行，等对象拷完按最新修订
-    // 回填；merge 更新过 current_hash 的文件强制重建（旧行是旧内容）
-    let stale: Vec<i64> = merged["memory_fts_stale"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
-        .unwrap_or_default();
-    let fts_backfilled = backfill_memory_fts(&conn, target_home, &stale)?;
+    let copied = copy_objects(&layout.root, target_home)
+        .context("对象恢复失败，尚未合并数据库；排除磁盘或权限问题后可重试")?;
+    let merged = merge_db(&conn, &src_db_path, target_home)
+        .context("数据库合并失败，事务已回滚；完整对象保留供重试")?;
     Ok(json!({
         "mode": "merge", "home": target_home, "objects_copied": copied, "merged": merged,
-        "memory_fts_backfilled": fts_backfilled,
+        "memory_fts_backfilled": merged["memory_fts_backfilled"],
         "note": "一次性合并完成；这不是同步，源机器的后续变化不会自动过来。",
     }))
 }
 
-/// Copy bundle objects into a home's CAS store. Content-addressed: existing
-/// objects are skipped untouched (幂等).
+/// Copy complete objects atomically; reuse verified objects and replace damaged copies.
 fn copy_objects(bundle_root: &Path, target_home: &Path) -> Result<u64> {
     let mut copied = 0u64;
     let objects_dir = bundle_root.join("objects");
     if !objects_dir.is_dir() {
         return Ok(0);
     }
-    for entry in walkdir::WalkDir::new(&objects_dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
+    for entry in walkdir::WalkDir::new(&objects_dir) {
+        let entry = entry?;
+        if !entry.file_type().is_file() { continue; }
         let hash = entry.file_name().to_string_lossy().to_string();
         let dst = vault::object_path(target_home, &hash);
-        if dst.exists() {
-            continue;
-        }
+        if dst.is_file() && vault::hash_bytes(&std::fs::read(&dst)?) == hash { continue; }
         std::fs::create_dir_all(dst.parent().unwrap())?;
-        std::fs::copy(entry.path(), &dst)?;
+        let mut pending = tempfile::NamedTempFile::new_in(dst.parent().unwrap())?;
+        std::io::copy(&mut std::fs::File::open(entry.path())?, pending.as_file_mut())?;
+        pending.as_file().sync_all()?;
+        pending.persist(&dst).map_err(|e| e.error)?;
         copied += 1;
     }
     Ok(copied)
@@ -433,12 +553,7 @@ fn backfill_memory_fts(conn: &Connection, home: &Path, force: &[i64]) -> Result<
         match vault::read_object(home, &hash, false) {
             Ok(bytes) => match std::str::from_utf8(&bytes) {
                 Ok(text) => {
-                    // 索引失败不再无声吞掉（codex 评审）：数据已合并、索引是派生物，
-                    // 不阻断恢复，但必须让人看见
-                    if let Err(e) = db::set_memory_fts(conn, fid, text) {
-                        eprintln!("yourmem bundle: memory_fts 回填失败 file {fid}: {e:#}");
-                        continue;
-                    }
+                    db::set_memory_fts(conn, fid, text)?;
                     done += 1;
                 }
                 Err(_) => continue,
@@ -449,7 +564,7 @@ fn backfill_memory_fts(conn: &Connection, home: &Path, force: &[i64]) -> Result<
     Ok(done)
 }
 
-fn merge_db(target: &Connection, src_db: &Path) -> Result<Value> {
+fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
     target.execute("ATTACH DATABASE ?1 AS src", params![src_db.to_string_lossy().as_ref()])?;
     let r = (|| -> Result<Value> {
         let tx = target.unchecked_transaction()?;
@@ -881,6 +996,7 @@ fn merge_db(target: &Connection, src_db: &Path) -> Result<Value> {
             [],
         )?;
 
+        let fts_backfilled = backfill_memory_fts(&tx, home, &fts_stale)?;
         tx.commit()?;
         Ok(json!({
             "sessions_added": sessions_added,
@@ -892,6 +1008,7 @@ fn merge_db(target: &Connection, src_db: &Path) -> Result<Value> {
             "handoffs_added": handoffs_added,
             "memory_revisions_added": memory_revisions_added,
             "memory_fts_stale": fts_stale,
+            "memory_fts_backfilled": fts_backfilled,
         }))
     })();
     target.execute("DETACH DATABASE src", [])?;

@@ -456,6 +456,7 @@ fn native_memory_files_backup() {
     // 的路径用正斜杠——Windows 反斜杠会让 \U 等成为非法 JSON 转义，整行被拒）
     std::fs::create_dir_all(&proj).unwrap();
     std::fs::write(proj.join("CLAUDE.md"), "项目规则：decision 要确认\n").unwrap();
+    std::fs::write(proj.join("AGENTS.md"), "项目 Codex 指令\n").unwrap();
     let enc = proj.to_string_lossy().replace(['/', '\\', ':'], "-");
     let mem_dir = claude_home.join("projects").join(&enc).join("memory");
     std::fs::create_dir_all(&mem_dir).unwrap();
@@ -486,17 +487,17 @@ fn native_memory_files_backup() {
 
     let dirs = memfiles::SourceDirs { claude: claude_home.clone(), codex: codex_home.clone() };
 
-    // 首次采集：4 个文件各一个修订
+    // 首次采集：全局和项目指令及自动记忆各一个修订
     let out = memfiles::collect(&conn, home.path(), &dirs).unwrap();
-    assert_eq!(out.files_monitored, 4);
-    assert_eq!(out.revisions_added, 4);
+    assert_eq!(out.files_monitored, 5);
+    assert_eq!(out.revisions_added, 5);
 
     // 内容没变 → 不产生新修订
     let out = memfiles::collect(&conn, home.path(), &dirs).unwrap();
     assert_eq!(out.revisions_added, 0);
 
     let files = db::list_memory_files(&conn).unwrap();
-    assert_eq!(files.len(), 4);
+    assert_eq!(files.len(), 5);
     let mem_md = files.iter().find(|f| f["path"].as_str().unwrap().ends_with("MEMORY.md")).unwrap();
     assert_eq!(mem_md["agent"], "claude");
     assert!(mem_md["scope"].as_str().unwrap().starts_with("project:"));
@@ -530,7 +531,7 @@ fn native_memory_files_backup() {
     // agent 正在写的文件（UTF-8 被切断）留到下一轮
     std::fs::write(mem_dir.join("partial.md"), [0xe7, 0x9b]).unwrap(); // 半个"盐"
     let out = memfiles::collect(&conn, home.path(), &dirs).unwrap();
-    assert_eq!(out.files_monitored, 5);
+    assert_eq!(out.files_monitored, 6);
     assert_eq!(out.revisions_added, 0);
     // 写完整后下一轮采集到
     std::fs::write(mem_dir.join("partial.md"), "内涝防治补充\n").unwrap();
@@ -543,8 +544,9 @@ fn native_memory_files_backup() {
     assert_eq!(arr.len(), 1);
     assert!(arr[0]["content"].as_str().unwrap().contains("v2"));
     let all = memfiles::read_native(&conn, home.path(), "codex", None).unwrap();
-    assert_eq!(all["memory_files"].as_array().unwrap().len(), 1);
+    assert_eq!(all["memory_files"].as_array().unwrap().len(), 2);
 }
+
 
 #[test]
 fn soft_delete_trash_roundtrip() {

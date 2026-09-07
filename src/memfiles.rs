@@ -89,6 +89,12 @@ fn discover_targets(conn: &Connection, dirs: &SourceDirs) -> Result<Vec<(String,
             targets.push((crate::adapters::AGENT_CLAUDE.to_string(), scope.clone(), project_claude_md));
         }
 
+        // Codex project instructions use AGENTS.md, independently of CLAUDE.md.
+        let project_agents = Path::new(&cwd).join("AGENTS.md");
+        if project_agents.is_file() {
+            targets.push((crate::adapters::AGENT_CODEX.to_string(), scope.clone(), project_agents));
+        }
+
         for enc in claude_project_encodings(&cwd) {
             let mem_dir = dirs.claude.join("projects").join(enc).join("memory");
             if mem_dir.is_dir() {

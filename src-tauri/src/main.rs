@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 use tauri::Manager;
 use yourmem::{data_home, db};
 
+mod tray;
+
 fn open() -> Result<rusqlite::Connection, String> {
     db::open(&data_home()).map_err(|e| e.to_string())
 }
@@ -704,8 +706,8 @@ async fn bundle_create(out: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn bundle_verify(path: String) -> Result<Value, String> {
-    yourmem::bundle::verify(std::path::Path::new(&path)).map_err(|e| e.to_string())
+async fn bundle_verify(path: String) -> Result<Value, String> {
+    run_blocking(move || yourmem::bundle::restore_plan(std::path::Path::new(&path), &data_home()).map_err(|e| e.to_string())).await
 }
 
 /// 从 bundle 恢复到当前库（merge=true 合并；false 要求库不存在——UI 里常态是合并）。
@@ -713,16 +715,11 @@ fn bundle_verify(path: String) -> Result<Value, String> {
 async fn bundle_restore(path: String, merge: bool) -> Result<Value, String> {
     run_blocking(move || {
         let home = data_home();
-        let conn = open()?;
-        let _ = db::log_usage(&conn, "app", "bundle_restore");
-        // --merge 写库：与 import/purge 共用互斥（CLI 侧同款；TOCTOU 见 main.rs）
-        // fail-closed：锁忙必须报错，不能吞成无锁继续（.ok() 就是 fail-open）
-        let _lock = if merge {
-            Some(yourmem::ingest::ImportLockTx::acquire(&home, std::time::Duration::from_secs(120)).map_err(|e| e.to_string())?)
-        } else {
-            None // fresh 模式要求目标为空，无并发窗口
-        };
-        yourmem::bundle::restore(std::path::Path::new(&path), &home, merge).map_err(|e| e.to_string())
+        let restored = yourmem::bundle::restore(std::path::Path::new(&path), &home, merge).map_err(|e| format!("{e:#}"))?;
+        if let Ok(conn) = open() {
+            let _ = db::log_usage(&conn, "app", "bundle_restore");
+        }
+        Ok(restored)
     })
     .await
 }
@@ -871,9 +868,13 @@ fn main() {
         }
         _ => {}
     }
-    auto_purge_if_enabled();
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            tray::show_main(app);
+        }))
         .setup(|app| {
+            auto_purge_if_enabled();
+            tray::setup(app)?;
             // Windows 任务栏/标题栏图标来自窗口 class,debug 构建不嵌入 exe 资源
             // （bundle 只在 tauri build 时打）——代码内显式设置,开发态也正常。
             if let Some(win) = app.get_webview_window("main") {
@@ -887,6 +888,16 @@ fn main() {
                 let _ = win.set_theme(Some(tauri::Theme::Dark));
             }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    // Only keep the process alive when the window was hidden successfully.
+                    if window.hide().is_ok() {
+                        api.prevent_close();
+                    }
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             session_window, message_content, stats, today, projects, context, project_dossier, daily_digest, sessions, session,

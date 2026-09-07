@@ -9,3 +9,6 @@ docs/*
 !docs/WINDOWS.md
 AGENTS.md
 /.cargo/
+
+# Local-only sensitive terms used by privacy tests
+/.privacy-deny.json

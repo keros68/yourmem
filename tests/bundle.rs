@@ -814,3 +814,164 @@ fn usage_summary_window_excludes_before_cutoff() {
     assert_eq!(summary.len(), 1, "截止点之前的记录不得入窗: {summary:?}");
     assert_eq!(summary[0]["name"], "recent_event");
 }
+
+
+/// Rewrite only synthetic test archives to exercise validation independently of creation.
+fn rewrite_bundle(path: &std::path::Path, change: impl FnOnce(&std::path::Path, &rusqlite::Connection)) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dec = flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap());
+    tar::Archive::new(dec).unpack(tmp.path()).unwrap();
+    let root = std::fs::read_dir(tmp.path()).unwrap().next().unwrap().unwrap().path();
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    let db_path = root.join("db").join(manifest["db_snapshot"].as_str().unwrap());
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    change(&root, &conn);
+    drop(conn);
+    let enc = flate2::write::GzEncoder::new(std::fs::File::create(path).unwrap(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(enc);
+    archive.append_dir_all(root.file_name().unwrap(), &root).unwrap();
+    archive.into_inner().unwrap().finish().unwrap();
+}
+
+#[test]
+fn project_bundle_excludes_other_project_and_global_memory_bytes() {
+    let (home, _src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    for (scope, path, text) in [
+        ("project:/tmp/proj-x", "/tmp/proj-x/AGENTS.md", "KEEP_PROJECT_MEMORY"),
+        ("project:/tmp/proj-y", "/tmp/proj-y/AGENTS.md", "EXCLUDED_PROJECT_MEMORY"),
+        ("global", "/tmp/global/AGENTS.md", "EXCLUDED_GLOBAL_MEMORY"),
+    ] {
+        let hash = vault::store_bytes(home.path(), text.as_bytes()).unwrap();
+        let (fid, _) = db::upsert_memory_file(&conn, "codex", scope, path, &hash).unwrap();
+        db::insert_memory_revision(&conn, fid, &hash, text.len() as u64).unwrap();
+        db::set_memory_fts(&conn, fid, text).unwrap();
+    }
+    conn.execute("INSERT INTO memories(id,scope,type,content,created_at,updated_at)
+        VALUES ('global-test','global','fact','EXCLUDED_CURATED_GLOBAL','2026-01-01','2026-01-01')", []).unwrap();
+    let out = home.path().join("project.tar.gz");
+    bundle::create(&conn, home.path(), &out, &bundle::BundleFilter { project: Some("proj-x".into()), agent: None }).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    bundle::restore(&out, target.path(), false).unwrap();
+    let restored = db::open(target.path()).unwrap();
+    assert_eq!(db::list_memory_files(&restored).unwrap().len(), 1);
+    assert_eq!(restored.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    let dec = flate2::read::GzDecoder::new(std::fs::File::open(out).unwrap());
+    for entry in tar::Archive::new(dec).entries().unwrap() {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        entry.unwrap().read_to_end(&mut bytes).unwrap();
+        for excluded in ["EXCLUDED_PROJECT_MEMORY", "EXCLUDED_GLOBAL_MEMORY", "EXCLUDED_CURATED_GLOBAL"] {
+            assert!(!bytes.windows(excluded.len()).any(|w| w == excluded.as_bytes()), "excluded text in archive: {excluded}");
+        }
+    }
+}
+
+#[test]
+fn bundle_validation_checks_reference_coverage_schema_and_database_integrity() {
+    let (home, _src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    for case in ["missing", "schema", "foreign-key", "invalid-path"] {
+        let out = home.path().join(format!("{case}.tar.gz"));
+        bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
+        rewrite_bundle(&out, |root, c| match case {
+            "missing" => { c.execute("UPDATE vault_lines SET hash=?1", ["f".repeat(64)]).unwrap(); }
+            "schema" => { c.pragma_update(None, "user_version", 999).unwrap(); }
+            "foreign-key" => { c.execute_batch("PRAGMA foreign_keys=OFF; UPDATE messages SET session_id='missing' WHERE session_id='claude:aaaa';").unwrap(); }
+            _ => {
+                let mp = root.join("manifest.json");
+                let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
+                m["db_snapshot"] = serde_json::json!("../outside.sqlite");
+                std::fs::write(mp, serde_json::to_vec(&m).unwrap()).unwrap();
+            }
+        });
+        match bundle::verify(&out) {
+            Ok(r) => assert_eq!(r["ok"], false, "{case}"),
+            Err(_) => assert_eq!(case, "invalid-path"),
+        }
+        let target = tempfile::tempdir().unwrap();
+        assert!(bundle::restore(&out, target.path(), false).is_err());
+        assert!(!target.path().join("yourmem.db").exists());
+    }
+}
+
+#[test]
+fn object_copy_failure_preserves_database_and_allows_restore_retry() {
+    let (home, _src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    let hash: String = conn.query_row("SELECT hash FROM vault_lines LIMIT 1", [], |r| r.get(0)).unwrap();
+    let out = home.path().join("restore.tar.gz");
+    bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
+    for merge in [false, true] {
+        let target = tempfile::tempdir().unwrap();
+        if merge { db::open(target.path()).unwrap(); }
+        std::fs::create_dir_all(target.path().join("objects")).unwrap();
+        let blocker = target.path().join("objects").join(&hash[..2]);
+        std::fs::write(&blocker, "synthetic obstruction").unwrap();
+        assert!(bundle::restore(&out, target.path(), merge).is_err());
+        if merge {
+            let c = db::open(target.path()).unwrap();
+            assert_eq!(db::recent_sessions(&c, None, 10).unwrap().len(), 0);
+        } else { assert!(!target.path().join("yourmem.db").exists()); }
+        std::fs::remove_file(blocker).unwrap();
+        bundle::restore(&out, target.path(), merge).unwrap();
+        let c = db::open(target.path()).unwrap();
+        assert_eq!(db::recent_sessions(&c, None, 10).unwrap().len(), 2);
+        assert!(vault::read_object(target.path(), &hash, true).is_ok());
+    }
+}
+
+#[test]
+fn restore_repairs_corrupt_existing_objects_and_previews_conflicts() {
+    let (home, _src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    let out = home.path().join("repair.tar.gz");
+    bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    bundle::restore(&out, target.path(), false).unwrap();
+    let hash: String = conn.query_row("SELECT hash FROM vault_lines LIMIT 1", [], |r| r.get(0)).unwrap();
+    std::fs::write(vault::object_path(target.path(), &hash), "damaged").unwrap();
+    let preview = bundle::restore_plan(&out, target.path()).unwrap();
+    assert_eq!(preview["merge_plan"]["sessions_skipped"], 2);
+    bundle::restore(&out, target.path(), true).unwrap();
+    assert!(vault::read_object(target.path(), &hash, true).is_ok());
+}
+
+#[test]
+fn cli_restore_into_default_fresh_home_does_not_create_database_early() {
+    let (home, _src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    let out = home.path().join("cli.tar.gz");
+    bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_yourmem"))
+        .env("YOUMEM_HOME", target.path()).arg("bundle").arg("restore").arg(&out).output().unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let r: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(r["mode"], "fresh");
+}
+
+
+#[test]
+fn failed_index_backfill_rolls_back_the_entire_merge() {
+    let (home, _src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    let hash = vault::store_bytes(home.path(), b"source memory").unwrap();
+    let (fid, _) = db::upsert_memory_file(&conn, "codex", "global", "/tmp/AGENTS.md", &hash).unwrap();
+    db::insert_memory_revision(&conn, fid, &hash, 13).unwrap();
+    db::set_memory_fts(&conn, fid, "source memory").unwrap();
+    let out = home.path().join("transaction.tar.gz");
+    bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let target_conn = db::open(target.path()).unwrap();
+    target_conn.execute_batch("DROP TABLE memory_fts; CREATE TABLE memory_fts(broken TEXT);").unwrap();
+    assert!(bundle::restore(&out, target.path(), true).is_err());
+    assert_eq!(target_conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(target_conn.query_row("SELECT COUNT(*) FROM memory_files", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    target_conn.execute_batch("DROP TABLE memory_fts;").unwrap();
+    drop(target_conn);
+    db::open(target.path()).unwrap();
+    bundle::restore(&out, target.path(), true).unwrap();
+    let c = db::open(target.path()).unwrap();
+    assert_eq!(yourmem::memfiles::search(&c, target.path(), "source memory", 10).unwrap().len(), 1);
+}

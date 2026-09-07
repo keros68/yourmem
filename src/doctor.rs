@@ -160,10 +160,10 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
         check("memory_files", "fail", format!("{cur_missing} 个 memory 文件的当前修订对象缺失"))
     });
 
-    // 7. 数据库快照新鲜度（VACUUM INTO 快照是崩溃恢复的最后一道）
+    // 7. 独立数据库快照新鲜度；bundle 可存到任意位置，不在此项检查范围内。
     let snapshots = vault::list_snapshots(home)?;
     let detail = match snapshots.last() {
-        None => ("warn", "尚无 DB 快照（backup db / bundle create 生成）".to_string()),
+        None => ("warn", "未发现独立数据库快照，可用 backup db 创建。此项不检查 .tar.gz 完整备份；完整备份请在设置的备份页校验。".to_string()),
         Some(p) => {
             let age = std::fs::metadata(p)
                 .and_then(|m| m.modified())

@@ -7,7 +7,7 @@ const vm = require('node:vm');
 function app() {
   const nodes = new Map(), lists = new Map(), requests = [], notices = [];
   const make = () => ({ innerHTML: '', textContent: '', value: '', dataset: {}, style: {},
-    focus() {}, remove() {}, addEventListener() {}, classList: { add() {}, remove() {} }, querySelectorAll: () => [] });
+    focus() {}, scrollIntoView() {}, remove() {}, addEventListener() {}, classList: { add() {}, remove() {} }, querySelectorAll: () => [] });
   const get = (key) => { if (!nodes.has(key)) nodes.set(key, make()); return nodes.get(key); };
   const context = {
     document: { querySelector: get, querySelectorAll: (sel) => lists.get(sel) || [], addEventListener() {},
@@ -20,7 +20,8 @@ function app() {
   vm.runInContext(ui('session-drawer.js').replace('export function', 'function'), context);
   vm.runInContext(ui('project-recall.js').replace('export async function', 'async function'), context);
   vm.runInContext(ui('graph-layout.js').replace('export function', 'function'), context);
-  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nglobalThis.testApp = { renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, setMemoryView: v => { memView = v; } };', context);
+  const bundleCode = ui('app.js').slice(ui('app.js').indexOf('  let bundleBusy = false'), ui('app.js').indexOf('  $("#auto-purge").onchange'));
+  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, setMemoryView: v => { memView = v; } };', context);
   return { ...context.testApp, get, lists, requests, notices };
 }
 
@@ -91,4 +92,50 @@ test('rendering memory sources does not overwrite graph highlighting handlers', 
   nodes[3].onclick({target:{classList:{contains:()=>false}}});
   assert.equal(nodes.filter(n=>n.classes.has('hl')).length,4);
   assert.equal(f.requests.length,count);
+});
+
+
+test('bundle controls prevent duplicate work and bind confirmation to the current source and plan', async () => {
+  const f = app(); f.bindBundleForTest();
+  const input = f.get('#bundle-path'), restore = f.get('#bundle-restore');
+  const report = { ok: true, objects: 3, manifest: { schema_version: 12 },
+    merge_plan: { home: '/demo/library', sessions_added: 2, sessions_replaced: 1, sessions_skipped: 0 } };
+  input.value = 'first.tar.gz';
+  const first = restore.onclick();
+  assert.equal(restore.disabled, true);
+  const n = f.requests.length;
+  await restore.onclick();
+  assert.equal(f.requests.length, n);
+  f.requests.at(-1).resolve(report); await first;
+  assert.equal(restore.textContent, '确认合并');
+  assert.match(f.get('#bundle-report').textContent, /\/demo\/library/);
+  assert.ok(!f.requests.some(r => r.command === 'bundle_restore'));
+  input.value = 'second.tar.gz'; input.oninput();
+  const changed = restore.onclick(); f.requests.at(-1).resolve(report); await changed;
+  assert.ok(!f.requests.some(r => r.command === 'bundle_restore'));
+  const confirm = restore.onclick(); f.requests.at(-1).resolve(report);
+  await new Promise(setImmediate);
+  assert.equal(f.requests.at(-1).command, 'bundle_restore');
+  assert.equal(f.requests.at(-1).args.path, 'second.tar.gz');
+  f.requests.at(-1).reject('对象恢复失败，数据库尚未写入'); await confirm;
+  assert.equal(restore.disabled, false);
+  assert.equal(restore.textContent, '合并恢复');
+  assert.match(f.get('#bundle-report').textContent, /数据库尚未写入/);
+});
+
+test('failed bundle verification blocks restore and releases controls', async () => {
+  const f = app(); f.bindBundleForTest(); f.get('#bundle-path').value = 'bad.tar.gz';
+  const pending = f.get('#bundle-restore').onclick();
+  f.requests.at(-1).resolve({ok:false, missing_referenced_objects:['missing']}); await pending;
+  assert.ok(!f.requests.some(r => r.command === 'bundle_restore'));
+  assert.match(f.get('#bundle-report').textContent, /缺少 1 个引用对象/);
+  assert.equal(f.get('#bundle-verify').disabled, false);
+});
+
+test('search discloses the effective index scope', async () => {
+  const f = app(); await f.renderSearch();
+  f.requests.find(r => r.command === 'index_status').resolve({tool_index_full:false});
+  await Promise.resolve();
+  assert.match(f.get('#q-scope').textContent, /少于 3 字/);
+  assert.match(f.get('#page-search').innerHTML, /20 万字符/);
 });

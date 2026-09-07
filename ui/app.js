@@ -880,7 +880,7 @@ async function renderSettings() {
     ${panel("backup", `
       <h2>备份位置</h2>
       <div class="memcard">
-        <div class="meta" style="margin-top:0">数据库快照、导出原件、删除档案都存这里。留空用默认位置（数据目录下的 backups）。</div>
+        <div class="meta" style="margin-top:0">数据库快照、导出原件和删除档案保存到此目录。原始归档对象仍在数据目录，改到其他磁盘后也需创建完整备份。</div>
         <div class="searchbar">
           <input type="text" id="backup-dir" style="flex:1" placeholder="绝对路径，如 D:\\yourmem-backup" value="${esc(bd.configured)}" />
           <button class="btn primary" id="backup-dir-save">保存</button>
@@ -907,19 +907,19 @@ async function renderSettings() {
           <span id="tools-index-state" style="color:var(--faint);font-size:12px">已索引 ${idx.indexed_tool_rows} / ${idx.tool_messages} 行</span>
         </div>
       </div>
-      <h2>备份与恢复（bundle 一次性迁移，非同步）</h2>
+      <h2>完整备份与恢复</h2>
       <div class="memcard">
-        <div class="meta" style="margin-top:0">创建：数据库一致性快照 + 引用的全部 CAS 对象，打包为 .tar.gz</div>
+        <div class="meta" style="margin-top:0">完整备份包含数据库和引用的原始记录，保存为 .tar.gz；单独的数据库快照不足以恢复原件。</div>
         <div class="searchbar">
           <input type="text" id="bundle-out" style="flex:1" value="${esc(bd.effective)}/backup-${today}.tar.gz" />
-          <button class="btn primary" id="bundle-create">创建 bundle</button>
+          <button class="btn primary" id="bundle-create">创建备份</button>
         </div>
         <div class="searchbar">
-          <input type="text" id="bundle-path" style="flex:1" placeholder="bundle 路径（.tar.gz 文件）" />
+          <input type="text" id="bundle-path" style="flex:1" placeholder="备份路径（.tar.gz 文件）" />
           <button class="btn" id="bundle-verify">校验</button>
           <button class="btn danger" id="bundle-restore">合并恢复</button>
         </div>
-        <div id="bundle-report"></div>
+        <div id="bundle-report" role="status" aria-live="polite" style="line-height:1.6;overflow-wrap:anywhere"></div>
       </div>
       <h2>彻底删除的离线档案</h2>
       <div class="memcard">
@@ -946,6 +946,8 @@ async function renderSettings() {
       </div>`)}
 
     ${panel("general", `
+      <h2>后台运行</h2>
+      <div class="memcard"><div class="meta" style="margin-top:0">关闭窗口后保留在系统托盘，每分钟采集已启用的数据源。点击托盘图标可打开窗口；右键选择「退出」可停止后台运行。</div></div>
       <h2>回收站自动清理</h2>
       <div class="memcard">
         <div class="meta" style="margin-top:0">开启后每次启动自动彻底删除超过 ${30} 天的回收站对话（对象先归档备份，非直接销毁）。默认关闭——物理删除不可逆。</div>
@@ -1017,40 +1019,65 @@ async function renderSettings() {
     };
   });
 
-  $("#bundle-create").onclick = async () => {toast("打包中…");
+  let bundleBusy = false, pendingMerge = null;
+  const bundleButtons = ["#bundle-create", "#bundle-verify", "#bundle-restore", "#bundle-path", "#bundle-out"].map($);
+  const setBundleBusy = (busy) => {
+    bundleBusy = busy;
+    bundleButtons.forEach(el => { el.disabled = busy; });
+  };
+  const clearMerge = () => {
+    pendingMerge = null;
+    $("#bundle-restore").textContent = "合并恢复";
+  };
+  $("#bundle-path").oninput = clearMerge;
+  const bundleFailure = (r) => r.reason || (r.missing_referenced_objects?.length
+    ? `缺少 ${r.missing_referenced_objects.length} 个引用对象`
+    : r.database_errors?.join("；") || "对象、数据库或版本检查未通过");
+  $("#bundle-create").onclick = async () => {
+    if (bundleBusy) return;
+    clearMerge(); setBundleBusy(true);
+    const rep = $("#bundle-report"); rep.textContent = "正在创建完整备份…";
     try {
       const m = await invoke("bundle_create", { out: $("#bundle-out").value.trim() });
-      $("#bundle-report").innerHTML = `<div class="meta">✓ 已创建：${m.objects} 个对象 / ${(m.objects_bytes/1024).toFixed(0)} KB · schema v${m.schema_version}</div>`;
-    } catch (e) { $("#bundle-report").innerHTML = `<div class="meta">✗ ${esc(e)}</div>`; }
+      rep.textContent = `已创建完整备份：${m.objects} 个对象，${(m.objects_bytes / 1024).toFixed(0)} KB`;
+    } catch (e) { rep.textContent = `创建失败：${String(e)}`; }
+    finally { setBundleBusy(false); }
   };
   $("#bundle-verify").onclick = async () => {
-    const p = $("#bundle-path").value.trim();
-    if (!p) return;
+    const path = $("#bundle-path").value.trim();
+    if (!path || bundleBusy) return;
+    clearMerge(); setBundleBusy(true);
+    const rep = $("#bundle-report"); rep.textContent = "正在校验备份…";
     try {
-      const r = await invoke("bundle_verify", { path: p });
-      // 文案别自相矛盾：失败时不能再念"哈希全对"（自检 C5）
-      $("#bundle-report").innerHTML = r.ok
-        ? `<div class="meta">✓ 校验通过：${r.objects} 个对象与清单一致 · 快照可打开</div>`
-        : `<div class="meta">✗ 校验失败：${esc(r.reason || r.error || "完整性或快照检查未通过")}</div>`;
-    } catch (e) { $("#bundle-report").innerHTML = `<div class="meta">✗ ${esc(e)}</div>`; }
+      const r = await invoke("bundle_verify", { path });
+      rep.textContent = r.ok ? `校验通过：${r.objects} 个对象，数据库与引用完整，版本一致`
+        : `校验失败：${bundleFailure(r)}`;
+    } catch (e) { rep.textContent = `校验失败：${String(e)}`; }
+    finally { setBundleBusy(false); }
   };
   $("#bundle-restore").onclick = async () => {
-    const p = $("#bundle-path").value.trim();
-    if (!p) return;
+    const path = $("#bundle-path").value.trim();
+    if (!path || bundleBusy) return;
+    setBundleBusy(true);
+    const rep = $("#bundle-report"); rep.textContent = "正在校验并计算合并结果…";
     try {
-      const v = await invoke("bundle_verify", { path: p });
-      if (!v.ok) { $("#bundle-report").innerHTML = `<div class="meta">✗ 校验失败，已阻止恢复</div>`; return; }
-      const btn = $("#bundle-restore");
-      if (!btn.dataset.armed) {
-        btn.dataset.armed = "1";
-        btn.textContent = `确认合并 ${v.objects} 个对象进当前库？`;
-        setTimeout(() => { btn.dataset.armed = ""; btn.textContent = "合并恢复"; }, 5000);
+      const v = await invoke("bundle_verify", { path });
+      if (!v.ok) { clearMerge(); rep.textContent = `校验失败，已阻止恢复：${bundleFailure(v)}`; return; }
+      const plan = v.merge_plan;
+      const signature = JSON.stringify([path, v.manifest, plan]);
+      if (pendingMerge !== signature) {
+        pendingMerge = signature;
+        rep.textContent = `目标：${plan.home}。预计新增 ${plan.sessions_added} 个、替换 ${plan.sessions_replaced} 个、跳过 ${plan.sessions_skipped} 个对话。同 ID 以消息更多的一侧为准；同 ID 项目记忆保留当前库版本。`;
+        $("#bundle-restore").textContent = "确认合并";
+        rep.scrollIntoView({ block: "center" });
         return;
       }
-      btn.dataset.armed = ""; btn.textContent = "合并恢复";
-      const r = await invoke("bundle_restore", { path: p, merge: true });
-      $("#bundle-report").innerHTML = `<div class="meta">✓ 合并完成：对话 +${r.merged.sessions_added} / 跳过 ${r.merged.sessions_skipped} · 对象 +${r.objects_copied}。${esc(r.note)}</div>`;
-    } catch (e) { $("#bundle-report").innerHTML = `<div class="meta">✗ ${esc(e)}</div>`; }
+      clearMerge(); rep.textContent = "正在恢复对象并合并数据库…";
+      const r = await invoke("bundle_restore", { path, merge: true });
+      rep.textContent = `合并完成：新增 ${r.merged.sessions_added} 个、替换 ${r.merged.sessions_replaced} 个、跳过 ${r.merged.sessions_skipped} 个对话。`;
+    } catch (e) {
+      clearMerge(); rep.textContent = `恢复失败：${String(e)}`;
+    } finally { setBundleBusy(false); }
   };
 
   $("#auto-purge").onchange = async (e) => {
@@ -1223,7 +1250,14 @@ async function renderSearch() {  $("#page-search").innerHTML = `
       </select>
       <button class="btn primary" id="q-go">搜索</button>
     </div>
+    <div id="q-scope" class="meta">正在读取搜索范围…</div>
+    <div class="meta">每条消息最多检索前 20 万字符，完整原文可从对话详情导出。</div>
     <div id="q-results" aria-live="polite"></div>`;
+  const scope = $("#q-scope");
+  invoke("index_status").then(r => {
+    if (scope !== $("#q-scope")) return;
+    scope.textContent = r.tool_index_full ? "搜索范围：对话及工具输出" : "搜索范围：对话；工具输出仅支持少于 3 字的短词，全文索引可在设置中开启";
+  }).catch(() => { if (scope === $("#q-scope")) scope.textContent = "搜索范围读取失败，可在设置中查看索引状态"; });
   const results = $("#q-results");
   let request = 0;
   const go = async () => {

@@ -491,7 +491,7 @@ fn main() -> Result<()> {
         Cmd::Doctor => "doctor",
         Cmd::Mcp => "mcp",
     };
-    if !matches!(cli.cmd, Cmd::Mcp) {
+    if !matches!(cli.cmd, Cmd::Mcp | Cmd::Bundle { cmd: BundleCmd::Restore { .. } }) {
         if let Ok(conn) = db::open(&home) {
             let _ = db::log_usage(&conn, "cli", cmd_name);
         }
@@ -815,15 +815,11 @@ fn main() -> Result<()> {
             }
             BundleCmd::Restore { path, home: target, merge } => {
                 let target = target.unwrap_or_else(|| home.clone());
-                // --merge 写库：与导入/purge 共用互斥（TOCTOU——GC 查引用与
-                // merge 提交新引用 + copy_objects 跳过已存在对象之间无锁会
-                // 让新引用指向被归档的对象）
-                let _lock = if merge {
-                    Some(yourmem::ingest::ImportLockTx::acquire(&target, std::time::Duration::from_secs(120))?)
-                } else {
-                    None
-                };
-                print_json(&yourmem::bundle::restore(&path, &target, merge)?);
+                let restored = yourmem::bundle::restore(&path, &target, merge)?;
+                if let Ok(conn) = db::open(&target) {
+                    let _ = db::log_usage(&conn, "cli", "bundle");
+                }
+                print_json(&restored);
             }
         },
 
