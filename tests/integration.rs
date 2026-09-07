@@ -314,6 +314,41 @@ fn lineage_detection() {
 }
 
 #[test]
+fn codex_lineage_uses_native_parent_thread_metadata() {
+    let home = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let codex_dir = src.path().join("codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    let parent = "11111111-1111-4111-8111-111111111111";
+    let continuation = "22222222-2222-4222-8222-222222222222";
+    let fork = "33333333-3333-4333-8333-333333333333";
+    let subagent = "44444444-4444-4444-8444-444444444444";
+    let write = |id: &str, payload: String| {
+        std::fs::write(
+            codex_dir.join(format!("rollout-2026-09-07T00-00-00-{id}.jsonl")),
+            format!("{{\"type\":\"session_meta\",\"payload\":{payload}}}\n"),
+        )
+        .unwrap();
+    };
+    write(parent, format!(r#"{{"id":"{parent}","cwd":"/tmp/codex-lineage"}}"#));
+    write(continuation, format!(r#"{{"id":"{continuation}","parent_thread_id":"{parent}"}}"#));
+    write(fork, format!(r#"{{"id":"{fork}","forked_from_id":"{parent}"}}"#));
+    // Codex writes fork metadata for subagents too; `source.subagent` is the
+    // more specific relation and must win.
+    write(subagent, format!(r#"{{"id":"{subagent}","forked_from_id":"{parent}","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{parent}"}}}}}}}}"#));
+
+    let mut conn = db::open(home.path()).unwrap();
+    let roots = vec![(adapters::AGENT_CODEX, codex_dir)];
+    let outcome = ingest::import_all(&mut conn, home.path(), &roots, None, None).unwrap();
+    assert_eq!(outcome.lineage_links, 3);
+    for (id, expected) in [(continuation, "continuation"), (fork, "fork"), (subagent, "subagent")] {
+        let lineage = db::lineage_for(&conn, &format!("codex:{id}")).unwrap();
+        assert_eq!(lineage["parents"][0]["session_id"], format!("codex:{parent}"));
+        assert_eq!(lineage["parents"][0]["type"], expected);
+    }
+}
+
+#[test]
 fn artifacts_and_db_snapshot() {
     let home = tempfile::tempdir().unwrap();
     let src = tempfile::tempdir().unwrap();

@@ -1,7 +1,7 @@
 //! SQLite schema and queries. FTS5 with the trigram tokenizer so both
 //! Chinese and English content are searchable by substring.
 
-use std::path::Path;
+use std::{io::{BufRead, BufReader}, path::Path};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -1916,6 +1916,54 @@ pub fn detect_lineage(conn: &Connection) -> Result<u64> {
                 params![child_id, parent_id, link_type, uuid, now_iso()],
             )? as u64;
         }
+    }
+    added += detect_codex_lineage(conn)?;
+    Ok(added)
+}
+
+/// Codex session metadata carries a direct parent thread id.  Unlike the
+/// generic UUID mechanism above, this is already a session id and remains
+/// available when importing an older on-disk rollout for the first time.
+///
+/// Do not infer a relation from project, title, or time: only native metadata
+/// is admitted.  Subagent metadata takes precedence over `forked_from_id`
+/// because Codex records both on a forked subagent session.
+fn detect_codex_lineage(conn: &Connection) -> Result<u64> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path FROM sessions WHERE agent = 'codex'",
+    )?;
+    let sessions: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut added = 0;
+    for (child_id, file_path) in sessions {
+        let Ok(file) = std::fs::File::open(file_path) else { continue };
+        let mut link = None;
+        for raw in BufReader::new(file).lines() {
+            let Ok(raw) = raw else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else { continue };
+            if value["type"].as_str() != Some("session_meta") {
+                continue;
+            }
+            let payload = &value["payload"];
+            link = payload["source"]["subagent"]["thread_spawn"]["parent_thread_id"]
+                .as_str()
+                .map(|id| (id.to_string(), "subagent"))
+                .or_else(|| payload["forked_from_id"].as_str().map(|id| (id.to_string(), "fork")))
+                .or_else(|| payload["parent_thread_id"].as_str().map(|id| (id.to_string(), "continuation")));
+            break;
+        }
+        let Some((parent_native_id, link_type)) = link else { continue };
+        let parent_id = format!("codex:{parent_native_id}");
+        if parent_id == child_id {
+            continue;
+        }
+        added += conn.execute(
+            "INSERT OR IGNORE INTO session_links(child_session_id, parent_session_id, link_type, via_uuid, created_at)
+             VALUES (?1, ?2, ?3, NULL, ?4)",
+            params![child_id, parent_id, link_type, now_iso()],
+        )? as u64;
     }
     Ok(added)
 }

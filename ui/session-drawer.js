@@ -35,7 +35,7 @@ async function showSession(sessionId, lineNo = null, precompact = false, offset 
         ltree.edges.map((e) => ({ p: e.parent, c: e.child, lt: e.link_type })),
         sessionId
       )
-    : `<div class="lchain"><span class="lnode cur">本对话</span><span style="color:var(--faint)">（无谱系边）</span></div>`;
+    : `<div class="lchain"><span class="lnode cur">本对话</span><span style="color:var(--faint)">（暂无可追溯的继承关系）</span></div>`;
   const msgHtml = (m) => `<div class="msg ${esc(m.kind)}" data-line="${m.line_no}" data-message="${m.message_id}"><div class="kind">${esc(m.kind)} · L${m.line_no} · ${fmtTime(m.timestamp)}</div><div class="content">${esc(m.content)}</div>${m.truncated ? `<button class="btn small" data-full-message="${m.message_id}">展开原文</button>` : ""}</div>`;
   // 长对话分块渲染：首屏 150 条，点按钮继续——500+ 条详情不卡的关键。
   // 来源指针跳转（lineNo）指向后块时首屏直接覆盖到目标行（codex 一审：

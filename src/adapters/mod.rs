@@ -161,9 +161,9 @@ pub fn capability_matrix() -> serde_json::Value {
           "writeback": "yes", "encrypted": "no",
           "notes": "压缩=新文件+compact 谱系边；写回限文件型（restore-agents）" },
         { "agent": AGENT_CODEX, "transcript": "yes", "search": "yes",
-          "lineage": "no", "resume": "yes",
+          "lineage": "yes", "resume": "yes",
           "writeback": "yes", "encrypted": "no",
-          "notes": "谱系/压缩点留接口（按样本门禁）；写回限文件型" },
+          "notes": "读取 session_meta 的 fork、续接与子 agent 父会话；压缩点留接口；写回限文件型" },
         { "agent": opencode::AGENT_OPENCODE, "transcript": "yes", "search": "yes",
           "lineage": "no", "resume": "yes",
           // SQLite 单库源：只读原则，不向别人的库插行（restore.rs 注释）

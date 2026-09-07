@@ -330,7 +330,7 @@ async function showProject(pid) {
     ${lineageGraphHtml(
       (d.timeline || []).map((t) => ({ session_id: t.session_id, agent: t.agent, started_at: t.started_at, messages: t.messages, title: t.title })),
       d.lineage_edges || (d.timeline || []).filter((t) => t.link_type && t.parent_session_id).map((t) => ({ p: t.parent_session_id, c: t.session_id, lt: t.link_type }))
-    ) || '<h2>谱系图</h2><div class="empty">本项目暂无谱系边（边来自 fork / compact / continuation / subagent）</div>'}
+    ) || '<h2>对话谱系</h2><div class="empty">当前没有可追溯的对话继承关系。谱系图只连接由 fork、续聊、上下文压缩或子 agent 创建的对话；普通新聊天不会按时间自动连成树。</div>'}
     <h2>Artifacts（${(d.artifacts || []).length}）</h2>
     <div class="scrollbox">${artifactRows || '<div class="empty">暂无 artifact</div>'}</div>
     <h2>Handoff 链（${(d.handoffs || []).length}）</h2>
@@ -352,6 +352,7 @@ let sessAgent = "";
 let sessTrash = false;
 let sessChecked = new Set();
 let sessShown = 200; // 列表分批渲染：已显示条数（数据全量持有，不封顶）
+let sessGroup = "project"; // 可在项目视图与按月清理视图之间切换
 
 // 二次确认按钮（借鉴本页 bundle 恢复的 armed 模式）：点第一次武装，
 // 4 秒内点第二次才执行。
@@ -384,7 +385,10 @@ async function renderSessions() {
   }
   const groups = new Map();
   for (const s of d.sessions) {
-    const key = s.project || "（无项目）";
+    const date = s.ended_at || s.started_at || "";
+    const key = sessGroup === "month"
+      ? (date.slice(0, 7) || "（未记录时间）")
+      : (s.project || "（无项目）");
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(s);
   }
@@ -403,7 +407,9 @@ function drawSessionsPage() {
           const byAgent = {};
           list.forEach((s) => { byAgent[s.agent] = (byAgent[s.agent] || 0) + 1; });
           const agentStr = Object.entries(byAgent).map(([a, n]) => `${a}×${n}`).join(" ");
-          const meta = `${list.length} 个对话 · ${agentStr} · ${fmtTime(list[0].ended_at || list[0].started_at)}`;
+          const meta = sessGroup === "month"
+            ? `${list.length} 个对话 · ${agentStr}`
+            : `${list.length} 个对话 · ${agentStr} · ${fmtTime(list[0].ended_at || list[0].started_at)}`;
           return `
           <div class="sess-proj-item ${name === sessSel ? "active" : ""}" data-proj="${esc(name)}">
             <div class="n">${esc(name)}</div>
@@ -413,6 +419,8 @@ function drawSessionsPage() {
       </div>
       <div class="sess-main">
         <div class="sess-filters">
+          <button class="chip ${sessGroup === "project" ? "on" : ""}" id="sess-by-project">按项目</button>
+          <button class="chip ${sessGroup === "month" ? "on" : ""}" id="sess-by-month">按月</button>
           ${agents.map((a) => `<button class="chip ${sessAgent === a ? "on" : ""}" data-agent="${a}">${a || "全部"}</button>`).join("")}
           <span style="flex:1"></span>
           <button class="chip danger hidden" id="sess-bulk-del"></button>
@@ -438,11 +446,18 @@ function drawSessionsPage() {
       const pj = document.querySelector(".sess-projs"); if (pj) pj.scrollTop = side;
     };
   });
+  const switchGroup = (group) => {
+    if (sessGroup === group) return;
+    sessGroup = group; sessSel = null; sessChecked = new Set(); sessShown = 200;
+    renderSessions();
+  };
+  $("#sess-by-project").onclick = () => switchGroup("project");
+  $("#sess-by-month").onclick = () => switchGroup("month");
   $("#sess-trash-btn").onclick = () => { sessTrash = true; sessChecked = new Set(); drawTrash(); };
   const all = (sessData.find(([n]) => n === sessSel)?.[1] || []).filter((s) => !sessAgent || s.agent === sessAgent);
   // 全量数据分批渲染：首屏 200，「显示更多」续排——资产不封顶，DOM 不拖垮
   const shown = all.slice(0, sessShown);
-  $("#sess-table").innerHTML = sessTable(shown, { project: false, preview: true, fixed: true, select: true, action: "delete" })
+  $("#sess-table").innerHTML = sessTable(shown, { project: sessGroup === "month", preview: true, fixed: true, select: true, action: "delete" })
     + (all.length > shown.length
       ? `<div style="padding:10px 0;text-align:center"><button class="chip" id="sess-more">显示更多（还有 ${all.length - shown.length} 个）</button></div>`
       : "");
@@ -625,7 +640,7 @@ async function renderMemory() {
   const counts = d.memories.length;
   $("#page-memory").innerHTML = `
     <h1>记忆 <span class="en">Memory</span></h1>
-    <details class="memcard"><summary>经验卡模板</summary><div class="content">按实际证据填写，未验证的内容标为待验证。通过 agent 的 save_memory 或 CLI memory add 保存。</div><pre>${esc(EXPERIENCE_TEMPLATE)}</pre><button class="btn small" data-copy="${esc(EXPERIENCE_TEMPLATE)}">复制模板</button></details>
+    <details class="memcard"><summary>新增记忆模板</summary><div class="content">用于把可复用的经验、决策或偏好保存为一条记忆；它不会从对话中自动生成。按实际证据填写，未验证内容标为待验证，再通过 agent 的 save_memory 或 CLI memory add 保存。</div><pre>${esc(EXPERIENCE_TEMPLATE)}</pre><button class="btn small" data-copy="${esc(EXPERIENCE_TEMPLATE)}">复制模板</button></details>
     <div class="searchbar">
       <select id="mem-status">
         ${memView === "graph" ? '<option value="all">全部状态（关系图）</option>' : ""}
