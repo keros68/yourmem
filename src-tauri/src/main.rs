@@ -531,34 +531,13 @@ async fn bundle_path_pick(window: tauri::WebviewWindow, path: String, save: bool
     }).await
 }
 
-/// 设置备份位置：空串 = 回到默认（数据目录下的 backups）。目录会自动创建，
-/// 创建失败（盘不存在/权限不足）即报错，config 不落盘；只对新备份生效，
-/// 旧位置的文件不动。
+/// 设置备份位置：空串 = 回到默认（数据目录下的 backups）。已有备份先迁移并
+/// 校验，成功后才切换 config；目标非空时拒绝，避免覆盖已有文件。
 #[tauri::command]
 async fn backup_dir_set(path: String) -> Result<Value, String> {
     run_blocking(move || {
         let home = data_home();
-        let trimmed = path.trim().to_string();
-        let dir = if trimmed.is_empty() {
-            home.join("backups")
-        } else {
-            let p = std::path::PathBuf::from(yourmem::expand_home(&trimmed));
-            if !p.is_absolute() {
-                return Err(format!("请填绝对路径：{trimmed}"));
-            }
-            p
-        };
-        std::fs::create_dir_all(&dir).map_err(|e| format!("目录不可用：{e}"))?;
-        let mut cfg = yourmem::ingest::read_config(&home);
-        if trimmed.is_empty() {
-            if let Some(obj) = cfg.as_object_mut() {
-                obj.remove("backup_dir");
-            }
-        } else {
-            cfg["backup_dir"] = json!(trimmed);
-        }
-        yourmem::ingest::write_config(&home, &cfg).map_err(|e| e.to_string())?;
-        Ok(json!({ "effective": dir }))
+        yourmem::backup_location::set(&home, &path).map_err(|e| format!("{e:#}"))
     })
     .await
 }

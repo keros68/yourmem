@@ -7,6 +7,7 @@
 //!   + Vault (line-level content-addressed immutable backup)
 
 pub mod adapters;
+pub mod backup_location;
 pub mod bundle;
 pub mod db;
 pub mod doctor;
@@ -87,7 +88,7 @@ pub fn is_first_run(home: &Path) -> bool {
 /// 备份根目录：config.json 的 `backup_dir`（支持 ~ 展开）优先，缺省/相对路径
 /// 回落 `<数据目录>/backups`（历史行为）。DB 快照、purge 档案、会话导出、
 /// 存储统计都从这里取根——新增备份落盘点必须走这个函数，别再 home.join("backups")。
-/// 只挪备份，不动数据目录本体；改位置只对新备份生效，历史文件不迁移。
+/// 只挪备份，不动数据目录本体；位置变更由 backup_location 在迁移完成后写入。
 pub fn backups_dir(home: &Path) -> PathBuf {
     let cfg = crate::ingest::read_config(home);
     let configured = cfg["backup_dir"].as_str().unwrap_or("").trim();

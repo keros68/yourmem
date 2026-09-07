@@ -901,7 +901,7 @@ async function renderSettings() {
     ${panel("backup", `
       <h2>备份位置</h2>
       <div class="memcard">
-        <div class="meta" style="margin-top:0">数据库快照、导出原件和删除档案保存到此目录。原始归档对象仍在数据目录，改到其他磁盘后也需创建完整备份。</div>
+        <div class="meta" style="margin-top:0">数据库快照、导出原件和删除档案保存到此目录。保存新位置时会迁移已有备份；原始归档对象仍在数据目录，改到其他磁盘后也需创建完整备份。</div>
         <div class="searchbar">
           <input type="text" id="backup-dir" style="flex:1" placeholder="绝对路径，如 D:\\yourmem-backup" value="${esc(bd.configured)}" />
           <button class="btn" id="backup-dir-pick">选择文件夹</button>
@@ -1262,8 +1262,9 @@ async function renderSettings() {
       if (oldOutput.startsWith(oldPrefix)) output.value = r.effective.replace(/[\\/]$/, "") + "/" + oldOutput.slice(oldPrefix.length);
       curBackupDir = r.effective;
       $("#snapshot-refresh").click();
-      rep.textContent = `当前：${r.effective}（之后的备份存这里，原有文件不搬动）`;
-      toast("备份位置已保存");
+      const moved = Number(r.moved_files || 0);
+      rep.textContent = `当前：${r.effective}${moved ? `（已迁移 ${moved} 个文件）` : ""}${r.cleanup_warning ? `；${r.cleanup_warning}` : ""}`;
+      toast(moved ? `备份位置已保存，已迁移 ${moved} 个文件` : "备份位置已保存");
     } catch (e) {
       rep.textContent = `✗ ${String(e)}`;
     } finally {
@@ -1386,14 +1387,9 @@ async function route(name, fn) {
     if (b) b.onclick = () => route(name, fn);
   }
 }
-const pages = {
-  today: () => route("today", renderToday),
-  projects: () => route("projects", renderProjects),
-  sessions: () => route("sessions", renderSessions),
-  memory: () => route("memory", renderMemory),
-  search: () => route("search", renderSearch),
-  settings: () => route("settings", renderSettings),
-};
+const pageRenderers = { today: renderToday, projects: renderProjects, sessions: renderSessions,
+  memory: renderMemory, search: renderSearch, settings: renderSettings };
+const pages = Object.fromEntries(Object.entries(pageRenderers).map(([name, fn]) => [name, () => route(name, fn)]));
 document.querySelectorAll(".nav").forEach((btn) => {
   btn.onclick = () => {
     document.querySelectorAll(".nav").forEach((b) => b.classList.remove("active"));
@@ -1405,13 +1401,23 @@ document.querySelectorAll(".nav").forEach((btn) => {
 });
 
 $("#btn-import").onclick = async () => {
-  toast("采集中…");
+  const btn = $("#btn-import"), label = $("#btn-import span");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.classList.add("busy");
+  label.textContent = "采集中…";
   try {
     const r = await invoke("import_now");
     toast(`完成：新增 ${r.messages_added} 条消息 / ${r.lines_archived} 行归档`);
-    pages[document.querySelector(".nav.active").dataset.page]();
+    const current = document.querySelector(".nav.active").dataset.page;
+    try { await pageRenderers[current](); }
+    catch (e) { toast(`采集完成，页面更新失败：${e}`); }
   } catch (e) {
     toast(`采集失败：${e}`);
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove("busy");
+    label.textContent = "采集新对话";
   }
 };
 

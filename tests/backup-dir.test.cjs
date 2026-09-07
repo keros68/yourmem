@@ -10,7 +10,7 @@ test('folder selection fills the input; only Save persists; cancel leaves it unc
   const invoke = async (name, args) => {
     calls.push({ name, args });
     if (name === 'backup_dir_pick') return selection;
-    if (name === 'backup_dir_set') return { effective: args.path };
+    if (name === 'backup_dir_set') return { effective: args.path, moved_files: 3 };
     throw Error(name);
   };
   const source = fs.readFileSync(require('node:path').join(__dirname, '../ui/app.js'), 'utf8');
@@ -29,4 +29,5 @@ test('folder selection fills the input; only Save persists; cancel leaves it unc
   assert.equal(calls.at(-1).args.path, 'D:/chosen');
   assert.equal($('#backup-dir-save').disabled, false);
   assert.equal($('#bundle-out').value, 'D:/chosen/backup.tar.gz');
+  assert.match($('#backup-dir-report').textContent, /已迁移 3 个文件/);
 });

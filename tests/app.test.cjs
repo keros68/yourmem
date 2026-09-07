@@ -164,3 +164,29 @@ test('backup picker cancels without changes and selected backup clears merge con
   assert.equal(f.get('#bundle-out').value, 'output.tar.gz');
   assert.ok(!f.requests.some(r => r.command === 'bundle_create'));
 });
+
+test('manual import keeps the current page visible until one completed refresh', async () => {
+  const f = app();
+  f.get('.nav.active').dataset.page = 'sessions';
+  f.get('#page-sessions').innerHTML = 'stable content';
+  const button = f.get('#btn-import'), label = f.get('#btn-import span'), classes = new Set();
+  button.classList = { add: x => classes.add(x), remove: x => classes.delete(x) };
+  const pending = button.onclick();
+  const importing = f.requests.at(-1);
+  assert.equal(importing.command, 'import_now');
+  assert.equal(f.get('#page-sessions').innerHTML, 'stable content');
+  assert.equal(button.disabled, true);
+  assert.equal(label.textContent, '采集中…');
+  assert.ok(classes.has('busy'));
+  importing.resolve({ messages_added: 2, lines_archived: 3 });
+  await new Promise(setImmediate);
+  const refresh = f.requests.at(-1);
+  assert.equal(refresh.command, 'sessions');
+  assert.equal(f.get('#page-sessions').innerHTML, 'stable content');
+  refresh.resolve({ sessions: [] });
+  await pending;
+  assert.equal(button.disabled, false);
+  assert.equal(label.textContent, '采集新对话');
+  assert.ok(!classes.has('busy'));
+  assert.doesNotMatch(f.get('#page-sessions').innerHTML, /加载中/);
+});

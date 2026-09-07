@@ -88,6 +88,9 @@ body {
 }
 #btn-import svg { width: 14px; height: 14px; }
 #btn-import:hover { background: rgba(245, 158, 11, 0.22); border-color: rgba(245, 158, 11, 0.45); }
+#btn-import:disabled { cursor: wait; opacity: .8; }
+#btn-import.busy svg { animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---------- headings ---------- */
 h1 { font-size: 23px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 20px; display: flex; align-items: baseline; gap: 10px; }
