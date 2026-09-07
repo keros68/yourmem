@@ -299,6 +299,15 @@ input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px;
 .chip:hover { color: var(--fg); border-color: var(--accent); }
 .chip.on { background: var(--accent-soft); border-color: rgba(245, 158, 11, 0.4); color: var(--accent); font-weight: 600; }
 
+/* 接入页的选择项与按钮各占一行。chip 是带内边距的 inline 元素时不会撑高
+   普通行盒，下一行按钮会压上来；显式 flex 后由真实高度参与布局。 */
+.setup-scope { margin-top: 10px; color: var(--faint); font-size: 12px; line-height: 1.7; }
+.setup-scope > div { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.setup-scope strong { min-width: 104px; color: var(--dim); font-weight: 600; }
+#setup-agents { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 12px 0 14px; }
+#setup-agents .chip { display: inline-flex; align-items: center; gap: 6px; }
+#setup-actions { margin-bottom: 18px; }
+
 /* ---------- pills ---------- */
 .pill {
   display: inline-flex; align-items: center; padding: 2px 9px; border-radius: 99px;

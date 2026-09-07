@@ -39,7 +39,7 @@ yourmem 在本机统一归档、搜索和管理 Claude Code、Codex、OpenCode�
 
 ### 让 AI 编程助手直接调用
 
-yourmem 提供 MCP 接口。接入后，可以在任意受支持的 AI 编程助手中直接检索历史、读取项目上下文、查看旧记忆或写入交接，例如：
+yourmem 提供标准 stdio MCP 接口。一键接入支持 Claude Code、Codex、ZCode、Kimi Code、Gemini CLI、Cursor 和 Hermes；其他兼容 stdio MCP 的客户端也可以手动配置 `yourmem mcp`。接入后，可以直接检索历史、读取项目上下文、查看旧记忆或写入交接，例如：
 
 > 用 yourmem 读取这个项目的上下文。
 
@@ -49,7 +49,7 @@ yourmem 提供 MCP 接口。接入后，可以在任意受支持的 AI 编程助
 
 ## 安装
 
-目前提供 Windows x64 安装包。从 [Releases](../../releases) 下载最新版本，双击安装，无需管理员权限。
+目前提供 Windows x64 安装包，以及适用于 Apple Silicon 和 Intel 芯片的 macOS 安装包。从 [Releases](../../releases) 下载最新版本。安装包暂未签名，Windows 可能显示未知发布者提示；macOS 首次打开时可能需要在系统设置的“隐私与安全性”中确认。
 
 首次启动时可以选择备份目录，也可以跳过并使用默认位置。
 

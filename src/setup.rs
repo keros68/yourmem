@@ -48,6 +48,10 @@ pub struct Targets {
     pub claude_md: PathBuf,     // ~/.claude/CLAUDE.md
     pub codex_config: PathBuf,  // ~/.codex/config.toml
     pub codex_agents: PathBuf,  // ~/.codex/AGENTS.md
+    pub zcode_config: PathBuf,  // ~/.zcode/cli/config.json（mcp.servers）
+    pub kimi_mcp: PathBuf,      // ~/.kimi-code/mcp.json（mcpServers）
+    pub gemini_settings: PathBuf, // ~/.gemini/settings.json（mcpServers）
+    pub cursor_mcp: PathBuf,    // ~/.cursor/mcp.json（mcpServers）
     pub hermes_config: PathBuf, // ~/.hermes/config.yaml（mcp_servers 段，0.3.9 起）
 }
 
@@ -59,6 +63,10 @@ impl Default for Targets {
             claude_md: home.join(".claude").join("CLAUDE.md"),
             codex_config: home.join(".codex").join("config.toml"),
             codex_agents: home.join(".codex").join("AGENTS.md"),
+            zcode_config: home.join(".zcode").join("cli").join("config.json"),
+            kimi_mcp: home.join(".kimi-code").join("mcp.json"),
+            gemini_settings: home.join(".gemini").join("settings.json"),
+            cursor_mcp: home.join(".cursor").join("mcp.json"),
             hermes_config: home.join(".hermes").join("config.yaml"),
         }
     }
@@ -69,23 +77,37 @@ impl Targets {
         match agent {
             "claude" => self.claude_md.parent().map(|p| p.is_dir()).unwrap_or(false) || self.claude_json.is_file(),
             "codex" => self.codex_config.parent().map(|p| p.is_dir()).unwrap_or(false),
+            "zcode" => self.zcode_config.parent().map(|p| p.is_dir()).unwrap_or(false),
+            "kimi" => self.kimi_mcp.parent().map(|p| p.is_dir()).unwrap_or(false),
+            "gemini" => self.gemini_settings.parent().map(|p| p.is_dir()).unwrap_or(false),
+            "cursor" => self.cursor_mcp.parent().map(|p| p.is_dir()).unwrap_or(false),
             "hermes" => self.hermes_config.is_file(),
             _ => false,
         }
     }
 
-    /// 已注册的 MCP 命令路径（claude 从 JSON 取，codex/hermes 从文本取）。
+    /// 已注册的 MCP 命令路径。不同 agent 的配置位置与键名不同，逐一按其
+    /// 真机格式读取，不能把“都是 JSON”误当成相同 schema。
     fn registered_mcp_command(&self, agent: &str) -> Option<String> {
         match agent {
-            "claude" => std::fs::read_to_string(&self.claude_json)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| v.pointer("/mcpServers/yourmem/command").cloned())
-                .and_then(|v| v.as_str().map(str::to_string)),
+            "claude" => json_registered_command(&self.claude_json, "/mcpServers/yourmem/command"),
+            "zcode" => json_registered_command(&self.zcode_config, "/mcp/servers/yourmem/command"),
+            "kimi" => json_registered_command(&self.kimi_mcp, "/mcpServers/yourmem/command"),
+            "gemini" => json_registered_command(&self.gemini_settings, "/mcpServers/yourmem/command"),
+            "cursor" => json_registered_command(&self.cursor_mcp, "/mcpServers/yourmem/command"),
             "hermes" => hermes_registered_command(&std::fs::read_to_string(&self.hermes_config).unwrap_or_default()),
-            _ => codex_registered_command(&std::fs::read_to_string(&self.codex_config).unwrap_or_default()),
+            "codex" => codex_registered_command(&std::fs::read_to_string(&self.codex_config).unwrap_or_default()),
+            _ => None,
         }
     }
+}
+
+fn json_registered_command(path: &Path, pointer: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.pointer(pointer).cloned())
+        .and_then(|v| v.as_str().map(str::to_string))
 }
 
 /// 从 config.yaml 文本里找 mcp_servers 段下 `  yourmem:` 块的 command 值
@@ -223,7 +245,7 @@ pub fn resolve_cli_exe() -> Result<PathBuf> {
 }
 
 /// 门控要素 1：预览。返回每个 agent 的每个动作及其当前状态（done/todo/skip）。
-const SETUP_AGENTS: [&str; 3] = ["claude", "codex", "hermes"];
+const SETUP_AGENTS: [&str; 7] = ["claude", "codex", "zcode", "kimi", "gemini", "cursor", "hermes"];
 
 /// 只预览用户选中的 agent。桌面端用它把“检测到”与“要接入”分开；CLI 仍默认全选。
 pub fn plan_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
@@ -241,14 +263,22 @@ pub fn plan_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
             agents.push(json!({ "agent": agent, "status": "skip", "reason": "未检测到配置目录" }));
             continue;
         }
-        // hermes 只有 MCP 注册一个动作——她有自己的人格/提示词体系，不写全局指令块
-        if agent == "hermes" {
-            let (st, detail) = mcp_status(targets.registered_mcp_command("hermes"));
+        // 这些 agent 只注册经过本机或官方文档确认的 MCP 配置；它们的全局指令
+        // 发现与覆盖规则未逐一验证，不在 setup 中猜路径写入。
+        if matches!(agent, "zcode" | "kimi" | "gemini" | "cursor" | "hermes") {
+            let (st, detail) = mcp_status(targets.registered_mcp_command(agent));
+            let path = match agent {
+                "zcode" => &targets.zcode_config,
+                "kimi" => &targets.kimi_mcp,
+                "gemini" => &targets.gemini_settings,
+                "cursor" => &targets.cursor_mcp,
+                _ => &targets.hermes_config,
+            };
             agents.push(json!({
                 "agent": agent,
                 "status": "detected",
                 "actions": [
-                    { "kind": "register_mcp", "path": targets.hermes_config,
+                    { "kind": "register_mcp", "path": path,
                       "status": st, "detail": detail },
                 ],
                 "mcp_entry": { "command": exe, "args": ["mcp"] },
@@ -319,6 +349,8 @@ pub fn execute_selected(targets: &Targets, selected: &[String]) -> Result<Value>
             let kind = action["kind"].as_str().unwrap_or_default();
             match kind {
                 "register_mcp" if name == "claude" => register_claude_mcp(&path, &exe)?,
+                "register_mcp" if name == "zcode" => register_zcode_mcp(&path, &exe)?,
+                "register_mcp" if matches!(name.as_str(), "kimi" | "gemini" | "cursor") => register_mcp_servers_json(&path, &exe)?,
                 "register_mcp" if name == "hermes" => register_hermes_mcp(&path, &exe)?,
                 "register_mcp" => register_codex_mcp(&path, &exe)?,
                 _ => write_instructions(&path)?,
@@ -327,7 +359,7 @@ pub fn execute_selected(targets: &Targets, selected: &[String]) -> Result<Value>
         }
         results.push(json!({ "agent": name, "status": "configured", "actions": done }));
     }
-    Ok(json!({ "agents": results, "verify": "新开一个 agent 会话，问它「以前是不是做过 X」——它应该先调 yourmem 再回答。" }))
+    Ok(json!({ "agents": results, "verify": "新开一个 agent 会话，在 MCP 或工具列表确认 yourmem；Claude Code/Codex 还会按全局指令在历史问题中主动调用。" }))
 }
 
 pub fn execute(targets: &Targets) -> Result<Value> {
@@ -429,6 +461,10 @@ mod tests {
         t.claude_md = dir.join("nope-claude/CLAUDE.md");
         t.codex_config = dir.join("nope-codex/config.toml");
         t.codex_agents = dir.join("nope-codex/AGENTS.md");
+        t.zcode_config = dir.join("nope-zcode/config.json");
+        t.kimi_mcp = dir.join("nope-kimi/mcp.json");
+        t.gemini_settings = dir.join("nope-gemini/settings.json");
+        t.cursor_mcp = dir.join("nope-cursor/mcp.json");
         t
     }
 
@@ -504,13 +540,50 @@ mod tests {
         let after2 = std::fs::read_to_string(&targets.hermes_config).unwrap();
         assert_eq!(after1, after2, "重复 setup 不得改动文件内容");
     }
+
+    #[test]
+    fn json_mcp_registration_preserves_neighbors() {
+        let dir = tempfile::tempdir().unwrap();
+        let zcode = dir.path().join("zcode/config.json");
+        let kimi = dir.path().join("kimi/mcp.json");
+        let gemini = dir.path().join("gemini/settings.json");
+        let cursor = dir.path().join("cursor/mcp.json");
+        for path in [&zcode, &kimi, &gemini, &cursor] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(
+            &zcode,
+            r#"{"skills":{"enabled":true},"mcp":{"servers":{"other":{"type":"http","url":"https://example.invalid"},"yourmem":{"enabled":false,"command":"old"}}}}"#,
+        ).unwrap();
+        std::fs::write(&kimi, r#"{"mcpServers":{"kimi-cu":{"command":"node","args":["server.js"]}}}"#).unwrap();
+        std::fs::write(&gemini, r#"{"hooks":{"BeforeTool":[]}}"#).unwrap();
+        std::fs::write(&cursor, r#"{"mcpServers":{"other":{"command":"node"}}}"#).unwrap();
+
+        register_zcode_mcp(&zcode, "C:/Program Files/yourmem/yourmem.exe").unwrap();
+        for path in [&kimi, &gemini, &cursor] {
+            register_mcp_servers_json(path, "C:/Program Files/yourmem/yourmem.exe").unwrap();
+        }
+        let z: Value = serde_json::from_str(&std::fs::read_to_string(&zcode).unwrap()).unwrap();
+        let k: Value = serde_json::from_str(&std::fs::read_to_string(&kimi).unwrap()).unwrap();
+        let g: Value = serde_json::from_str(&std::fs::read_to_string(&gemini).unwrap()).unwrap();
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(&cursor).unwrap()).unwrap();
+        assert_eq!(z["mcp"]["servers"]["yourmem"]["type"], "stdio");
+        assert_eq!(z["mcp"]["servers"]["yourmem"]["enabled"], false);
+        assert_eq!(z["mcp"]["servers"]["other"]["type"], "http");
+        assert_eq!(z["skills"]["enabled"], true);
+        assert_eq!(k["mcpServers"]["kimi-cu"]["command"], "node");
+        assert_eq!(g["hooks"]["BeforeTool"], json!([]));
+        assert_eq!(c["mcpServers"]["other"]["command"], "node");
+        for v in [&k, &g, &c] {
+            assert_eq!(v["mcpServers"]["yourmem"]["args"][0], "mcp");
+        }
+    }
 }
 
-/// Claude Code user-scope MCP 注册表：~/.claude.json 的 mcpServers。
-fn register_claude_mcp(path: &Path, exe: &str) -> Result<()> {
+fn read_json_config(path: &Path) -> Result<Value> {
     // 文件不存在 → 空对象起步；存在但读失败/不是合法 JSON → 拒绝：这份文件装着
     // 用户全部项目历史/配置，静默按空对象重写等于清空它（.bak 兜底救不了不知道的人）。
-    let mut v: Value = match std::fs::read_to_string(path) {
+    let value = match std::fs::read_to_string(path) {
         Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s)
             .with_context(|| format!("{} 不是合法 JSON，请先修复再 setup（不会自动重置）", path.display()))?,
         Ok(_) => json!({}),
@@ -519,6 +592,33 @@ fn register_claude_mcp(path: &Path, exe: &str) -> Result<()> {
             return Err(e).with_context(|| format!("读取 {} 失败（不会自动重置）", path.display()))
         }
     };
+    Ok(value)
+}
+
+/// Claude Code user-scope MCP 注册表：~/.claude.json 的 mcpServers。
+fn register_claude_mcp(path: &Path, exe: &str) -> Result<()> {
+    let mut v = read_json_config(path)?;
+    v["mcpServers"]["yourmem"] = json!({ "command": exe, "args": ["mcp"] });
+    backup_then_write(path, serde_json::to_string_pretty(&v)?.as_bytes())?;
+    Ok(())
+}
+
+/// ZCode 0.16.5：~/.zcode/cli/config.json 的 mcp.servers，stdio 需显式 type。
+fn register_zcode_mcp(path: &Path, exe: &str) -> Result<()> {
+    let mut v = read_json_config(path)?;
+    let enabled = v.pointer("/mcp/servers/yourmem/enabled").and_then(Value::as_bool);
+    let mut entry = json!({ "type": "stdio", "command": exe, "args": ["mcp"] });
+    if enabled == Some(false) {
+        entry["enabled"] = json!(false);
+    }
+    v["mcp"]["servers"]["yourmem"] = entry;
+    backup_then_write(path, serde_json::to_string_pretty(&v)?.as_bytes())?;
+    Ok(())
+}
+
+/// Kimi Code、Gemini CLI 与 Cursor 的用户级 JSON 配置均使用 mcpServers。
+fn register_mcp_servers_json(path: &Path, exe: &str) -> Result<()> {
+    let mut v = read_json_config(path)?;
     v["mcpServers"]["yourmem"] = json!({ "command": exe, "args": ["mcp"] });
     backup_then_write(path, serde_json::to_string_pretty(&v)?.as_bytes())?;
     Ok(())

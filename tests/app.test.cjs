@@ -199,3 +199,16 @@ test('storage copy distinguishes core data from backups and exports', () => {
   assert.match(source, /两者不是两份重复备份/);
   assert.doesNotMatch(source, /备份对象（objects）/);
 });
+
+test('setup UI separates choices from actions and discloses agent capability scope', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '../ui/style.css'), 'utf8');
+  assert.match(source, /一键接入表示自动修改 agent 的 MCP 配置/);
+  assert.match(source, /自动配置 MCP/);
+  assert.match(source, /支持会话采集/);
+  assert.match(source, /其他 MCP agent/);
+  assert.match(source, /不受上列名单限制/);
+  assert.match(source, /本机仅检测到目录/);
+  assert.match(css, /#setup-agents\s*\{[^}]*display:\s*flex/);
+  assert.match(css, /#setup-actions\s*\{[^}]*margin-bottom:/);
+});

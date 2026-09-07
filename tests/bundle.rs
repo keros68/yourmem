@@ -343,13 +343,17 @@ fn setup_gate_plan_and_execute() {
         claude_md: fake.path().join(".claude").join("CLAUDE.md"),
         codex_config: fake.path().join(".codex").join("config.toml"),
         codex_agents: fake.path().join(".codex").join("AGENTS.md"),
+        zcode_config: fake.path().join("nope-zcode/config.json"),
+        kimi_mcp: fake.path().join("nope-kimi/mcp.json"),
+        gemini_settings: fake.path().join("nope-gemini/settings.json"),
+        cursor_mcp: fake.path().join("nope-cursor/mcp.json"),
         hermes_config: fake.path().join("nope-hermes.yaml"),
     };
 
     // 预览：claude+codex 各两个 todo 动作（hermes 未装 → skip，0.3.9 起入预览清单）
     let p = setup::plan(&targets).unwrap();
     let agents = p["agents"].as_array().unwrap();
-    assert_eq!(agents.len(), 3);
+    assert_eq!(agents.len(), 7);
     assert_eq!(agents.iter().filter(|a| a["status"] == "detected").count(), 2);
     assert!(agents.iter().filter(|a| a["status"] == "detected")
         .all(|a| a["actions"].as_array().unwrap().iter().all(|act| act["status"] == "todo")));
@@ -413,6 +417,10 @@ fn setup_selected_only_returns_requested_agents() {
         claude_md: fake.path().join(".claude").join("CLAUDE.md"),
         codex_config: fake.path().join(".codex").join("config.toml"),
         codex_agents: fake.path().join(".codex").join("AGENTS.md"),
+        zcode_config: fake.path().join("nope-zcode/config.json"),
+        kimi_mcp: fake.path().join("nope-kimi/mcp.json"),
+        gemini_settings: fake.path().join("nope-gemini/settings.json"),
+        cursor_mcp: fake.path().join("nope-cursor/mcp.json"),
         hermes_config: fake.path().join("hermes.yaml"),
     };
     let selected = vec!["codex".to_string()];
@@ -425,6 +433,50 @@ fn setup_selected_only_returns_requested_agents() {
     assert_eq!(std::fs::read_to_string(&targets.hermes_config).unwrap(), "mcp_servers:\n");
     assert!(setup::plan_selected(&targets, &[]).is_err());
     assert!(setup::plan_selected(&targets, &["unknown".to_string()]).is_err());
+}
+
+#[test]
+fn setup_selected_registers_json_agents_without_touching_other_agents() {
+    let fake = tempfile::tempdir().unwrap();
+    for dir in [".zcode/cli", ".kimi-code", ".gemini", ".cursor"] {
+        std::fs::create_dir_all(fake.path().join(dir)).unwrap();
+    }
+    std::fs::write(fake.path().join(".zcode/cli/config.json"), r#"{"plugins":{"enabled":{}}}"#).unwrap();
+    std::fs::write(fake.path().join(".kimi-code/mcp.json"), r#"{"mcpServers":{"other":{"command":"node"}}}"#).unwrap();
+    std::fs::write(fake.path().join(".gemini/settings.json"), r#"{"hooks":{}}"#).unwrap();
+    let targets = setup::Targets {
+        claude_json: fake.path().join("nope-claude/.claude.json"),
+        claude_md: fake.path().join("nope-claude/CLAUDE.md"),
+        codex_config: fake.path().join("nope-codex/config.toml"),
+        codex_agents: fake.path().join("nope-codex/AGENTS.md"),
+        zcode_config: fake.path().join(".zcode/cli/config.json"),
+        kimi_mcp: fake.path().join(".kimi-code/mcp.json"),
+        gemini_settings: fake.path().join(".gemini/settings.json"),
+        cursor_mcp: fake.path().join(".cursor/mcp.json"),
+        hermes_config: fake.path().join("nope-hermes/config.yaml"),
+    };
+    let selected = vec!["zcode".to_string(), "kimi".to_string(), "gemini".to_string(), "cursor".to_string()];
+    let plan = setup::plan_selected(&targets, &selected).unwrap();
+    assert_eq!(plan["agents"].as_array().unwrap().len(), 4);
+    assert!(plan["agents"].as_array().unwrap().iter().all(|a| {
+        a["status"] == "detected" && a["actions"].as_array().unwrap().len() == 1
+            && a["actions"][0]["kind"] == "register_mcp"
+    }));
+
+    setup::execute_selected(&targets, &selected).unwrap();
+    let z: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&targets.zcode_config).unwrap()).unwrap();
+    let k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&targets.kimi_mcp).unwrap()).unwrap();
+    let g: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&targets.gemini_settings).unwrap()).unwrap();
+    let c: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&targets.cursor_mcp).unwrap()).unwrap();
+    assert_eq!(z["mcp"]["servers"]["yourmem"]["type"], "stdio");
+    assert_eq!(z["mcp"]["servers"]["yourmem"]["args"][0], "mcp");
+    assert_eq!(k["mcpServers"]["other"]["command"], "node");
+    for v in [&k, &g, &c] {
+        assert_eq!(v["mcpServers"]["yourmem"]["args"][0], "mcp");
+    }
+    assert_eq!(g["hooks"], serde_json::json!({}));
+    assert!(!targets.claude_json.exists());
+    assert!(!targets.codex_config.exists());
 }
 
 // 依赖 stub_version 的 sh 脚本，Windows 无法执行，整测试门控 unix。
@@ -441,6 +493,10 @@ fn setup_detects_and_refreshes_stale_mcp_registration() {
         claude_md: fake.path().join(".claude").join("CLAUDE.md"),
         codex_config: fake.path().join(".codex").join("config.toml"),
         codex_agents: fake.path().join(".codex").join("AGENTS.md"),
+        zcode_config: fake.path().join("nope-zcode/config.json"),
+        kimi_mcp: fake.path().join("nope-kimi/mcp.json"),
+        gemini_settings: fake.path().join("nope-gemini/settings.json"),
+        cursor_mcp: fake.path().join("nope-cursor/mcp.json"),
         hermes_config: fake.path().join("nope-hermes.yaml"),
     };
     let old = stub_version(fake.path(), "0.0.1");
@@ -500,6 +556,10 @@ fn instruction_block_version_gate() {
         claude_md: fake.path().join(".claude").join("CLAUDE.md"),
         codex_config: fake.path().join(".codex").join("config.toml"),
         codex_agents: fake.path().join(".codex").join("AGENTS.md"),
+        zcode_config: fake.path().join("nope-zcode/config.json"),
+        kimi_mcp: fake.path().join("nope-kimi/mcp.json"),
+        gemini_settings: fake.path().join("nope-gemini/settings.json"),
+        cursor_mcp: fake.path().join("nope-cursor/mcp.json"),
         hermes_config: fake.path().join("nope-hermes.yaml"),
     };
     // 只有 claude 目录存在 → codex skip；指令文件含旧版块（有 marker、无新全文），
