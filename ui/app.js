@@ -827,6 +827,10 @@ async function renderSettings() {
     : v === "partial" ? '<span class="cap-partial">◐</span>'
     : '<span class="cap-no">—</span>';
   const home = info.home;
+  const setupAgents = ["claude", "codex", "hermes"].map((name) => {
+    const source = agentsInfo.agents.find((a) => a.agent === name);
+    return { name, checked: !!source?.detected && !source?.disabled, disabled: !!source?.disabled };
+  });
   // 简约优先（用户反馈 2026-08-29）：已停用的源与未安装的观察名单默认都收起来
   const disabledCount = agentsInfo.agents.filter((a) => a.disabled).length;
   // 默认文件名用本地日期：toISOString 是 UTC，东八区凌晨 0-8 点会早一天（自检 C5）
@@ -957,7 +961,10 @@ async function renderSettings() {
       <table><tr><th>入口 / 操作</th><th>最近结果</th><th>完成时间</th><th>上次成功</th></tr>${(info.recall_status || []).map(r => `<tr><td>${esc(r.source)} / ${esc(r.name)}</td><td>${r.ok === true ? `成功${r.result_count != null ? `（${r.result_count} 条）` : ""}` : r.ok === false ? "失败" : "暂无结果记录"}</td><td>${fmtTime(r.completed_at)}</td><td>${fmtTime(r.last_success)}</td></tr>`).join("")}</table></div>
       <h2>一键接入 agent</h2>
       <div class="memcard">
-        <div class="meta" style="margin-top:0">检测本机 agent（claude / codex）→ 注册 MCP + 写全局指令。覆盖前自动 .bak 备份，幂等。</div>
+        <div class="meta" style="margin-top:0">选择要接入的 agent，再检查其 MCP 注册和全局指令。是否正在运行不影响检测结果；新配置在新会话中生效。覆盖前自动 .bak 备份。</div>
+        <div class="pillrow" id="setup-agents" style="margin-top:10px">
+          ${setupAgents.map((a) => `<label class="chip" style="cursor:pointer"><input type="checkbox" data-setup-agent="${a.name}" ${a.checked ? "checked" : ""} /> ${a.name}${a.disabled ? "（已停用）" : ""}</label>`).join("")}
+        </div>
         <div class="searchbar">
           <button class="btn" id="setup-plan">检测并预览</button>
           <button class="btn primary hidden" id="setup-run">确认执行接入</button>
@@ -1151,15 +1158,31 @@ async function renderSettings() {
         <table>${r.checks.map((c) => `<tr><td>${icon(c.status)}</td><td style="white-space:nowrap">${esc(c.name)}</td><td style="color:var(--dim)">${esc(c.detail)}</td></tr>`).join("")}</table>`;
     } catch (e) { $("#doctor-report").innerHTML = `<div class="meta">✗ 自检失败：${esc(e)}</div>`; }
   };
+  let plannedSetupAgents = [];
+  const selectedSetupAgents = () => Array.from(document.querySelectorAll("#page-settings [data-setup-agent]"))
+    .filter((box) => box.checked).map((box) => box.dataset.setupAgent);
+  document.querySelectorAll("#page-settings [data-setup-agent]").forEach((box) => {
+    box.onchange = () => {
+      plannedSetupAgents = [];
+      $("#setup-run").classList.add("hidden");
+      $("#setup-report").innerHTML = '';
+    };
+  });
   $("#setup-plan").onclick = async () => {
     const btn = $("#setup-plan");
+    const agents = selectedSetupAgents();
+    if (!agents.length) {
+      $("#setup-report").innerHTML = '<div class="meta proof-bad">请至少选择一个要接入的 agent。</div>';
+      return;
+    }
     btn.disabled = true;
     $("#setup-report").innerHTML = '<div class="meta">检测中…</div>';
     try {
-      const p = await invoke("setup_plan");
+      const p = await invoke("setup_plan", { agents });
       $("#setup-report").innerHTML = (p.agents || []).map((a) => `
         <div class="meta">${esc(a.agent)}：${a.status === "skip" ? "未检测到，跳过" :
           (a.actions || []).map((x) => `${x.kind === "register_mcp" ? "注册 MCP" : "全局指令"} → ${esc(x.path)}（${x.status === "done" ? "已配置" : x.status === "stale" ? "旧版待更新" : "待写入"}）`).join("；")}</div>`).join("");
+      plannedSetupAgents = agents;
       $("#setup-run").classList.remove("hidden");
     } catch (e) {
       $("#setup-report").innerHTML = `<div class="meta proof-bad">✗ 检测失败：${esc(String(e))}</div>`;
@@ -1169,10 +1192,11 @@ async function renderSettings() {
   };
   $("#setup-run").onclick = async () => {
     const btn = $("#setup-run");
+    if (!plannedSetupAgents.length) return;
     btn.disabled = true;
     $("#setup-report").innerHTML = '<div class="meta">执行中…</div>';
     try {
-      const r = await invoke("setup_run");
+      const r = await invoke("setup_run", { agents: plannedSetupAgents });
       $("#setup-report").innerHTML = `<div class="meta">✓ 完成。验证方式：${esc(r.verify)}</div>`;
       $("#setup-run").classList.add("hidden");
     } catch (e) {

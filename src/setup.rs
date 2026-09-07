@@ -223,10 +223,20 @@ pub fn resolve_cli_exe() -> Result<PathBuf> {
 }
 
 /// 门控要素 1：预览。返回每个 agent 的每个动作及其当前状态（done/todo/skip）。
-pub fn plan(targets: &Targets) -> Result<Value> {
+const SETUP_AGENTS: [&str; 3] = ["claude", "codex", "hermes"];
+
+/// 只预览用户选中的 agent。桌面端用它把“检测到”与“要接入”分开；CLI 仍默认全选。
+pub fn plan_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
+    anyhow::ensure!(!selected.is_empty(), "请至少选择一个要接入的 agent");
+    for agent in selected {
+        anyhow::ensure!(SETUP_AGENTS.contains(&agent.as_str()), "不支持接入 agent: {agent}");
+    }
     let exe = resolve_cli_exe()?.to_string_lossy().to_string();
     let mut agents = Vec::new();
-    for agent in ["claude", "codex", "hermes"] {
+    for agent in SETUP_AGENTS {
+        if !selected.iter().any(|a| a == agent) {
+            continue;
+        }
         if !targets.agent_present(agent) {
             agents.push(json!({ "agent": agent, "status": "skip", "reason": "未检测到配置目录" }));
             continue;
@@ -283,9 +293,13 @@ pub fn plan(targets: &Targets) -> Result<Value> {
     }))
 }
 
+pub fn plan(targets: &Targets) -> Result<Value> {
+    plan_selected(targets, &SETUP_AGENTS.map(str::to_string))
+}
+
 /// 门控要素 3/4：备份后执行。`confirmed` 由调用方保证。
-pub fn execute(targets: &Targets) -> Result<Value> {
-    let plan = plan(targets)?;
+pub fn execute_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
+    let plan = plan_selected(targets, selected)?;
     let exe = resolve_cli_exe()?.to_string_lossy().to_string();
     let mut results = Vec::new();
 
@@ -314,6 +328,10 @@ pub fn execute(targets: &Targets) -> Result<Value> {
         results.push(json!({ "agent": name, "status": "configured", "actions": done }));
     }
     Ok(json!({ "agents": results, "verify": "新开一个 agent 会话，问它「以前是不是做过 X」——它应该先调 yourmem 再回答。" }))
+}
+
+pub fn execute(targets: &Targets) -> Result<Value> {
+    execute_selected(targets, &SETUP_AGENTS.map(str::to_string))
 }
 
 /// 追加式后缀，完整保留原文件名（`foo.md` → `foo.md.bak-…`）。

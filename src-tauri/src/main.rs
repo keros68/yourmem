@@ -760,8 +760,8 @@ async fn bundle_restore(path: String, merge: bool) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn setup_plan() -> Result<Value, String> {
-    run_blocking(|| yourmem::setup::plan(&yourmem::setup::Targets::default()).map_err(|e| e.to_string())).await
+async fn setup_plan(agents: Vec<String>) -> Result<Value, String> {
+    run_blocking(move || yourmem::setup::plan_selected(&yourmem::setup::Targets::default(), &agents).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command]
@@ -776,11 +776,11 @@ async fn project_review(project_id: i64, mark_reviewed: Option<bool>) -> Result<
 
 /// UI 侧的"确认"由前端二次确认按钮承担（门控语义不变：预览→确认→备份→执行）。
 #[tauri::command]
-async fn setup_run() -> Result<Value, String> {
-    run_blocking(|| {
+async fn setup_run(agents: Vec<String>) -> Result<Value, String> {
+    run_blocking(move || {
         let conn = open()?;
         let _ = db::log_usage(&conn, "app", "setup_run");
-        yourmem::setup::execute(&yourmem::setup::Targets::default()).map_err(|e| e.to_string())
+        yourmem::setup::execute_selected(&yourmem::setup::Targets::default(), &agents).map_err(|e| e.to_string())
     })
     .await
 }

@@ -403,6 +403,30 @@ fn setup_gate_plan_and_execute() {
     assert!(!baks.is_empty(), "覆盖前必须留下 .bak 时间戳备份");
 }
 
+#[test]
+fn setup_selected_only_returns_requested_agents() {
+    let fake = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(fake.path().join(".codex")).unwrap();
+    std::fs::write(fake.path().join("hermes.yaml"), "mcp_servers:\n").unwrap();
+    let targets = setup::Targets {
+        claude_json: fake.path().join(".claude.json"),
+        claude_md: fake.path().join(".claude").join("CLAUDE.md"),
+        codex_config: fake.path().join(".codex").join("config.toml"),
+        codex_agents: fake.path().join(".codex").join("AGENTS.md"),
+        hermes_config: fake.path().join("hermes.yaml"),
+    };
+    let selected = vec!["codex".to_string()];
+    let plan = setup::plan_selected(&targets, &selected).unwrap();
+    let agents = plan["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["agent"], "codex");
+    setup::execute_selected(&targets, &selected).unwrap();
+    assert!(std::fs::read_to_string(&targets.codex_config).unwrap().contains("[mcp_servers.yourmem]"));
+    assert_eq!(std::fs::read_to_string(&targets.hermes_config).unwrap(), "mcp_servers:\n");
+    assert!(setup::plan_selected(&targets, &[]).is_err());
+    assert!(setup::plan_selected(&targets, &["unknown".to_string()]).is_err());
+}
+
 // 依赖 stub_version 的 sh 脚本，Windows 无法执行，整测试门控 unix。
 #[cfg(unix)]
 #[test]
