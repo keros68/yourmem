@@ -821,8 +821,8 @@ pub fn index_status(conn: &Connection) -> Result<Value> {
     }))
 }
 
-/// 数据目录三项占用（db / objects / backups），设置页「存储占用」与
-/// `index status` 的消费方；objects 是几十万碎文件，调用方须放阻塞线程。
+/// 核心数据与备份目录的占用和实际位置，供设置页明确区分两类存储。
+/// objects 是几十万碎文件，调用方须放阻塞线程。
 pub fn storage_usage(home: &Path) -> Value {
     let dir_bytes = |p: &Path| -> u64 {
         walkdir::WalkDir::new(p)
@@ -833,11 +833,16 @@ pub fn storage_usage(home: &Path) -> Value {
             .map(|m| m.len())
             .sum()
     };
+    let objects = crate::vault::objects_root(home);
+    let backups = crate::backups_dir(home);
     json!({
+        "data_dir": home.display().to_string(),
+        "objects_dir": objects.display().to_string(),
+        "backups_dir": backups.display().to_string(),
         "db_bytes": std::fs::metadata(home.join("yourmem.db")).map(|m| m.len()).unwrap_or(0)
             + std::fs::metadata(home.join("yourmem.db-wal")).map(|m| m.len()).unwrap_or(0),
-        "objects_bytes": dir_bytes(&crate::vault::objects_root(home)),
-        "backups_bytes": dir_bytes(&crate::backups_dir(home)),
+        "objects_bytes": dir_bytes(&objects),
+        "backups_bytes": dir_bytes(&backups),
     })
 }
 

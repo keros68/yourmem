@@ -190,3 +190,12 @@ test('manual import keeps the current page visible until one completed refresh',
   assert.ok(!classes.has('busy'));
   assert.doesNotMatch(f.get('#page-sessions').innerHTML, /加载中/);
 });
+
+test('storage copy distinguishes core data from backups and exports', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
+  assert.match(source, /存储与备份/);
+  assert.match(source, /会话原文归档/);
+  assert.match(source, /备份与导出/);
+  assert.match(source, /两者不是两份重复备份/);
+  assert.doesNotMatch(source, /备份对象（objects）/);
+});

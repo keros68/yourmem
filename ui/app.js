@@ -96,7 +96,7 @@ async function renderToday() {
       <div class="card"><div class="num">${st.sessions}</div><div class="label">对话</div></div>
       <div class="card"><div class="num">${st.messages}</div><div class="label">消息</div></div>
       <div class="card"><div class="num">${st.memories}</div><div class="label">记忆（待确认 ${st.memories_suggested}）</div></div>
-      <div class="card"><div class="num">${st.vault_lines}</div><div class="label" title="对话逐行备份的总行数；对话的删除/归档在「对话」页的回收站">备份行数</div></div>
+      <div class="card"><div class="num">${st.vault_lines}</div><div class="label" title="已保存的会话原文行数；对话的删除和恢复在「对话」页的回收站">原文归档行数</div></div>
     </div>
     ${agentPills ? `<div class="digest agent-mini" style="margin-bottom:16px">${st.sessions} 个对话来自 ${st.by_agent.length} 种 agent：${agentPills}</div>` : ""}
     <h2>今日对话（${d.today_sessions.length}）</h2>
@@ -837,13 +837,13 @@ async function renderSettings() {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, "0");
   const today = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
-  // 二级 tab：数据源 / 能力矩阵 / 备份 / 接入 / 通用（清理偏好+关于）
+  // 二级 tab：数据源 / 能力矩阵 / 存储与备份 / 接入 / 通用（清理偏好+关于）
   const stab = (id, label) => `<button class="subtab ${settingsTab === id ? "on" : ""}" data-stab="${id}">${label}</button>`;
   const panel = (id, inner) => `<div class="subpanel ${settingsTab === id ? "on" : ""}" data-spanel="${id}">${inner}</div>`;
   $("#page-settings").innerHTML = `
     <h1>设置 <span class="en">Settings</span></h1>
     <div class="subtabs">
-      ${stab("sources", "数据源")}${stab("cap", "能力矩阵")}${stab("backup", "备份")}${stab("setup", "接入")}${stab("general", "通用")}
+      ${stab("sources", "数据源")}${stab("cap", "能力矩阵")}${stab("backup", "存储与备份")}${stab("setup", "接入")}${stab("general", "通用")}
     </div>
     ${panel("sources", `
       <h2>Agent 数据源</h2>
@@ -899,9 +899,9 @@ async function renderSettings() {
       </div>`)}
 
     ${panel("backup", `
-      <h2>备份位置</h2>
+      <h2>备份与导出位置</h2>
       <div class="memcard">
-        <div class="meta" style="margin-top:0">数据库快照、导出原件和删除档案保存到此目录。保存新位置时会迁移已有备份；原始归档对象仍在数据目录，改到其他磁盘后也需创建完整备份。</div>
+        <div class="meta" style="margin-top:0">这里只存放手动生成的数据库快照、会话导出和删除档案。保存新位置时会迁移这些已有文件，不会移动软件正在使用的数据库和会话原文归档。</div>
         <div class="searchbar">
           <input type="text" id="backup-dir" style="flex:1" placeholder="绝对路径，如 D:\\yourmem-backup" value="${esc(bd.configured)}" />
           <button class="btn" id="backup-dir-pick">选择文件夹</button>
@@ -911,6 +911,7 @@ async function renderSettings() {
       </div>
       <h2>存储占用</h2>
       <div class="memcard">
+        <div class="meta" style="margin-top:0">核心数据是软件正在使用的数据；备份与导出是按需生成的文件，两者不是两份重复备份。</div>
         <div class="searchbar" style="margin-top:0">
           <button class="btn" id="storage-usage">查看占用</button>
           <button class="btn" id="storage-compact">回收空闲空间</button>
@@ -1239,12 +1240,15 @@ async function renderSettings() {
     try {
       const u = await invoke("storage_usage");
       const st = await invoke("index_status");
-      $("#storage-report").innerHTML = `<table>
-        <tr><td>数据库</td><td class="c-num">${fmtBytes(u.db_bytes)}</td></tr>
-        <tr><td>备份对象（objects）</td><td class="c-num">${fmtBytes(u.objects_bytes)}</td></tr>
-        <tr><td>快照与档案（backups）</td><td class="c-num">${fmtBytes(u.backups_bytes)}</td></tr>
+      $("#storage-report").innerHTML = `
+        <div class="meta" style="margin:12px 14px 2px"><strong>核心数据</strong> · 软件运行和恢复原文需要<br><span style="overflow-wrap:anywhere">${esc(u.data_dir)}</span></div>
+        <table>
+        <tr><td>数据库与搜索索引</td><td class="c-num">${fmtBytes(u.db_bytes)}</td></tr>
+        <tr><td>会话原文归档</td><td class="c-num">${fmtBytes(u.objects_bytes)}</td></tr>
         ${st.free_bytes > 1048576 ? `<tr><td>其中空闲页可回收</td><td class="c-num">${fmtBytes(st.free_bytes)}</td></tr>` : ""}
-      </table>`;
+        </table>
+        <div class="meta" style="margin:14px 14px 2px"><strong>备份与导出</strong> · 手动生成，不影响软件日常使用<br><span style="overflow-wrap:anywhere">${esc(u.backups_dir)}</span></div>
+        <table><tr><td>快照、导出与删除档案</td><td class="c-num">${fmtBytes(u.backups_bytes)}</td></tr></table>`;
     } catch (e) {
       $("#storage-report").innerHTML = `<div class="meta">✗ 读取失败：${esc(String(e))}</div>`;
     }
@@ -1440,8 +1444,8 @@ function showWizard(fr) {
     <div class="wiz-card">
       <h2 style="margin-top:0">欢迎使用 yourmem</h2>
       <p class="meta">把你与 AI 编程助手的对话自动归档、统一检索，数据保存在你自己的电脑上。</p>
-      <h3>备份存到哪里？</h3>
-      <p class="meta">数据库快照、导出原件、彻底删除前的档案都存这个目录。留空用默认位置。</p>
+      <h3>备份与导出存到哪里？</h3>
+      <p class="meta">这里存放手动生成的数据库快照、会话导出和删除档案。核心数据仍保存在 ${esc(fr.home)}；留空使用默认位置。</p>
       <div class="searchbar">
         <input type="text" id="wiz-backup-dir" style="flex:1" placeholder="绝对路径，如 D:\\yourmem-backup" value="${esc(fr.suggested || "")}" />
         <button class="btn" id="wiz-pick">选择文件夹</button>
