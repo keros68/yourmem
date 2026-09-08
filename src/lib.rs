@@ -12,6 +12,7 @@ pub mod bundle;
 pub mod db;
 pub mod doctor;
 pub mod dossier;
+pub mod organizer;
 pub mod ingest;
 pub mod mcp;
 pub mod memfiles;

@@ -163,6 +163,89 @@ fn daily_digest(day: Option<String>) -> Result<Value, String> {
     yourmem::dossier::daily_digest(&conn, &day).map_err(|e| e.to_string())
 }
 
+// ------------------------------------------------ 可选 AI 整理（API key 只进系统凭据库）
+
+const AI_KEY_SERVICE: &str = "yourmem.ai";
+const AI_KEY_ACCOUNT: &str = "default";
+
+fn ai_key_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(AI_KEY_SERVICE, AI_KEY_ACCOUNT)
+        .map_err(|e| format!("无法访问系统凭据库：{e}"))
+}
+
+fn ai_key_from_store() -> Result<Option<(String, &'static str)>, String> {
+    if let Ok(key) = std::env::var("YOUMEM_AI_API_KEY") {
+        if !key.trim().is_empty() {
+            return Ok(Some((key, "environment")));
+        }
+    }
+    match ai_key_entry()?.get_password() {
+        Ok(key) if !key.trim().is_empty() => Ok(Some((key, "keyring"))),
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("读取系统凭据库失败：{e}")),
+    }
+}
+
+#[tauri::command]
+fn ai_settings_get() -> Result<Value, String> {
+    let mut out = yourmem::organizer::settings_json(&data_home());
+    let key = ai_key_from_store()?;
+    out["key_configured"] = json!(key.is_some());
+    out["key_source"] = json!(key.map(|(_, source)| source));
+    let s = yourmem::organizer::load_settings(&data_home());
+    out["configured"] = json!(!s.model.trim().is_empty() && out["key_configured"] == true);
+    Ok(out)
+}
+
+#[tauri::command]
+fn ai_settings_save(
+    base_url: String,
+    model: String,
+    max_input_chars: usize,
+    api_key: Option<String>,
+    clear_key: Option<bool>,
+) -> Result<Value, String> {
+    let settings = yourmem::organizer::AiSettings { base_url, model, max_input_chars };
+    yourmem::organizer::validate_settings(&settings).map_err(|e| e.to_string())?;
+    if clear_key.unwrap_or(false) {
+        match ai_key_entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(format!("移除 API Key 失败：{e}")),
+        }
+    } else if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+        ai_key_entry()?.set_password(key.trim())
+            .map_err(|e| format!("保存 API Key 失败：{e}"))?;
+    }
+    yourmem::organizer::save_settings(&data_home(), &settings).map_err(|e| e.to_string())?;
+    ai_settings_get()
+}
+
+#[tauri::command]
+async fn ai_organize_day(day: Option<String>) -> Result<Value, String> {
+    let day = day.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
+    run_blocking(move || {
+        let home = data_home();
+        let settings = yourmem::organizer::load_settings(&home);
+        let (key, _) = ai_key_from_store()?.ok_or_else(|| "尚未配置 API Key".to_string())?;
+        let conn = db::open(&home).map_err(|e| e.to_string())?;
+        let activity = yourmem::dossier::daily_digest(&conn, &day).map_err(|e| e.to_string())?;
+        let mut out = yourmem::organizer::organize_with_api(&settings, &key, &activity)
+            .map_err(|e| e.to_string())?;
+        out["day"] = json!(day);
+        let _ = db::log_usage(&conn, "app", "ai_organize_day");
+        Ok(out)
+    }).await
+}
+
+#[tauri::command]
+fn ai_summary_save(day: String, summary: Value) -> Result<Value, String> {
+    let conn = open()?;
+    let out = yourmem::organizer::save_project_summary(&conn, &day, &summary)
+        .map_err(|e| e.to_string())?;
+    let _ = db::log_usage(&conn, "app", "ai_summary_save");
+    Ok(out)
+}
+
 #[tauri::command]
 fn sessions(project_id: Option<i64>, limit: Option<u32>) -> Result<Value, String> {
     let conn = open()?;
@@ -941,6 +1024,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             session_window, message_content, stats, today, projects, context, project_dossier, daily_digest, sessions, session,
+            ai_settings_get, ai_settings_save, ai_organize_day, ai_summary_save,
             project_add, project_archive, project_restore, open_in_finder,
             session_proof, session_verify, session_export, session_writeback_plan,
             session_writeback, capability_matrix,

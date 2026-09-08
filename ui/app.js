@@ -2,6 +2,7 @@ import { loadProjectRecall } from "./project-recall.js";
 import { graphDepths } from "./graph-layout.js";
 import { createSessionDrawer } from "./session-drawer.js";
 import { snapshotPanelHtml, bindSnapshotPanel } from "./snapshot-panel.js";
+import { workbenchHtml, aiSummaryHtml } from "./workbench.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -86,6 +87,8 @@ async function renderToday() {
   const st = d.stats;
   let dg = null, dgErr = null;
   try { dg = await invoke("daily_digest"); } catch (e) { dgErr = String(e); }
+  let aiConfig = null;
+  try { aiConfig = await invoke("ai_settings_get"); } catch (e) {}
   const agentPills = st.by_agent.map((a) => `<span class="it"><span class="dot ${esc(a.agent)}"></span>${esc(a.agent)} ${a.sessions}</span>`).join(" · ");
   $("#page-today").innerHTML = `
     <h1>今天 <span class="en">Today</span></h1>
@@ -99,6 +102,18 @@ async function renderToday() {
       <div class="card"><div class="num">${st.vault_lines}</div><div class="label" title="已保存的会话原文行数；对话的删除和恢复在「对话」页的回收站">原文归档行数</div></div>
     </div>
     ${agentPills ? `<div class="digest agent-mini" style="margin-bottom:16px">${st.sessions} 个对话来自 ${st.by_agent.length} 种 agent：${agentPills}</div>` : ""}
+    <div class="workbench-title">
+      <div><h2>今日工作</h2><p>按项目整合各 Agent 的对话、进展、产物和遗留事项；每项均可回到来源对话。</p></div>
+      <div class="workbench-actions">
+        <button class="btn" id="ai-settings">AI 设置</button>
+        <button class="btn primary" id="ai-organize" ${!dg?.project_activity?.length ? "disabled" : ""}>AI 整理今天</button>
+      </div>
+    </div>
+    ${dg ? workbenchHtml(dg) : ""}
+    <div class="ai-organizer">
+      <div class="ai-disclosure">AI 整理为可选功能。单次仅发送对话标题、末条 Agent 回复、任务、产物路径和交接摘要，不发送完整对话、文件内容或 API Key；发送上限可在设置中调整。</div>
+      <div id="ai-result">${aiConfig && !aiConfig.configured ? '<div class="work-empty">尚未配置 API；本地工作账本不受影响。</div>' : ""}</div>
+    </div>
     <h2>今日对话（${d.today_sessions.length}）</h2>
     <div class="scrollbox tight">${sessTable(d.today_sessions)}</div>
     <h2>未完成任务</h2>
@@ -107,7 +122,58 @@ async function renderToday() {
     <div class="scrollbox tight">${d.recent_handoffs.length ? d.recent_handoffs.map(handoffCard).join("") : '<div class="empty">暂无 handoff</div>'}</div>
   `;
   bindSessionRows("#page-today");
+  document.querySelectorAll("#page-today [data-work-session]").forEach((b) => {
+    b.onclick = () => showSession(b.dataset.workSession);
+  });
   snapScrollboxTables($("#page-today"));
+  $("#ai-settings").onclick = () => {
+    settingsTab = "ai";
+    document.querySelector('.nav[data-page="settings"]').click();
+  };
+  let aiResponse = null;
+  const saved = new Set();
+  const bindAiResult = () => {
+    $("#ai-result").innerHTML = aiSummaryHtml(aiResponse, saved);
+    document.querySelectorAll("#ai-result [data-ai-source]").forEach((b) => {
+      b.onclick = () => showSession(b.dataset.aiSource);
+    });
+    document.querySelectorAll("#ai-result [data-ai-save]").forEach((b) => {
+      b.onclick = async () => {
+        const i = Number(b.dataset.aiSave);
+        b.disabled = true;
+        try {
+          await invoke("ai_summary_save", { day: aiResponse.day || dg.day, summary: aiResponse.result.projects[i] });
+          saved.add(i);
+          bindAiResult();
+          toast("已保存为项目记忆");
+        } catch (e) { b.disabled = false; toast(String(e)); }
+      };
+    });
+  };
+  $("#ai-organize").onclick = async () => {
+    const b = $("#ai-organize"), out = $("#ai-result");
+    if (b.disabled) return;
+    if (!aiConfig?.configured) {
+      out.innerHTML = '<div class="digest digest-error">请先在“AI 设置”中填写 API 地址、模型名称和 API Key。</div>';
+      return;
+    }
+    b.disabled = true;
+    b.textContent = "正在整理…";
+    out.innerHTML = '<div class="state loading">正在发送精简工作记录并等待结果…</div>';
+    try {
+      aiResponse = await invoke("ai_organize_day", { day: dg.day });
+      if (b !== $("#ai-organize")) return;
+      saved.clear();
+      bindAiResult();
+    } catch (e) {
+      if (out === $("#ai-result")) out.innerHTML = `<div class="state error">AI 整理失败：${esc(String(e))}</div>`;
+    } finally {
+      if (b === $("#ai-organize")) {
+        b.disabled = false;
+        b.textContent = aiResponse ? "重新整理" : "AI 整理今天";
+      }
+    }
+  };
   document.querySelectorAll("#page-today [data-task-archive]").forEach((btn) => {
     btn.onclick = async () => {
       try {
@@ -837,6 +903,9 @@ async function renderSettings() {
   const cap = await invoke("capability_matrix");
   const idx = await invoke("index_status");
   const bd = await invoke("backup_dir_get");
+  let ai = { base_url: "https://api.openai.com/v1", model: "", max_input_chars: 40000, key_configured: false, key_source: null };
+  let aiSettingsError = "";
+  try { ai = await invoke("ai_settings_get"); } catch (e) { aiSettingsError = String(e); }
   // 能力矩阵格子：✓ 支持 / ◐ 部分 / — 不支持（诚实自报，证据写在 adapter 注释里）
   const capCell = (v) => v === "yes" ? '<span class="cap-yes">✓</span>'
     : v === "partial" ? '<span class="cap-partial">◐</span>'
@@ -859,13 +928,13 @@ async function renderSettings() {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, "0");
   const today = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
-  // 二级 tab：数据源 / 能力矩阵 / 存储与备份 / 接入 / 通用（清理偏好+关于）
+  // 二级 tab：数据源 / 能力矩阵 / 存储与备份 / 接入 / AI 整理 / 通用
   const stab = (id, label) => `<button class="subtab ${settingsTab === id ? "on" : ""}" data-stab="${id}">${label}</button>`;
   const panel = (id, inner) => `<div class="subpanel ${settingsTab === id ? "on" : ""}" data-spanel="${id}">${inner}</div>`;
   $("#page-settings").innerHTML = `
     <h1>设置 <span class="en">Settings</span></h1>
     <div class="subtabs">
-      ${stab("sources", "数据源")}${stab("cap", "能力矩阵")}${stab("backup", "存储与备份")}${stab("setup", "接入")}${stab("general", "通用")}
+      ${stab("sources", "数据源")}${stab("cap", "能力矩阵")}${stab("backup", "存储与备份")}${stab("setup", "接入")}${stab("ai", "AI 整理")}${stab("general", "通用")}
     </div>
     ${panel("sources", `
       <h2>Agent 数据源</h2>
@@ -1001,6 +1070,25 @@ async function renderSettings() {
         <div id="setup-report"></div>
       </div>`)}
 
+    ${panel("ai", `
+      <h2>AI 整理</h2>
+      <div class="memcard">
+        <div class="content">连接兼容 OpenAI Chat Completions 的 API，为“今日工作”生成带来源的项目摘要。未配置时，本地工作账本、搜索和归档仍可使用。</div>
+        <div class="ai-settings-note">单次仅发送对话标题、末条 Agent 回复、任务、产物路径和交接摘要，不发送完整对话、文件内容或 API Key。模型输出先作为建议显示，点击保存后才写入项目记忆。</div>
+        ${aiSettingsError ? `<div class="digest digest-error">系统凭据库不可用：${esc(aiSettingsError)}</div>` : ""}
+        <div class="form-grid ai-settings-form">
+          <label>API 根地址<input id="ai-base-url" type="url" value="${esc(ai.base_url)}" placeholder="https://api.openai.com/v1" /></label>
+          <label>模型名称<input id="ai-model" type="text" value="${esc(ai.model)}" placeholder="填写账号可用的模型 ID" /></label>
+          <label>单次发送上限<input id="ai-max-input" type="number" min="4000" max="200000" step="1000" value="${esc(ai.max_input_chars)}" /></label>
+          <label>API Key<input id="ai-api-key" type="password" autocomplete="off" placeholder="${ai.key_configured ? "已保存；留空保持不变" : "保存在系统凭据库"}" /></label>
+        </div>
+        <div class="searchbar">
+          <button class="btn primary" id="ai-settings-save">保存设置</button>
+          <button class="btn" id="ai-key-clear" ${ai.key_configured && ai.key_source !== "environment" ? "" : "disabled"}>移除 API Key</button>
+          <span id="ai-settings-state" class="setting-state">${ai.key_configured ? `API Key：${ai.key_source === "environment" ? "由环境变量提供" : "已保存在系统凭据库"}` : "尚未保存 API Key"}</span>
+        </div>
+      </div>`)}
+
     ${panel("general", `
       <h2>后台运行</h2>
       <div class="memcard"><div class="meta" style="margin-top:0">关闭窗口后保留在系统托盘，每分钟采集已启用的数据源。点击托盘图标可打开窗口；右键选择「退出」可停止后台运行。</div></div>
@@ -1041,6 +1129,35 @@ async function renderSettings() {
       snapScrollboxTables($("#page-settings")); // 刚显形的面板渲染时不可见，补吸附
     };
   });
+
+  const aiSettingsArgs = (clearKey = false) => ({
+    baseUrl: $("#ai-base-url").value.trim(),
+    model: $("#ai-model").value.trim(),
+    maxInputChars: Number($("#ai-max-input").value),
+    apiKey: $("#ai-api-key").value.trim() || null,
+    clearKey,
+  });
+  $("#ai-settings-save").onclick = async () => {
+    const btn = $("#ai-settings-save"), state = $("#ai-settings-state");
+    btn.disabled = true; state.textContent = "正在保存…";
+    try {
+      const next = await invoke("ai_settings_save", aiSettingsArgs(false));
+      $("#ai-api-key").value = "";
+      state.textContent = next.key_configured ? "设置已保存，API Key 未显示" : "设置已保存，尚未保存 API Key";
+      toast("AI 整理设置已保存");
+    } catch (e) { state.textContent = `保存失败：${String(e)}`; }
+    finally { btn.disabled = false; }
+  };
+  $("#ai-key-clear").onclick = async () => {
+    const btn = $("#ai-key-clear"), state = $("#ai-settings-state");
+    if (btn.disabled) return;
+    btn.disabled = true; state.textContent = "正在移除…";
+    try {
+      await invoke("ai_settings_save", aiSettingsArgs(true));
+      state.textContent = "API Key 已移除";
+      toast("API Key 已移除");
+    } catch (e) { state.textContent = `移除失败：${String(e)}`; btn.disabled = false; }
+  };
 
   $("#agent-add-btn").onclick = async () => {
     const path = $("#agent-add-path").value.trim();

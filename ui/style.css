@@ -481,6 +481,68 @@ pre.memfile {
 .digest.digest-error { background: rgba(248, 113, 113, 0.10); border-color: rgba(248, 113, 113, 0.35); }
 .msg.flash { outline: 2px solid var(--accent); border-radius: 6px; }
 
+/* ---------- 今日工作账本 + 可选 AI 整理 ---------- */
+.workbench-title { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px; margin-top: 26px; }
+.workbench-title h2 { margin: 0 0 4px; }
+.workbench-title p { color: var(--dim); font-size: 12.5px; }
+.workbench-actions { display: flex; gap: 8px; flex: none; }
+.workbench-grid, .ai-result-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 14px; margin-top: 12px; }
+.work-project, .ai-project {
+  min-width: 0; background: linear-gradient(180deg, var(--bg2) 0%, var(--bg-soft) 100%);
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 15px 16px;
+}
+.work-project > header, .ai-project > header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.work-project h3, .ai-project h3 { font-size: 15px; line-height: 1.35; }
+.work-path { max-width: 420px; color: var(--faint); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.work-count { color: var(--dim); font-size: 11.5px; white-space: nowrap; }
+.work-agents { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+.work-activities { display: flex; flex-direction: column; border-top: 1px solid var(--border); }
+.work-activity {
+  display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; gap: 9px; align-items: start;
+  width: 100%; padding: 10px 2px; background: none; color: var(--fg); border: 0;
+  border-bottom: 1px solid var(--border); text-align: left; cursor: pointer;
+}
+.work-activity:hover strong { color: var(--accent); }
+.work-time, .work-agent { color: var(--faint); font-size: 11px; padding-top: 2px; }
+.work-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.work-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.work-main > span { color: var(--dim); font-size: 12px; line-height: 1.45; }
+.work-sub { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 9px; margin-top: 10px; color: var(--dim); font-size: 12px; }
+.work-sub > b { color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.work-sub ul, .ai-section ul { flex-basis: 100%; padding-left: 18px; }
+.work-sub li, .ai-section li { margin: 2px 0; }
+.work-link { background: none; border: 0; color: var(--accent); font-size: 12px; cursor: pointer; padding: 0; text-align: left; }
+.work-link:hover { text-decoration: underline; }
+.work-more, .work-empty { color: var(--faint); font-size: 12px; }
+.workbench-empty { margin-top: 12px; }
+.ai-organizer { margin-top: 14px; }
+.ai-disclosure, .ai-settings-note {
+  padding: 9px 12px; color: var(--dim); font-size: 12px; line-height: 1.55;
+  border-left: 2px solid var(--accent); background: rgba(245, 158, 11, .055);
+}
+.ai-result-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-top: 14px; }
+.ai-result-head p { margin-top: 3px; color: var(--dim); }
+.ai-result-head > span { color: var(--faint); font-size: 11px; white-space: nowrap; }
+.ai-project .ai-summary { margin: 9px 0 10px; line-height: 1.55; }
+.ai-section { margin-top: 8px; color: var(--dim); font-size: 12.5px; }
+.ai-section b { color: var(--fg); }
+.ai-project footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); color: var(--faint); font-size: 11px; }
+.ai-settings-note { margin: 12px 0; }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; margin: 14px 0; }
+.form-grid label { display: flex; flex-direction: column; gap: 5px; color: var(--dim); font-size: 12px; }
+.form-grid input {
+  width: 100%; background: var(--bg2); border: 1px solid var(--border-strong); border-radius: 8px;
+  color: var(--fg); padding: 8px 10px; font-size: 13px; outline: none;
+}
+.form-grid input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.setting-state { align-self: center; color: var(--faint); font-size: 12px; }
+
+@media (max-width: 1050px) {
+  .workbench-grid, .ai-result-grid { grid-template-columns: 1fr; }
+  .workbench-title, .ai-result-head { align-items: flex-start; }
+  .form-grid { grid-template-columns: 1fr; }
+}
+
 /* ---------- 三态 / 谱系链 / 记忆关系图 ---------- */
 .state { padding: 40px 20px; text-align: center; color: var(--dim); border: 1px dashed var(--border); border-radius: var(--radius); margin: 20px 0; }
 .state.loading::after { content: "…"; }

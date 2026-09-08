@@ -326,6 +326,15 @@ fn daily_digest_counts_the_day_with_new_fields() {
     assert_eq!(dg["projects"].as_array().unwrap().len(), 1);
     assert_eq!(dg["open_tasks"].as_array().unwrap().len(), 0);
     assert_eq!(dg["recent_handoffs"].as_array().unwrap().len(), 1);
+    let activity = dg["project_activity"].as_array().unwrap();
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0]["project"], "dos-proj");
+    assert_eq!(activity[0]["sessions"], 2);
+    assert_eq!(activity[0]["agents"][0]["agent"], "claude");
+    assert_eq!(activity[0]["activities"].as_array().unwrap().len(), 2);
+    assert_eq!(activity[0]["activities"][0]["tail"], "卷宗回复二");
+    assert_eq!(activity[0]["artifacts"][0]["path"], "/tmp/dos-proj/report.md");
+    assert_eq!(activity[0]["latest_handoff"]["title"], "卷宗功能动工");
     // 别的日子应为零
     let empty = dossier::daily_digest(&conn, "2026-01-01").unwrap();
     assert_eq!(empty["sessions"], 0);

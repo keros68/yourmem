@@ -1,6 +1,6 @@
 [package]
 name = "yourmem-app"
-version = "1.1.6"
+version = "1.1.7"
 edition = "2021"
 description = "yourmem desktop app"
 
@@ -16,6 +16,15 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rusqlite = "0.32"
 yourmem = { path = ".." }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native"] }
 
 [profile.release]
 opt-level = 2

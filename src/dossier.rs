@@ -270,7 +270,7 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
     let projects = {
         let mut stmt = tx.prepare(
             &format!(
-                "SELECT p.name, COUNT(*), COALESCE(SUM(s.message_count),0)
+                "SELECT p.id, p.name, p.path, COUNT(*), COALESCE(SUM(s.message_count),0)
                  FROM sessions s JOIN projects p ON p.id = s.project_id
                  WHERE s.deleted_at IS NULL AND ({in_day})
                  GROUP BY p.id ORDER BY COUNT(*) DESC"
@@ -279,9 +279,11 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
         let rows = stmt
             .query_map(params![lo, hi], |r| {
                 Ok(json!({
-                    "project": r.get::<_, String>(0)?,
-                    "sessions": r.get::<_, i64>(1)?,
-                    "messages": r.get::<_, i64>(2)?,
+                    "project_id": r.get::<_, i64>(0)?,
+                    "project": r.get::<_, String>(1)?,
+                    "path": r.get::<_, String>(2)?,
+                    "sessions": r.get::<_, i64>(3)?,
+                    "messages": r.get::<_, i64>(4)?,
                 }))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -298,6 +300,84 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
          WHERE s.deleted_at IS NULL AND a.created_at >= ?1 AND a.created_at < ?2",
     )?;
     let open_tasks = crate::db::open_tasks(&tx, None)?;
+    // 工作账本：会话是保存单位，项目才是用户理解每天工作的单位。这里只做
+    // 确定性归并，标题/末条回复/产物/待办都保留来源，不生成新的事实。
+    let mut project_activity = Vec::new();
+    for p in &projects {
+        let pid = p["project_id"].as_i64().unwrap_or(0);
+        let activities = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT s.id, s.agent, s.started_at, s.ended_at, s.message_count,
+                        (SELECT replace(substr(m.content,1,240),char(10),' ') FROM messages m
+                         WHERE m.session_id=s.id AND m.kind='user'
+                           AND substr(ltrim(m.content),1,1) NOT IN ('<','#')
+                         ORDER BY m.line_no,m.ord LIMIT 1),
+                        (SELECT substr(m.content,1,1600) FROM messages m
+                         WHERE m.session_id=s.id AND m.kind='assistant'
+                         ORDER BY m.line_no DESC,m.ord DESC LIMIT 1),
+                        (SELECT COUNT(*) FROM session_artifacts a WHERE a.session_id=s.id)
+                 FROM sessions s WHERE s.project_id=?3 AND s.deleted_at IS NULL AND ({in_day})
+                 ORDER BY COALESCE(s.ended_at,s.started_at) DESC,s.id"
+            ))?;
+            let rows = stmt.query_map(params![lo, hi, pid], |r| Ok(json!({
+                "session_id": r.get::<_, String>(0)?,
+                "agent": r.get::<_, String>(1)?,
+                "started_at": r.get::<_, Option<String>>(2)?,
+                "ended_at": r.get::<_, Option<String>>(3)?,
+                "messages": r.get::<_, i64>(4)?,
+                "title": r.get::<_, Option<String>>(5)?,
+                "tail": r.get::<_, Option<String>>(6)?,
+                "artifact_count": r.get::<_, i64>(7)?,
+            })))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let agents = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT s.agent,COUNT(*),COALESCE(SUM(s.message_count),0)
+                 FROM sessions s WHERE s.project_id=?3 AND s.deleted_at IS NULL AND ({in_day})
+                 GROUP BY s.agent ORDER BY COUNT(*) DESC,s.agent"
+            ))?;
+            let rows = stmt.query_map(params![lo, hi, pid], |r| Ok(json!({
+                "agent": r.get::<_, String>(0)?,
+                "sessions": r.get::<_, i64>(1)?,
+                "messages": r.get::<_, i64>(2)?,
+            })))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let artifacts = {
+            let mut stmt = tx.prepare(
+                "SELECT a.path,a.tool,a.session_id,s.agent,a.created_at
+                 FROM session_artifacts a JOIN sessions s ON s.id=a.session_id
+                 WHERE a.project_id=?3 AND s.deleted_at IS NULL
+                   AND a.created_at>=?1 AND a.created_at<?2
+                 ORDER BY a.created_at DESC,a.id DESC",
+            )?;
+            let rows = stmt.query_map(params![lo, hi, pid], |r| Ok(json!({
+                "path": r.get::<_, String>(0)?,
+                "tool": r.get::<_, Option<String>>(1)?,
+                "session_id": r.get::<_, String>(2)?,
+                "agent": r.get::<_, String>(3)?,
+                "created_at": r.get::<_, String>(4)?,
+            })))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let project_name = p["project"].as_str().unwrap_or("");
+        let tasks: Vec<Value> = open_tasks.iter()
+            .filter(|t| t["project"].as_str() == Some(project_name))
+            .cloned().collect();
+        project_activity.push(json!({
+            "project_id": pid,
+            "project": project_name,
+            "path": p["path"],
+            "sessions": p["sessions"],
+            "messages": p["messages"],
+            "agents": agents,
+            "activities": activities,
+            "artifacts": artifacts,
+            "open_tasks": tasks,
+            "latest_handoff": crate::db::latest_handoff(&tx, pid)?,
+        }));
+    }
     let recent_handoffs = {
         let mut stmt = tx.prepare(
             "SELECT h.id, h.title, h.next_steps, h.created_at, p.name FROM handoffs h
@@ -322,6 +402,7 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
         "sessions": sessions,
         "messages": messages,
         "projects": projects,
+        "project_activity": project_activity,
         "memories_added": memories_added,
         "decisions_added": decisions_added,
         "artifacts_added": artifacts_added,
