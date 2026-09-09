@@ -340,7 +340,7 @@ fn daily_digest_counts_the_day_with_new_fields() {
     assert_eq!(empty["sessions"], 0);
     // markdown 导出（§7.3）
     let md = dossier::render_digest_markdown(&dg);
-    assert!(md.contains("# 日报卡：2026-08-23"));
+    assert!(md.contains("# 动态：2026-08-23"));
     assert!(md.contains("决策/规则 3"));
 }
 

@@ -2,7 +2,7 @@ import { loadProjectRecall } from "./project-recall.js";
 import { graphDepths } from "./graph-layout.js";
 import { createSessionDrawer } from "./session-drawer.js";
 import { snapshotPanelHtml, bindSnapshotPanel } from "./snapshot-panel.js";
-import { workbenchHtml, aiSummaryHtml } from "./workbench.js";
+import { todayOverviewHtml, activityPageHtml, aiSummaryHtml } from "./workbench.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -83,117 +83,106 @@ function bindCopyButtons(scope) {
 
 // ---------------------------------------------------------------- today
 async function renderToday() {
-  const d = await invoke("today");
-  const st = d.stats;
-  let dg = null, dgErr = null;
-  try { dg = await invoke("daily_digest"); } catch (e) { dgErr = String(e); }
-  let aiConfig = null;
-  try { aiConfig = await invoke("ai_settings_get"); } catch (e) {}
-  const agentPills = st.by_agent.map((a) => `<span class="it"><span class="dot ${esc(a.agent)}"></span>${esc(a.agent)} ${a.sessions}</span>`).join(" · ");
-  $("#page-today").innerHTML = `
-    <h1>今天 <span class="en">Today</span></h1>
-    ${dgErr ? `<div class="digest digest-error">日报卡加载失败：${esc(dgErr)}</div>` : ""}
-    ${dg ? `<div class="digest">日报卡：${dg.sessions} 个对话 · ${dg.messages} 条消息 · 新增记忆 ${dg.memories_added}（决策 ${dg.decisions_added}）· 新增 artifact ${dg.artifacts_added} · 未完成任务 ${dg.open_tasks.length}</div>` : ""}
-    <div class="cards">
-      <div class="card"><div class="num">${st.projects}</div><div class="label">项目</div></div>
-      <div class="card"><div class="num">${st.sessions}</div><div class="label">对话</div></div>
-      <div class="card"><div class="num">${st.messages}</div><div class="label">消息</div></div>
-      <div class="card"><div class="num">${st.memories}</div><div class="label">记忆（待确认 ${st.memories_suggested}）</div></div>
-      <div class="card"><div class="num">${st.vault_lines}</div><div class="label" title="已保存的会话原文行数；对话的删除和恢复在「对话」页的回收站">原文归档行数</div></div>
-    </div>
-    ${agentPills ? `<div class="digest agent-mini" style="margin-bottom:16px">${st.sessions} 个对话来自 ${st.by_agent.length} 种 agent：${agentPills}</div>` : ""}
-    <div class="workbench-title">
-      <div><h2>今日工作</h2><p>按项目整合各 Agent 的对话、进展、产物和遗留事项；每项均可回到来源对话。</p></div>
-      <div class="workbench-actions">
-        <button class="btn" id="ai-settings">AI 设置</button>
-        <button class="btn primary" id="ai-organize" ${!dg?.project_activity?.length ? "disabled" : ""}>AI 整理今天</button>
-      </div>
-    </div>
-    ${dg ? workbenchHtml(dg) : ""}
-    <div class="ai-organizer">
-      <div class="ai-disclosure">AI 整理为可选功能。单次仅发送对话标题、末条 Agent 回复、任务、产物路径和交接摘要，不发送完整对话、文件内容或 API Key；发送上限可在设置中调整。</div>
-      <div id="ai-result">${aiConfig && !aiConfig.configured ? '<div class="work-empty">尚未配置 API；本地工作账本不受影响。</div>' : ""}</div>
-    </div>
-    <h2>今日对话（${d.today_sessions.length}）</h2>
-    <div class="scrollbox tight">${sessTable(d.today_sessions)}</div>
-    <h2>未完成任务</h2>
-    <div class="scrollbox tight">${d.open_tasks.length ? d.open_tasks.map(taskCard).join("") : '<div class="empty">暂无未完成任务</div>'}</div>
-    <h2>最近 Handoff</h2>
-    <div class="scrollbox tight">${d.recent_handoffs.length ? d.recent_handoffs.map(handoffCard).join("") : '<div class="empty">暂无 handoff</div>'}</div>
-  `;
-  bindSessionRows("#page-today");
+  const dg = await invoke("daily_digest");
+  $("#page-today").innerHTML = todayOverviewHtml(dg);
   document.querySelectorAll("#page-today [data-work-session]").forEach((b) => {
     b.onclick = () => showSession(b.dataset.workSession);
   });
-  snapScrollboxTables($("#page-today"));
-  $("#ai-settings").onclick = () => {
-    settingsTab = "ai";
-    document.querySelector('.nav[data-page="settings"]').click();
-  };
-  let aiResponse = null;
-  const saved = new Set();
-  const bindAiResult = () => {
-    $("#ai-result").innerHTML = aiSummaryHtml(aiResponse, saved);
-    document.querySelectorAll("#ai-result [data-ai-source]").forEach((b) => {
-      b.onclick = () => showSession(b.dataset.aiSource);
-    });
-    document.querySelectorAll("#ai-result [data-ai-save]").forEach((b) => {
-      b.onclick = async () => {
-        const i = Number(b.dataset.aiSave);
-        b.disabled = true;
-        try {
-          await invoke("ai_summary_save", { day: aiResponse.day || dg.day, summary: aiResponse.result.projects[i] });
-          saved.add(i);
-          bindAiResult();
-          toast("已保存为项目记忆");
-        } catch (e) { b.disabled = false; toast(String(e)); }
-      };
-    });
-  };
-  $("#ai-organize").onclick = async () => {
-    const b = $("#ai-organize"), out = $("#ai-result");
-    if (b.disabled) return;
-    if (!aiConfig?.configured) {
-      out.innerHTML = '<div class="digest digest-error">请先在“AI 设置”中填写 API 地址、模型名称和 API Key。</div>';
-      return;
-    }
-    b.disabled = true;
-    b.textContent = "正在整理…";
-    out.innerHTML = '<div class="state loading">正在发送精简工作记录并等待结果…</div>';
-    try {
-      aiResponse = await invoke("ai_organize_day", { day: dg.day });
-      if (b !== $("#ai-organize")) return;
-      saved.clear();
-      bindAiResult();
-    } catch (e) {
-      if (out === $("#ai-result")) out.innerHTML = `<div class="state error">AI 整理失败：${esc(String(e))}</div>`;
-    } finally {
-      if (b === $("#ai-organize")) {
-        b.disabled = false;
-        b.textContent = aiResponse ? "重新整理" : "AI 整理今天";
-      }
-    }
-  };
-  document.querySelectorAll("#page-today [data-task-archive]").forEach((btn) => {
-    btn.onclick = async () => {
+  const open = () => document.querySelector('.nav[data-page="activity"]').click();
+  $("#open-activity").onclick = open;
+  $("#open-activity-all").onclick = open;
+}
+
+const localDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+let activityDay = localDay(new Date());
+let activityDigest = null;
+let activityState = { project: "all", agent: "all", selected: null, tab: "activities" };
+let activityAiResponse = null;
+const activitySaved = new Set();
+
+const shiftDay = (day, offset) => {
+  const d = new Date(`${day}T12:00:00`);
+  d.setDate(d.getDate() + offset);
+  return localDay(d);
+};
+
+function closeActivityAi() {
+  document.getElementById("activity-ai-overlay")?.remove();
+}
+
+function bindActivityAi(digest) {
+  const out = $("#activity-ai-result");
+  out.innerHTML = aiSummaryHtml(activityAiResponse, activitySaved);
+  out.querySelectorAll("[data-ai-source]").forEach((b) => { b.onclick = () => showSession(b.dataset.aiSource); });
+  out.querySelectorAll("[data-ai-save]").forEach((b) => {
+    b.onclick = async () => {
+      const i = Number(b.dataset.aiSave);
+      b.disabled = true;
       try {
-        await invoke("update_memory", { id: btn.dataset.taskArchive, action: "archive", supersededBy: null });
-        toast("任务已归档");
-      } catch (e) { toast(String(e)); }
-      renderToday();
+        await invoke("ai_summary_save", { day: activityAiResponse.day || digest.day, summary: activityAiResponse.result.projects[i] });
+        activitySaved.add(i); bindActivityAi(digest); toast("已保存为项目记忆");
+      } catch (e) { b.disabled = false; toast(String(e)); }
     };
   });
 }
 
-const taskCard = (m) => `
-  <div class="memcard"><div class="content">${esc(m.content)}</div>
-  <div class="meta"><span class="pill">task</span><span>${esc(m.project || "global")}</span><span>${fmtTime(m.created_at)}</span>
-  <button class="btn small" data-task-archive="${esc(m.id)}" title="任务完成后归档，即从待办移除（记忆无硬删除，归档即终态）">归档</button></div></div>`;
+async function showActivityAi(digest) {
+  let config = null;
+  try { config = await invoke("ai_settings_get"); } catch (e) {}
+  if (!config?.configured) {
+    toast("请先在 AI 设置中填写 API 地址、模型名称和 API Key");
+    settingsTab = "ai";
+    document.querySelector('.nav[data-page="settings"]').click();
+    return;
+  }
+  closeActivityAi();
+  const ov = document.createElement("div");
+  ov.id = "activity-ai-overlay";
+  ov.innerHTML = `<section><header><div><h2>AI 整理 · ${esc(digest.day)}</h2><p>这是预览，不会自动写入记忆。</p></div><button id="activity-ai-close" title="关闭"><img src="icons/x.svg" alt=""></button></header>
+    <div class="activity-ai-note">单次仅发送对话标题、末条 Agent 回复、任务、产物路径和交接摘要，不发送完整对话、文件内容或 API Key。</div>
+    <div id="activity-ai-result"><div class="state loading">正在发送精简工作记录并等待结果…</div></div></section>`;
+  document.body.appendChild(ov);
+  $("#activity-ai-close").onclick = closeActivityAi;
+  ov.onclick = (e) => { if (e.target === ov) closeActivityAi(); };
+  try {
+    activityAiResponse = await invoke("ai_organize_day", { day: digest.day });
+    if (!document.getElementById("activity-ai-result")) return;
+    activitySaved.clear(); bindActivityAi(digest);
+  } catch (e) {
+    if ($("#activity-ai-result")) $("#activity-ai-result").innerHTML = `<div class="state error">AI 整理失败：${esc(String(e))}</div>`;
+  }
+}
 
-const handoffCard = (h) => `
-  <div class="memcard"><div class="content"><b>${esc(h.project)}</b> — ${esc(h.handoff.title)}<br>
-  ${h.handoff.next_steps ? "下一步：" + esc(h.handoff.next_steps) : ""}</div>
-  <div class="meta"><span>${fmtTime(h.handoff.created_at)}</span></div></div>`;
+function paintActivity() {
+  const root = $("#page-activity");
+  root.innerHTML = activityPageHtml(activityDigest, { ...activityState, today: localDay(new Date()) });
+  root.querySelectorAll("[data-work-session]").forEach((b) => { b.onclick = () => showSession(b.dataset.workSession); });
+  root.querySelectorAll("[data-activity-project]").forEach((b) => {
+    b.onclick = () => { activityState.selected = b.dataset.activityProject; activityState.tab = "activities"; paintActivity(); };
+  });
+  root.querySelectorAll("[data-activity-tab]").forEach((b) => { b.onclick = () => { activityState.tab = b.dataset.activityTab; paintActivity(); }; });
+  $("#activity-project-filter").onchange = (e) => {
+    activityState.project = e.target.value; activityState.selected = e.target.value === "all" ? null : e.target.value; activityState.tab = "activities"; paintActivity();
+  };
+  $("#activity-agent-filter").onchange = (e) => { activityState.agent = e.target.value; activityState.selected = null; paintActivity(); };
+  $("#activity-day").onchange = (e) => { if (e.target.value) { activityDay = e.target.value; activityDigest = null; pages.activity(); } };
+  $("#activity-prev").onclick = () => { activityDay = shiftDay(activityDay, -1); activityDigest = null; pages.activity(); };
+  $("#activity-next").onclick = () => { activityDay = shiftDay(activityDay, 1); activityDigest = null; pages.activity(); };
+  $("#activity-export").onclick = async () => {
+    const b = $("#activity-export"); b.disabled = true;
+    try {
+      const r = await invoke("daily_digest_export", { day: activityDigest.day });
+      toast(`日报已导出：${r.path}`);
+    } catch (e) { toast(String(e)); }
+    finally { b.disabled = false; }
+  };
+  $("#activity-ai").onclick = () => showActivityAi(activityDigest);
+}
+
+async function renderActivity() {
+  if (!activityDigest || activityDigest.day !== activityDay) activityDigest = await invoke("daily_digest", { day: activityDay });
+  paintActivity();
+}
 
 function sessTable(sessions, opts = {}) {
   const { project: showProject = true, preview: showPreview = false, fixed = false,
@@ -1073,7 +1062,7 @@ async function renderSettings() {
     ${panel("ai", `
       <h2>AI 整理</h2>
       <div class="memcard">
-        <div class="content">连接兼容 OpenAI Chat Completions 的 API，为“今日工作”生成带来源的项目摘要。未配置时，本地工作账本、搜索和归档仍可使用。</div>
+        <div class="content">连接兼容 OpenAI Chat Completions 的 API，为动态生成带来源的项目摘要。未配置时，动态、搜索和归档仍可使用。</div>
         <div class="ai-settings-note">单次仅发送对话标题、末条 Agent 回复、任务、产物路径和交接摘要，不发送完整对话、文件内容或 API Key。模型输出先作为建议显示，点击保存后才写入项目记忆。</div>
         ${aiSettingsError ? `<div class="digest digest-error">系统凭据库不可用：${esc(aiSettingsError)}</div>` : ""}
         <div class="form-grid ai-settings-form">
@@ -1536,7 +1525,7 @@ async function route(name, fn) {
     if (b) b.onclick = () => route(name, fn);
   }
 }
-const pageRenderers = { today: renderToday, projects: renderProjects, sessions: renderSessions,
+const pageRenderers = { today: renderToday, activity: renderActivity, projects: renderProjects, sessions: renderSessions,
   memory: renderMemory, search: renderSearch, settings: renderSettings };
 const pages = Object.fromEntries(Object.entries(pageRenderers).map(([name, fn]) => [name, () => route(name, fn)]));
 document.querySelectorAll(".nav").forEach((btn) => {
@@ -1739,6 +1728,7 @@ document.addEventListener("keydown", (e) => {
     // 谱系图全屏覆盖层打开时 Esc 只关覆盖层（覆盖层自己的捕获 handler 主责，
     // 这里是兜底：捕获被跳过/重复投递时也不误关 drawer）
     if (document.getElementById("graph-overlay")) return;
+    if (document.getElementById("activity-ai-overlay")) { closeActivityAi(); return; }
     closeDrawer();
     return;
   }

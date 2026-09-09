@@ -1,4 +1,5 @@
 /target
+/.target-*/
 .sandbox/
 src-tauri/target
 src-tauri/target-test
@@ -8,6 +9,7 @@ src-tauri/gen
 docs/*
 !docs/WINDOWS.md
 AGENTS.md
+/design-qa.md
 /.cargo/
 
 # Local-only sensitive terms used by privacy tests

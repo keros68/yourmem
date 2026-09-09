@@ -13,6 +13,7 @@ function app() {
     document: { querySelector: get, querySelectorAll: (sel) => lists.get(sel) || [], addEventListener() {},
       createElement: make, body: { appendChild: (node) => notices.push(node) } },
     window: { addEventListener() {}, __TAURI__: { core: { invoke: (command, args) => new Promise((resolve, reject) => requests.push({ command, args, resolve, reject })) } } },
+    todayOverviewHtml: () => '', activityPageHtml: () => '', aiSummaryHtml: () => '',
     setTimeout() {},
   };
   vm.createContext(context);

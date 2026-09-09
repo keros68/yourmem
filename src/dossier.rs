@@ -572,10 +572,10 @@ pub fn render_markdown(d: &Value) -> String {
     s
 }
 
-/// 日报卡 markdown 导出（§7.3"可导出 markdown"）。
+/// 动态日报 markdown 导出（§7.3"可导出 markdown"）。
 pub fn render_digest_markdown(d: &Value) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "# 日报卡：{}\n", d["day"].as_str().unwrap_or(""));
+    let _ = writeln!(s, "# 动态：{}\n", d["day"].as_str().unwrap_or(""));
     let _ = writeln!(s, "- 会话 {} 个，消息 {} 条",
         d["sessions"].as_i64().unwrap_or(0), d["messages"].as_i64().unwrap_or(0));
     for p in d["projects"].as_array().cloned().unwrap_or_default() {

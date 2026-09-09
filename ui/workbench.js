@@ -11,34 +11,96 @@ const list = (items, empty) => items?.length
   ? `<ul>${items.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>`
   : `<div class="work-empty">${empty}</div>`;
 
-export function workbenchHtml(digest) {
+const activityStamp = (a) => String(a?.ended_at || a?.started_at || "");
+
+const agentDot = (agent) => `<span class="activity-agent ${esc(agent)}"><i></i>${esc(agent)}</span>`;
+
+export function todayOverviewHtml(digest) {
   const projects = digest?.project_activity || [];
-  if (!projects.length) {
-    return '<div class="empty workbench-empty">今天还没有可归入项目的对话</div>';
+  const recent = projects.flatMap((p) => (p.activities || []).map((a) => ({ ...a, project: p.project })))
+    .sort((a, b) => activityStamp(b).localeCompare(activityStamp(a))).slice(0, 5);
+  const tasks = (digest?.open_tasks || []).slice(0, 3);
+  const handoffs = (digest?.recent_handoffs || []).slice(0, 2);
+  const agentsToday = new Set(projects.flatMap((p) => (p.activities || []).map((a) => a.agent))).size;
+  const stats = [
+    ["folder", projects.length, "活跃项目", "今日有对话"],
+    ["message-circle", digest?.sessions || 0, "新增对话", `${agentsToday} 个 Agent`],
+    ["archive", digest?.messages || 0, "消息", "今日活跃会话"],
+    ["file-text", digest?.artifacts_added || 0, "产物", "今日新增"],
+  ];
+  const statHtml = stats.map(([icon, value, label, hint]) => `<article class="today-stat">
+    <span class="today-stat-icon"><img src="icons/${icon}.svg" alt=""></span>
+    <strong>${Number(value).toLocaleString("zh-CN")}</strong><span>${label}</span><small>${hint}</small>
+  </article>`).join("");
+  const recentHtml = recent.length ? recent.map((a) => `<button class="today-activity" data-work-session="${esc(a.session_id)}">
+    <time>${fmtTime(activityStamp(a))}</time><span class="today-activity-main"><strong>${esc(clipped(a.title, 90) || "未命名对话")}</strong>
+    <span>${esc(clipped(a.tail, 150) || "尚无 Agent 回复")}</span></span>${agentDot(a.agent)}</button>`).join("")
+    : '<div class="today-empty">今天还没有活动</div>';
+  const taskHtml = tasks.length ? tasks.map((t) => `<div class="today-task"><img src="icons/square.svg" alt=""><span><b>${esc(clipped(t.content, 76))}</b><small>${esc(t.project || "全局")}${t.agent ? ` · ${esc(t.agent)}` : ""}</small></span></div>`).join("")
+    : '<div class="today-empty">暂无未完成任务</div>';
+  const handoffHtml = handoffs.length ? handoffs.map((h) => `<article class="today-handoff"><header><b>${esc(h.project)}</b><time>${fmtTime(h.created_at)}</time></header><p>${esc(clipped(h.next_steps || h.title, 120))}</p></article>`).join("")
+    : '<div class="today-empty">暂无交接</div>';
+  return `<div class="today-heading"><div><span>${esc(digest?.day || "")}</span><h1>今天 <em>Today</em></h1><p>快速掌握今天发生了什么；需要逐项追踪时进入动态。</p></div>
+    <button class="btn primary" id="open-activity">查看动态</button></div>
+    <div class="today-stats">${statHtml}</div>
+    <div class="today-overview"><section class="today-panel today-recent"><header><div><h2>最近活动</h2><p>按时间汇总各 Agent 的最新工作</p></div><button id="open-activity-all">查看全部 →</button></header><div>${recentHtml}</div></section>
+      <div class="today-side"><section class="today-panel"><header><div><h2>未完成任务</h2><p>${digest?.open_tasks?.length || 0} 项需要继续推进</p></div></header><div class="today-task-list">${taskHtml}</div></section>
+      <section class="today-panel"><header><div><h2>最近交接</h2><p>跨 Agent 延续工作的入口</p></div></header><div>${handoffHtml}</div></section></div></div>`;
+}
+
+const activityTabs = (project, active) => [
+  ["activities", "活动", project?.activities?.length || 0],
+  ["tasks", "任务", project?.open_tasks?.length || 0],
+  ["artifacts", "产物", project?.artifacts?.length || 0],
+  ["handoff", "交接", project?.latest_handoff ? 1 : 0],
+].map(([id, label, count]) => `<button class="${active === id ? "on" : ""}" data-activity-tab="${id}">${label}<span>${count}</span></button>`).join("");
+
+function activityDetailHtml(project, agent, tab) {
+  if (!project) return '<div class="activity-no-project">当天没有符合筛选条件的项目</div>';
+  const agents = (project.agents || []).map((a) => agentDot(a.agent)).join("");
+  let body = "";
+  if (tab === "activities") {
+    const rows = (project.activities || []).filter((a) => agent === "all" || a.agent === agent);
+    body = rows.length ? rows.map((a) => `<button class="activity-row" data-work-session="${esc(a.session_id)}"><time>${fmtTime(activityStamp(a))}</time>
+      <span><strong>${esc(clipped(a.title, 100) || "未命名对话")}</strong><small>${esc(clipped(a.tail, 190) || "尚无 Agent 回复")}</small></span>${agentDot(a.agent)}</button>`).join("")
+      : '<div class="activity-no-project">当前 Agent 没有活动</div>';
+  } else if (tab === "tasks") {
+    body = (project.open_tasks || []).length ? project.open_tasks.map((t) => `<article class="activity-card"><span class="activity-state">进行中</span><div><strong>${esc(clipped(t.content, 150))}</strong><small>${esc(t.project || project.project)}</small></div></article>`).join("")
+      : '<div class="activity-no-project">这个项目没有未完成任务</div>';
+  } else if (tab === "artifacts") {
+    const rows = (project.artifacts || []).filter((a) => agent === "all" || a.agent === agent);
+    body = rows.length ? rows.map((a) => `<button class="activity-card clickable" data-work-session="${esc(a.session_id)}"><img src="icons/file-text.svg" alt=""><div><strong title="${esc(a.path)}">${esc(clipped(a.path, 120))}</strong><small>${esc(a.tool || "产物")} · ${fmtTime(a.created_at)} · ${esc(a.agent)}</small></div></button>`).join("")
+      : '<div class="activity-no-project">当前筛选下没有产物</div>';
+  } else {
+    const h = project.latest_handoff;
+    body = h ? `<article class="activity-handoff"><header><strong>${esc(h.title)}</strong><time>${fmtTime(h.created_at)}</time></header><p>${esc(h.next_steps || "未记录下一步")}</p></article>`
+      : '<div class="activity-no-project">这个项目还没有交接记录</div>';
   }
-  return `<div class="workbench-grid">${projects.map((p) => {
-    const agents = (p.agents || []).map((a) =>
-      `<span class="pill ${esc(a.agent)}">${esc(a.agent)} · ${a.sessions}</span>`).join("");
-    const activities = (p.activities || []).map((a) => `
-      <button class="work-activity" data-work-session="${esc(a.session_id)}">
-        <span class="work-time">${fmtTime(a.ended_at || a.started_at)}</span>
-        <span class="work-main"><strong>${esc(clipped(a.title, 90) || "未命名对话")}</strong>
-          <span>${esc(clipped(a.tail) || "尚无 Agent 回复")}</span></span>
-        <span class="work-agent">${esc(a.agent)}</span>
-      </button>`).join("");
-    const artifacts = (p.artifacts || []).slice(0, 4).map((a) =>
-      `<button class="work-link" data-work-session="${esc(a.session_id)}" title="${esc(a.path)}">${esc(clipped(a.path, 80))}</button>`).join("");
-    const handoff = p.latest_handoff;
-    return `<article class="work-project">
-      <header><div><h3>${esc(p.project)}</h3><div class="work-path" title="${esc(p.path)}">${esc(p.path)}</div></div>
-        <div class="work-count">${p.sessions} 个对话 · ${p.messages} 条消息</div></header>
-      <div class="work-agents">${agents}</div>
-      <div class="work-activities">${activities}</div>
-      ${(p.artifacts || []).length ? `<div class="work-sub"><b>今日产物</b>${artifacts}${p.artifacts.length > 4 ? `<span class="work-more">另有 ${p.artifacts.length - 4} 个</span>` : ""}</div>` : ""}
-      ${(p.open_tasks || []).length ? `<div class="work-sub"><b>未完成</b>${list(p.open_tasks.slice(0, 3).map((t) => clipped(t.content, 120)), "")}</div>` : ""}
-      ${handoff ? `<div class="work-sub"><b>最近交接</b><span>${esc(clipped(handoff.next_steps || handoff.title, 160))}</span></div>` : ""}
-    </article>`;
-  }).join("")}</div>`;
+  return `<div class="activity-detail-head"><div><div class="activity-title"><h2>${esc(project.project)}</h2>${agents}</div><p class="activity-path" title="${esc(project.path)}">${esc(project.path)}</p><p>${esc(clipped(project.activities?.[0]?.tail || "当天有活动记录", 120))}</p></div>
+    <div class="activity-counts"><span><b>${project.sessions}</b>对话</span><span><b>${project.messages}</b>消息</span></div></div>
+    <nav class="activity-tabs">${activityTabs(project, tab)}</nav><div class="activity-tab-body">${body}</div>`;
+}
+
+export function activityPageHtml(digest, state = {}) {
+  const agent = state.agent || "all";
+  const filterProject = state.project || "all";
+  const allProjects = digest?.project_activity || [];
+  const agentProjects = agent === "all" ? allProjects : allProjects.filter((p) => (p.agents || []).some((a) => a.agent === agent));
+  const projects = filterProject === "all" ? agentProjects : agentProjects.filter((p) => String(p.project_id) === String(filterProject));
+  const selected = projects.find((p) => String(p.project_id) === String(state.selected)) || projects[0] || null;
+  const projectOptions = allProjects.map((p) => `<option value="${p.project_id}" ${String(filterProject) === String(p.project_id) ? "selected" : ""}>${esc(p.project)}</option>`).join("");
+  const knownAgents = [...new Set(allProjects.flatMap((p) => (p.agents || []).map((a) => a.agent)))].sort();
+  const agentOptions = knownAgents.map((a) => `<option value="${esc(a)}" ${agent === a ? "selected" : ""}>${esc(a)}</option>`).join("");
+  const projectRows = projects.map((p) => `<button class="activity-project ${selected === p ? "on" : ""}" data-activity-project="${p.project_id}"><header><strong>${esc(p.project)}</strong><time>${fmtTime(activityStamp(p.activities?.[0]))}</time></header>
+    <p>${esc(clipped(p.activities?.[0]?.tail || "当天有活动记录", 92))}</p><footer><span>${p.sessions} 对话</span><span>${p.messages} 消息</span><i>${(p.agents || []).map((a) => `<b class="dot ${esc(a.agent)}"></b>`).join("")}</i></footer></button>`).join("");
+  const today = state.today || "";
+  return `<div class="activity-heading"><span>Daily activity</span><h1>动态</h1><p>按日期、项目和 Agent 查看工作进展；每条信息都可以回到来源对话。</p></div>
+    <div class="activity-toolbar"><div class="activity-date"><button id="activity-prev" title="前一天"><img src="icons/chevron-left.svg" alt=""></button><label><input id="activity-day" type="date" value="${esc(digest?.day || "")}" ${today ? `max="${esc(today)}"` : ""}></label><button id="activity-next" title="后一天" ${today && digest?.day >= today ? "disabled" : ""}><img src="icons/chevron-right.svg" alt=""></button></div>
+      <label class="activity-select"><span>项目</span><select id="activity-project-filter"><option value="all">全部项目</option>${projectOptions}</select></label>
+      <label class="activity-select"><span>Agent</span><select id="activity-agent-filter"><option value="all">全部 Agent</option>${agentOptions}</select></label>
+      <span class="activity-toolbar-spacer"></span><button class="btn activity-export" id="activity-export"><img src="icons/file-export.svg" alt="">导出日报</button><button class="btn primary" id="activity-ai" ${!allProjects.length ? "disabled" : ""}>AI 整理</button></div>
+    <div class="activity-workspace"><aside><header><div><h2>活跃项目</h2><span>${projects.length}</span></div><p>按最近活动排序</p></header><div class="activity-project-list">${projectRows || '<div class="activity-no-project">当天没有项目活动</div>'}</div></aside>
+      <section class="activity-detail">${activityDetailHtml(selected, agent, state.tab || "activities")}</section></div>`;
 }
 
 const section = (label, values) => values?.length
