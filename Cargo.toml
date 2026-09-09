@@ -1,6 +1,6 @@
 [package]
 name = "yourmem"
-version = "1.1.8"
+version = "1.1.9"
 edition = "2021"
 description = "Local-first session vault, memory and recall for AI coding agents"
 license = "MIT OR Apache-2.0"

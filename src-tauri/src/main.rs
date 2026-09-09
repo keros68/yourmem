@@ -7,7 +7,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde_json::{json, Value};
-use tauri::Manager;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use tauri::{Emitter, Manager};
+use tauri_plugin_updater::UpdaterExt;
 use yourmem::{data_home, db};
 
 mod tray;
@@ -540,23 +545,71 @@ mod tests {
     }
 }
 
-/// 检查更新：当前版本 vs GitHub 最新 release（私有仓库走本机 gh CLI）。
+/// 通过签名后的 latest.json 检查更新。GitHub Release 只是下载源，
+/// 版本判定、签名验证、下载与安装均由 Tauri Updater 完成。
 #[tauri::command]
-async fn update_check() -> Result<Value, String> {
-    run_blocking(move || {
-        let current = env!("CARGO_PKG_VERSION");
-        let latest = yourmem::update::latest_release().map_err(|e| e.to_string())?;
-        let tag = latest["tag"].as_str().unwrap_or("").trim().to_string();
-        let clean = tag.trim_start_matches(['v', 'V']).to_string();
-        Ok(json!({
+async fn update_check(app: tauri::AppHandle) -> Result<Value, String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let update = app
+        .updater()
+        .map_err(|e| format!("更新器初始化失败：{e}"))?
+        .check()
+        .await
+        .map_err(|e| format!("检查更新失败：{e}"))?;
+    match update {
+        Some(update) => Ok(json!({
             "current": current,
-            "latest": clean,
-            "url": latest["url"],
-            "published_at": latest["published_at"],
-            "update_available": yourmem::update::version_newer(&tag, current),
-        }))
-    })
-    .await
+            "latest": update.version,
+            "notes": update.body,
+            "published_at": update.date.map(|d| d.to_string()),
+            "url": format!("https://github.com/keros68/yourmem/releases/tag/v{}", update.version.trim_start_matches(['v', 'V'])),
+            "update_available": true,
+            "installable": true,
+        })),
+        None => Ok(json!({
+            "current": current,
+            "latest": current,
+            "update_available": false,
+            "installable": true,
+        })),
+    }
+}
+
+/// 重新检查并安装，避免使用 UI 中可能已经过期的下载地址。
+/// Windows 安装器会退出并自动重启；macOS 安装完成后由 app.restart() 重启。
+#[tauri::command]
+async fn update_install(app: tauri::AppHandle) -> Result<Value, String> {
+    let update = app
+        .updater()
+        .map_err(|e| format!("更新器初始化失败：{e}"))?
+        .check()
+        .await
+        .map_err(|e| format!("检查更新失败：{e}"))?
+        .ok_or_else(|| "当前已是最新版本".to_string())?;
+    let version = update.version.clone();
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let progress_app = app.clone();
+    let progress_bytes = downloaded.clone();
+    let finish_app = app.clone();
+    update
+        .download_and_install(
+            move |chunk, total| {
+                let done = progress_bytes.fetch_add(chunk as u64, Ordering::Relaxed) + chunk as u64;
+                let _ = progress_app.emit(
+                    "update-progress",
+                    json!({ "phase": "downloading", "downloaded": done, "total": total }),
+                );
+            },
+            move || {
+                let _ = finish_app.emit(
+                    "update-progress",
+                    json!({ "phase": "installing", "version": version }),
+                );
+            },
+        )
+        .await
+        .map_err(|e| format!("更新安装失败：{e}"))?;
+    app.restart();
 }
 
 /// 系统默认浏览器打开外链（只放行 http/https 且无空白，防参数注入）。
@@ -1007,6 +1060,7 @@ fn main() {
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             tray::show_main(app);
         }))
@@ -1047,7 +1101,7 @@ fn main() {
             trash_empty_overdue, purge_archives, purge_archive_delete, purge_archive_clear,
             auto_purge_get, auto_purge_set, agent_set_enabled,
             backup_dir_get, backup_dir_set, backup_dir_pick, bundle_path_pick,
-            first_run_state, update_check, open_url,
+            first_run_state, update_check, update_install, open_url,
             search, memories, update_memory, artifacts, import_now,
             memory_files, memory_file_show,
             agents_detect, agent_add_root, agent_remove_root,

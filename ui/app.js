@@ -110,6 +110,25 @@ function closeActivityAi() {
   document.getElementById("activity-ai-overlay")?.remove();
 }
 
+function showAiSetupReminder() {
+  closeActivityAi();
+  const ov = document.createElement("div");
+  ov.id = "activity-ai-overlay";
+  ov.innerHTML = `<section class="ai-setup-reminder"><header><div><h2>需要先配置 AI</h2><p>AI 整理是可选功能，不影响本地动态与日报。</p></div><button id="activity-ai-close" title="关闭"><img src="icons/x.svg" alt=""></button></header>
+    <div class="ai-setup-reminder-body"><p>请填写兼容 OpenAI 的 API 地址、模型名称和 API Key，保存后即可整理当天活动。</p>
+      <div class="activity-ai-actions"><button class="btn" id="activity-ai-later">稍后</button><button class="btn primary" id="activity-ai-settings">前往 AI 设置</button></div></div></section>`;
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  $("#activity-ai-close").onclick = close;
+  $("#activity-ai-later").onclick = close;
+  $("#activity-ai-settings").onclick = () => {
+    close();
+    settingsTab = "ai";
+    document.querySelector('.nav[data-page="settings"]').click();
+  };
+  ov.onclick = (e) => { if (e.target === ov) close(); };
+}
+
 function bindActivityAi(digest) {
   const out = $("#activity-ai-result");
   out.innerHTML = aiSummaryHtml(activityAiResponse, activitySaved);
@@ -130,9 +149,7 @@ async function showActivityAi(digest) {
   let config = null;
   try { config = await invoke("ai_settings_get"); } catch (e) {}
   if (!config?.configured) {
-    toast("请先在 AI 设置中填写 API 地址、模型名称和 API Key");
-    settingsTab = "ai";
-    document.querySelector('.nav[data-page="settings"]').click();
+    showAiSetupReminder();
     return;
   }
   closeActivityAi();
@@ -1274,8 +1291,34 @@ async function renderSettings() {
       if (!r.update_available) {
         rep.textContent = "已是最新版本";
       } else {
-        rep.innerHTML = `新版本 v${esc(r.latest)} 可用 <button class="btn small primary" id="update-goto">前往下载</button>`;
+        rep.innerHTML = `新版本 v${esc(r.latest)} 可用 <button class="btn small primary" id="update-install">下载并安装</button><button class="btn small" id="update-goto">查看版本</button>`;
         $("#update-goto").onclick = () => invoke("open_url", { url: r.url }).catch((e) => toast(String(e)));
+        $("#update-install").onclick = async () => {
+          if (!confirm(`将下载并安装 yourmem v${r.latest}，完成后软件会自动重启。继续？`)) return;
+          const install = $("#update-install"), link = $("#update-goto");
+          install.disabled = true; link.disabled = true; btn.disabled = true;
+          install.textContent = "准备下载…";
+          let unlisten = null;
+          try {
+            if (window.__TAURI__.event?.listen) {
+              unlisten = await window.__TAURI__.event.listen("update-progress", ({ payload }) => {
+                if (payload?.phase === "installing") {
+                  install.textContent = "正在安装…";
+                } else if (payload?.phase === "downloading") {
+                  const done = Number(payload.downloaded || 0), total = Number(payload.total || 0);
+                  install.textContent = total > 0 ? `下载中 ${Math.min(100, Math.round(done / total * 100))}%` : "正在下载…";
+                }
+              });
+            }
+            await invoke("update_install");
+          } catch (e) {
+            rep.innerHTML = `更新失败：${esc(String(e))} <button class="btn small" id="update-goto">前往 GitHub 下载</button>`;
+            $("#update-goto").onclick = () => invoke("open_url", { url: r.url }).catch((err) => toast(String(err)));
+            btn.disabled = false;
+          } finally {
+            if (unlisten) unlisten();
+          }
+        };
       }
     } catch (e) {
       rep.textContent = `检查失败：${String(e)}`;

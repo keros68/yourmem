@@ -10,7 +10,7 @@ function app() {
     focus() {}, scrollIntoView() {}, remove() {}, addEventListener() {}, classList: { add() {}, remove() {} }, querySelectorAll: () => [] });
   const get = (key) => { if (!nodes.has(key)) nodes.set(key, make()); return nodes.get(key); };
   const context = {
-    document: { querySelector: get, querySelectorAll: (sel) => lists.get(sel) || [], addEventListener() {},
+    document: { querySelector: get, querySelectorAll: (sel) => lists.get(sel) || [], getElementById: (id) => nodes.get(`#${id}`) || null, addEventListener() {},
       createElement: make, body: { appendChild: (node) => notices.push(node) } },
     window: { addEventListener() {}, __TAURI__: { core: { invoke: (command, args) => new Promise((resolve, reject) => requests.push({ command, args, resolve, reject })) } } },
     todayOverviewHtml: () => '', activityPageHtml: () => '', aiSummaryHtml: () => '',
@@ -22,7 +22,7 @@ function app() {
   vm.runInContext(ui('project-recall.js').replace('export async function', 'async function'), context);
   vm.runInContext(ui('graph-layout.js').replace('export function', 'function'), context);
   const bundleCode = ui('app.js').slice(ui('app.js').indexOf('  let bundleBusy = false'), ui('app.js').indexOf('  $("#auto-purge").onchange'));
-  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, setMemoryView: v => { memView = v; } };', context);
+  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
   return { ...context.testApp, get, lists, requests, notices };
 }
 
@@ -212,4 +212,24 @@ test('setup UI separates choices from actions and discloses agent capability sco
   assert.match(source, /本机仅检测到目录/);
   assert.match(css, /#setup-agents\s*\{[^}]*display:\s*flex/);
   assert.match(css, /#setup-actions\s*\{[^}]*margin-bottom:/);
+});
+
+test('AI organization explains missing configuration and offers a direct settings action', async () => {
+  const f = app();
+  const pending = f.showActivityAi({ day: '2026-09-09' });
+  assert.equal(f.requests.at(-1).command, 'ai_settings_get');
+  f.requests.at(-1).resolve({ configured: false });
+  await pending;
+  const html = f.notices.at(-1).innerHTML;
+  assert.match(html, /需要先配置 AI/);
+  assert.match(html, /AI 整理是可选功能，不影响本地动态与日报/);
+  assert.match(html, /前往 AI 设置/);
+});
+
+test('update controls install in app and retain GitHub only as a failure fallback', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
+  assert.match(source, /下载并安装/);
+  assert.match(source, /invoke\("update_install"\)/);
+  assert.match(source, /update-progress/);
+  assert.match(source, /更新失败：[\s\S]*前往 GitHub 下载/);
 });

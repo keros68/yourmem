@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "yourmem",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "identifier": "com.yourmem.app",
   "build": {
     "frontendDist": "../ui"
@@ -23,6 +23,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["app", "dmg", "nsis"],
     "category": "Developer Tools",
     "copyright": "Copyright © 2026 yourmem contributors",
@@ -36,5 +37,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVFOUQ2NkQ2OUY5OUZCOUQKUldTZCs1bWYxbWFkWHJ2QUdoaGoxT3h0MGE4Q0ppMkI4SEVDNi9udDRVakZrZWFVUGFScms5aU4K",
+      "endpoints": [
+        "https://github.com/keros68/yourmem/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
