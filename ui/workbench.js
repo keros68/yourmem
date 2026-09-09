@@ -52,7 +52,7 @@ const activityTabs = (project, active) => [
   ["activities", "活动", project?.activities?.length || 0],
   ["tasks", "任务", project?.open_tasks?.length || 0],
   ["artifacts", "产物", project?.artifacts?.length || 0],
-  ["handoff", "交接", project?.latest_handoff ? 1 : 0],
+  ["handoff", "交接", project?.handoffs?.length || (project?.latest_handoff ? 1 : 0)],
 ].map(([id, label, count]) => `<button class="${active === id ? "on" : ""}" data-activity-tab="${id}">${label}<span>${count}</span></button>`).join("");
 
 function activityDetailHtml(project, agent, tab) {
@@ -72,8 +72,12 @@ function activityDetailHtml(project, agent, tab) {
     body = rows.length ? rows.map((a) => `<button class="activity-card clickable" data-work-session="${esc(a.session_id)}"><img src="icons/file-text.svg" alt=""><div><strong title="${esc(a.path)}">${esc(clipped(a.path, 120))}</strong><small>${esc(a.tool || "产物")} · ${fmtTime(a.created_at)} · ${esc(a.agent)}</small></div></button>`).join("")
       : '<div class="activity-no-project">当前筛选下没有产物</div>';
   } else {
-    const h = project.latest_handoff;
-    body = h ? `<article class="activity-handoff"><header><strong>${esc(h.title)}</strong><time>${fmtTime(h.created_at)}</time></header><p>${esc(h.next_steps || "未记录下一步")}</p></article>`
+    const handoffs = project.handoffs?.length ? project.handoffs : (project.latest_handoff ? [project.latest_handoff] : []);
+    body = handoffs.length ? handoffs.map((h) => {
+      const attrs = h.path ? `data-handoff-path="${esc(h.path)}"` : (h.session_id ? `data-work-session="${esc(h.session_id)}"` : "");
+      const tag = attrs ? "button" : "article";
+      return `<${tag} class="activity-handoff ${attrs ? "clickable" : ""}" ${attrs}><header><strong>${esc(h.title)}</strong><span><em>${h.source === "file" ? "交接文档" : "交接记录"}</em><time>${fmtTime(h.created_at)}</time></span></header><p>${esc(h.next_steps || "未记录下一步")}</p>${h.path ? `<small title="${esc(h.path)}">${esc(clipped(h.path, 130))}</small>` : ""}</${tag}>`;
+    }).join("")
       : '<div class="activity-no-project">这个项目还没有交接记录</div>';
   }
   return `<div class="activity-detail-head"><div><div class="activity-title"><h2>${esc(project.project)}</h2>${agents}</div><p class="activity-path" title="${esc(project.path)}">${esc(project.path)}</p><p>${esc(clipped(project.activities?.[0]?.tail || "当天有活动记录", 120))}</p></div>

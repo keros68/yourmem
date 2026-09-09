@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::path::Path;
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
@@ -361,6 +362,23 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
             })))?.collect::<std::result::Result<Vec<_>, _>>()?;
             rows
         };
+        let handoffs = {
+            let mut stmt = tx.prepare(
+                "SELECT h.id,h.session_id,h.title,h.next_steps,h.created_at
+                 FROM handoffs h WHERE h.project_id=?3
+                   AND h.created_at>=?1 AND h.created_at<?2
+                 ORDER BY h.created_at DESC,h.id DESC",
+            )?;
+            let rows = stmt.query_map(params![lo, hi, pid], |r| Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "session_id": r.get::<_, Option<String>>(1)?,
+                "title": r.get::<_, String>(2)?,
+                "next_steps": r.get::<_, String>(3)?,
+                "created_at": r.get::<_, String>(4)?,
+                "source": "record",
+            })))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
         let project_name = p["project"].as_str().unwrap_or("");
         let tasks: Vec<Value> = open_tasks.iter()
             .filter(|t| t["project"].as_str() == Some(project_name))
@@ -375,10 +393,11 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
             "activities": activities,
             "artifacts": artifacts,
             "open_tasks": tasks,
+            "handoffs": handoffs,
             "latest_handoff": crate::db::latest_handoff(&tx, pid)?,
         }));
     }
-    let recent_handoffs = {
+    let mut recent_handoffs = {
         let mut stmt = tx.prepare(
             "SELECT h.id, h.title, h.next_steps, h.created_at, p.name FROM handoffs h
              JOIN projects p ON p.id = h.project_id ORDER BY h.id DESC LIMIT 3",
@@ -397,6 +416,40 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
         rows
     };
     tx.commit()?;
+
+    // MCP 结构化交接仍是首选；同时识别项目目录中的 HANDOFF*.md。很多 Agent
+    // 会把交接直接写成文件，若只认 create_handoff，用户明明看得到文件，动态却
+    // 显示 0。扫描限制在项目下三层且跳过常见依赖/构建目录，避免打开动态时遍历
+    // 整棵大型工作区。
+    for project in &mut project_activity {
+        let path = project["path"].as_str().unwrap_or("");
+        let docs = handoff_documents(path, &lo, &hi);
+        if docs.is_empty() {
+            continue;
+        }
+        if let Some(rows) = project["handoffs"].as_array_mut() {
+            rows.extend(docs.iter().cloned());
+            rows.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
+        }
+        let doc_is_newer = project["latest_handoff"].is_null()
+            || docs[0]["created_at"].as_str().unwrap_or("")
+                > project["latest_handoff"]["created_at"].as_str().unwrap_or("");
+        if doc_is_newer {
+            project["latest_handoff"] = docs[0].clone();
+        }
+        for doc in docs {
+            let mut item = doc;
+            item["project"] = project["project"].clone();
+            recent_handoffs.push(item);
+        }
+    }
+    recent_handoffs.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
+    let mut seen_paths = HashSet::new();
+    recent_handoffs.retain(|h| {
+        h["path"].as_str().map(|p| seen_paths.insert(p.to_string())).unwrap_or(true)
+    });
+    recent_handoffs.truncate(3);
+
     Ok(json!({
         "day": day,
         "sessions": sessions,
@@ -409,6 +462,86 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
         "open_tasks": open_tasks,
         "recent_handoffs": recent_handoffs,
     }))
+}
+
+fn handoff_documents(project_path: &str, lo: &str, hi: &str) -> Vec<Value> {
+    let expanded = crate::expand_home(project_path);
+    let root = Path::new(&expanded);
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let Ok(lo) = chrono::DateTime::parse_from_rfc3339(lo) else { return Vec::new() };
+    let Ok(hi) = chrono::DateTime::parse_from_rfc3339(hi) else { return Vec::new() };
+    let skipped = [".git", ".yourmem", "node_modules", "target", ".venv", "venv"];
+    let mut docs = Vec::new();
+    let mut visited = 0usize;
+    let entries = walkdir::WalkDir::new(root)
+        .max_depth(4)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !e.file_type().is_dir()
+            || !skipped.iter().any(|name| e.file_name().eq_ignore_ascii_case(name)));
+    for entry in entries.filter_map(|e| e.ok()) {
+        visited += 1;
+        if visited > 50_000 || docs.len() >= 20 {
+            break;
+        }
+        if !entry.file_type().is_file() || !is_handoff_filename(entry.file_name().to_string_lossy().as_ref()) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else { continue };
+        let Ok(modified) = metadata.modified() else { continue };
+        let modified = chrono::DateTime::<chrono::Utc>::from(modified);
+        if modified < lo || modified >= hi {
+            continue;
+        }
+        let path = entry.path();
+        let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+        let next_steps = std::fs::read_to_string(path).ok()
+            .and_then(|body| handoff_excerpt(&body))
+            .unwrap_or_else(|| format!("交接文档：{relative}"));
+        docs.push(json!({
+            "title": entry.file_name().to_string_lossy(),
+            "next_steps": next_steps,
+            "created_at": modified.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "path": path.to_string_lossy(),
+            "source": "file",
+        }));
+    }
+    docs.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
+    docs
+}
+
+fn is_handoff_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("handoff")
+        && [".md", ".markdown", ".txt"].iter().any(|ext| lower.ends_with(ext))
+}
+
+fn handoff_excerpt(body: &str) -> Option<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    let key = |line: &str| {
+        let t = line.trim().trim_start_matches('#').trim().to_ascii_lowercase();
+        if ["next", "next steps", "next step", "下一步", "后续"].contains(&t.as_str()) {
+            return Some(String::new());
+        }
+        ["next:", "next steps:", "next step:", "下一步：", "下一步:", "后续：", "后续:"]
+            .iter().find_map(|prefix| t.strip_prefix(prefix).map(|s| s.trim().to_string()))
+    };
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(inline) = key(line) {
+            if !inline.is_empty() {
+                return Some(inline.chars().take(500).collect());
+            }
+            let section = lines.iter().skip(i + 1).take_while(|l| !l.trim_start().starts_with('#'))
+                .map(|l| l.trim().trim_start_matches(|c| matches!(c, '-' | '*' | ' ')).trim())
+                .filter(|l| !l.is_empty()).take(4).collect::<Vec<_>>().join("；");
+            if !section.is_empty() {
+                return Some(section.chars().take(500).collect());
+            }
+        }
+    }
+    None
 }
 
 /// 本地日的 UTC 边界（闭开区间）。两个午夜各自换算——DST 切换日不是 24 小时整，
@@ -845,5 +978,27 @@ mod tests {
         let (lo, hi) = bounds_in_tz("2026-08-23", &utc).unwrap();
         assert_eq!(lo, "2026-08-23T00:00:00Z");
         assert_eq!(hi, "2026-08-24T00:00:00Z");
+    }
+
+    #[test]
+    fn discovers_handoff_documents_and_extracts_next_step() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("07_rebuild");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(
+            work.join("HANDOFF_20260909_V2.md"),
+            "# Handoff\n\nCurrent: rebuilt\n\n## Next\n\n- verify figures and publish\n",
+        ).unwrap();
+        std::fs::write(work.join("README.md"), "not a handoff").unwrap();
+
+        let docs = handoff_documents(
+            root.path().to_string_lossy().as_ref(),
+            "2000-01-01T00:00:00Z",
+            "2100-01-01T00:00:00Z",
+        );
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["title"], "HANDOFF_20260909_V2.md");
+        assert_eq!(docs[0]["next_steps"], "verify figures and publish");
+        assert_eq!(docs[0]["source"], "file");
     }
 }

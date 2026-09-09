@@ -214,6 +214,13 @@ test('setup UI separates choices from actions and discloses agent capability sco
   assert.match(css, /#setup-actions\s*\{[^}]*margin-bottom:/);
 });
 
+test('Activity keeps project and detail lists independently scrollable', () => {
+  const css = fs.readFileSync(path.join(__dirname, '../ui/style.css'), 'utf8');
+  assert.match(css, /\.activity-workspace\s*>\s*aside\s*\{[^}]*min-height:\s*0[^}]*overflow:\s*hidden/);
+  assert.match(css, /\.activity-project-list\s*\{[^}]*flex:\s*1[^}]*overflow-y:\s*auto/);
+  assert.match(css, /\.activity-tab-body\s*\{[^}]*flex:\s*1[^}]*overflow-y:\s*auto/);
+});
+
 test('AI organization explains missing configuration and offers a direct settings action', async () => {
   const f = app();
   const pending = f.showActivityAi({ day: '2026-09-09' });

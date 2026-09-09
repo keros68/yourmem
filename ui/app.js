@@ -174,6 +174,7 @@ function paintActivity() {
   const root = $("#page-activity");
   root.innerHTML = activityPageHtml(activityDigest, { ...activityState, today: localDay(new Date()) });
   root.querySelectorAll("[data-work-session]").forEach((b) => { b.onclick = () => showSession(b.dataset.workSession); });
+  root.querySelectorAll("[data-handoff-path]").forEach((b) => { b.onclick = () => invoke("open_in_finder", { path: b.dataset.handoffPath, reveal: true }).catch((e) => toast(String(e))); });
   root.querySelectorAll("[data-activity-project]").forEach((b) => {
     b.onclick = () => { activityState.selected = b.dataset.activityProject; activityState.tab = "activities"; paintActivity(); };
   });

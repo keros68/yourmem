@@ -161,26 +161,30 @@ fn project_dossier(project_id: i64) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn daily_digest(day: Option<String>) -> Result<Value, String> {
-    let conn = open()?;
-    let _ = db::log_usage(&conn, "app", "digest");
-    let day = day.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
-    yourmem::dossier::daily_digest(&conn, &day).map_err(|e| e.to_string())
+async fn daily_digest(day: Option<String>) -> Result<Value, String> {
+    run_blocking(move || {
+        let conn = open()?;
+        let _ = db::log_usage(&conn, "app", "digest");
+        let day = day.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
+        yourmem::dossier::daily_digest(&conn, &day).map_err(|e| e.to_string())
+    }).await
 }
 
 #[tauri::command]
-fn daily_digest_export(day: Option<String>) -> Result<Value, String> {
-    let home = data_home();
-    let conn = db::open(&home).map_err(|e| e.to_string())?;
-    let day = day.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
-    let digest = yourmem::dossier::daily_digest(&conn, &day).map_err(|e| e.to_string())?;
-    let dir = yourmem::backups_dir(&home).join("export");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建导出目录失败：{e}"))?;
-    let path = dir.join(format!("activity-{day}.md"));
-    std::fs::write(&path, yourmem::dossier::render_digest_markdown(&digest))
-        .map_err(|e| format!("写入日报失败：{e}"))?;
-    let _ = db::log_usage(&conn, "app", "digest_export");
-    Ok(json!({ "path": path }))
+async fn daily_digest_export(day: Option<String>) -> Result<Value, String> {
+    run_blocking(move || {
+        let home = data_home();
+        let conn = db::open(&home).map_err(|e| e.to_string())?;
+        let day = day.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
+        let digest = yourmem::dossier::daily_digest(&conn, &day).map_err(|e| e.to_string())?;
+        let dir = yourmem::backups_dir(&home).join("export");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建导出目录失败：{e}"))?;
+        let path = dir.join(format!("activity-{day}.md"));
+        std::fs::write(&path, yourmem::dossier::render_digest_markdown(&digest))
+            .map_err(|e| format!("写入日报失败：{e}"))?;
+        let _ = db::log_usage(&conn, "app", "digest_export");
+        Ok(json!({ "path": path }))
+    }).await
 }
 
 // ------------------------------------------------ 可选 AI 整理（API key 只进系统凭据库）

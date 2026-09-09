@@ -20,6 +20,10 @@ const digest = { day: '2026-09-09', sessions: 2, messages: 20, artifacts_added: 
     agents: [{ agent: 'codex', sessions: 2 }],
     activities: [{ session_id: 's1', agent: 'codex', ended_at: '2026-09-09T10:20:00Z', title: '<fix>', tail: 'implemented feature' }],
     artifacts: [{ session_id: 's1', agent: 'codex', path: 'src/main.rs', tool: 'Write', created_at: '2026-09-09T10:10:00Z' }],
+    handoffs: [
+      { source: 'file', title: 'HANDOFF_20260909.md', path: 'D:/alpha/HANDOFF_20260909.md', created_at: '2026-09-09T10:30:00Z', next_steps: 'publish' },
+      { source: 'file', title: 'HANDOFF_20260909_V2.md', path: 'D:/alpha/HANDOFF_20260909_V2.md', created_at: '2026-09-09T10:31:00Z', next_steps: 'verify' },
+    ],
     open_tasks: [{ content: 'run acceptance test', project: 'alpha' }],
     latest_handoff: { title: 'handoff', created_at: '2026-09-09T10:30:00Z', next_steps: 'publish after verification' },
   }] };
@@ -47,6 +51,11 @@ test('Activity supports project, Agent and detail-tab navigation', () => {
   assert.match(html, /src\/main\.rs/);
   assert.match(html, /data-work-session="s1"/);
   assert.match(html, /id="activity-next"[^>]*disabled/);
+
+  const handoffs = context.api.activityPageHtml(digest, { selected: '7', tab: 'handoff', today: '2026-09-09' });
+  assert.match(handoffs, /交接<span>2<\/span>/);
+  assert.match(handoffs, /data-handoff-path="D:\/alpha\/HANDOFF_20260909_V2.md"/);
+  assert.match(handoffs, /交接文档/);
 });
 
 test('AI suggestions show source links and require an explicit save', () => {
