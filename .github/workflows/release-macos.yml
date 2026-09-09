@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,24 +22,29 @@ jobs:
         include:
           - name: Windows x64
             platform: windows-latest
+            manual: false
             args: --bundles nsis
           - name: macOS Apple Silicon
             platform: macos-latest
+            manual: true
             target: aarch64-apple-darwin
-            args: --target aarch64-apple-darwin --bundles dmg
+            args: --target aarch64-apple-darwin --bundles app,dmg
           - name: macOS Intel
             platform: macos-latest
+            manual: true
             target: x86_64-apple-darwin
-            args: --target x86_64-apple-darwin --bundles dmg
+            args: --target x86_64-apple-darwin --bundles app,dmg
 
     steps:
       - uses: actions/checkout@v7
+        if: github.event_name == 'push' || matrix.manual
 
       - name: Add Rust target
-        if: matrix.target != ''
+        if: (github.event_name == 'push' || matrix.manual) && matrix.target != ''
         run: rustup target add ${{ matrix.target }}
 
       - name: Build and upload installer
+        if: github.event_name == 'push' || matrix.manual
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
