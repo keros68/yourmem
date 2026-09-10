@@ -676,6 +676,7 @@ fn mcp_initialize_imports_and_stays_healthy() {
     std::env::set_var("YOUMEM_CODEX_DIR", src.path().join("codex"));
     std::env::set_var("YOUMEM_ZCODE_DIR", src.path().join("nope-rollout"));
     std::env::set_var("YOUMEM_KIMI_DIR", src.path().join("nope-sessions"));
+    std::env::set_var("YOUMEM_PI_DIR", src.path().join("nope-pi"));
     std::env::set_var("YOUMEM_OPENCODE_DB", src.path().join("nope.db"));
     std::env::set_var("YOUMEM_HERMES_DB", src.path().join("nope-hermes.db"));
 
@@ -720,7 +721,9 @@ fn mcp_initialize_imports_and_stays_healthy() {
     std::env::remove_var("YOUMEM_CODEX_DIR");
     std::env::remove_var("YOUMEM_ZCODE_DIR");
     std::env::remove_var("YOUMEM_KIMI_DIR");
+    std::env::remove_var("YOUMEM_PI_DIR");
     std::env::remove_var("YOUMEM_OPENCODE_DB");
+    std::env::remove_var("YOUMEM_HERMES_DB");
 }
 
 #[test]

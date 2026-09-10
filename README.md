@@ -1,6 +1,6 @@
 # yourmem
 
-yourmem 在本机统一归档、搜索和管理 Claude Code、Codex、OpenCode、ZCode、Kimi 与 Hermes 的聊天记录和项目记忆，也可以通过 MCP 把项目上下文提供给其他 AI 编程助手。
+yourmem 在本机统一归档、搜索和管理 Claude Code、Codex、OpenCode、ZCode、Kimi、Hermes 与 pi 的聊天记录和项目记忆，也可以通过 MCP 把项目上下文提供给其他 AI 编程助手。
 
 这些内容原本散落在各个工具中。yourmem 保留原文和来源，让用户可以自行保存、恢复和迁移自己的聊天与记忆。
 

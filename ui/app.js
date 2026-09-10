@@ -690,7 +690,7 @@ let memStatus = "";
 let memAgent = "";
 let memType = "";
 let memView = "list";
-const AGENT_LIST = ["", "claude", "codex", "opencode", "zcode", "kimi", "hermes"];
+const AGENT_LIST = ["", "claude", "codex", "opencode", "zcode", "kimi", "hermes", "pi"];
 const shortId = (sid) => (sid ? sid.split(":")[1] || sid : "");
 
 let memoryRequest = 0;
@@ -965,6 +965,7 @@ async function renderSettings() {
           <select id="agent-add-name">
             <option value="claude">claude</option><option value="codex">codex</option>
             <option value="zcode">zcode</option><option value="kimi">kimi</option>
+            <option value="pi">pi</option>
           </select>
           <input type="text" id="agent-add-path" style="flex:1" placeholder="额外采集根目录（绝对路径，必须已存在）" />
           <button class="btn" id="agent-add-pick">选择文件夹</button>

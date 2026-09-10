@@ -88,6 +88,7 @@ pub fn import_defaults(home: &Path) -> Result<ImportOutcome> {
         (adapters::AGENT_CODEX, "YOUMEM_CODEX_DIR", crate::default_codex_root()),
         (adapters::AGENT_ZCODE, "YOUMEM_ZCODE_DIR", crate::default_zcode_root()),
         (adapters::AGENT_KIMI, "YOUMEM_KIMI_DIR", crate::default_kimi_root()),
+        (adapters::AGENT_PI, "YOUMEM_PI_DIR", crate::default_pi_root()),
     ]
     .into_iter()
     .filter_map(|(a, v, d)| off_root(a, v, d).map(|p| (a.to_string(), p)))
@@ -109,8 +110,9 @@ pub fn import_defaults(home: &Path) -> Result<ImportOutcome> {
 // （claude/codex/zcode/kimi）；opencode 是单库源，用 YOUMEM_OPENCODE_DB 覆盖。
 
 /// 可登记额外根的文件型 agent。
-pub const EXTRA_ROOT_AGENTS: [&str; 4] = [
+pub const EXTRA_ROOT_AGENTS: [&str; 5] = [
     adapters::AGENT_CLAUDE, adapters::AGENT_CODEX, adapters::AGENT_ZCODE, adapters::AGENT_KIMI,
+    adapters::AGENT_PI,
 ];
 
 pub fn read_config(home: &Path) -> Value {
@@ -161,7 +163,8 @@ pub fn disabled_agents(home: &Path) -> Vec<String> {
 pub fn set_agent_disabled(home: &Path, agent: &str, disabled: bool) -> Result<Value> {
     let known = [
         adapters::AGENT_CLAUDE, adapters::AGENT_CODEX, adapters::AGENT_ZCODE,
-        adapters::AGENT_KIMI, adapters::opencode::AGENT_OPENCODE, adapters::hermes::AGENT_HERMES,
+        adapters::AGENT_KIMI, adapters::AGENT_PI,
+        adapters::opencode::AGENT_OPENCODE, adapters::hermes::AGENT_HERMES,
     ];
     anyhow::ensure!(known.contains(&agent), "unknown agent: {agent}");
     let mut cfg = read_config(home);
@@ -220,7 +223,7 @@ pub fn remove_extra_root(home: &Path, agent: &str, path: &Path) -> Result<Value>
     Ok(json!({ "ok": true, "extra_roots": cfg["extra_roots"] }))
 }
 
-/// 六源检测（app 设置页 / `agents` CLI）：默认根是否存在、库里各 agent 的
+/// 七源检测（app 设置页 / `agents` CLI）：默认根是否存在、库里各 agent 的
 /// 会话数、已登记的自定义根、停用状态、最后采集时间；另附主流 agent 观察名单
 /// 的目录级检测。只读。
 pub fn agent_sources(home: &Path, conn: &Connection) -> Result<Value> {
@@ -244,6 +247,7 @@ pub fn agent_sources(home: &Path, conn: &Connection) -> Result<Value> {
         (adapters::AGENT_CODEX, crate::default_codex_root()),
         (adapters::AGENT_ZCODE, crate::default_zcode_root()),
         (adapters::AGENT_KIMI, crate::default_kimi_root()),
+        (adapters::AGENT_PI, crate::default_pi_root()),
     ] {
         out.push(json!({
             "agent": agent,
@@ -313,7 +317,12 @@ pub fn import_all(
         memory_revisions_added: 0,
     };
     for (agent, root) in roots {
-        for path in adapters::discover(root) {
+        let mut files = adapters::discover(root);
+        if *agent == adapters::AGENT_PI {
+            // 临时现场（scratchpad）整桶不采，见 adapters/pi.rs exclude_temp_buckets
+            files = adapters::pi::exclude_temp_buckets(files);
+        }
+        for path in files {
             out.files_seen += 1;
             let (msgs, lines) = match import_file(conn, home, agent, &path) {
                 Ok(r) => r,

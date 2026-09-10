@@ -29,6 +29,9 @@ enum Cmd {
         /// Override Kimi Code sessions root (default ~/.kimi-code/sessions).
         #[arg(long)]
         kimi_dir: Option<PathBuf>,
+        /// Override pi agent sessions root (default ~/.pi/agent/sessions).
+        #[arg(long)]
+        pi_dir: Option<PathBuf>,
         /// Override OpenCode database (default ~/.local/share/opencode/opencode.db).
         #[arg(long)]
         opencode_db: Option<PathBuf>,
@@ -443,6 +446,7 @@ fn run_import(
     codex_dir: Option<PathBuf>,
     zcode_dir: Option<PathBuf>,
     kimi_dir: Option<PathBuf>,
+    pi_dir: Option<PathBuf>,
     opencode_db: Option<PathBuf>,
     hermes_db: Option<PathBuf>,
 ) -> Result<ingest::ImportOutcome> {
@@ -457,6 +461,7 @@ fn run_import(
         (adapters::AGENT_CODEX, pick(codex_dir, "YOUMEM_CODEX_DIR", yourmem::default_codex_root)),
         (adapters::AGENT_ZCODE, pick(zcode_dir, "YOUMEM_ZCODE_DIR", yourmem::default_zcode_root)),
         (adapters::AGENT_KIMI, pick(kimi_dir, "YOUMEM_KIMI_DIR", yourmem::default_kimi_root)),
+        (adapters::AGENT_PI, pick(pi_dir, "YOUMEM_PI_DIR", yourmem::default_pi_root)),
     ];
     let oc_explicit = opencode_db
         .or_else(|| std::env::var_os("YOUMEM_OPENCODE_DB").map(PathBuf::from));
@@ -538,8 +543,8 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Mcp => return yourmem::mcp::serve(&home),
 
-        Cmd::Import { claude_dir, codex_dir, zcode_dir, kimi_dir, opencode_db, hermes_db } => {
-            let outcome = run_import(&home, claude_dir, codex_dir, zcode_dir, kimi_dir, opencode_db, hermes_db)?;
+        Cmd::Import { claude_dir, codex_dir, zcode_dir, kimi_dir, pi_dir, opencode_db, hermes_db } => {
+            let outcome = run_import(&home, claude_dir, codex_dir, zcode_dir, kimi_dir, pi_dir, opencode_db, hermes_db)?;
             print_json(&ingest::outcome_json(&outcome));
         }
 
@@ -548,7 +553,7 @@ fn main() -> Result<()> {
             loop {
                 // 单轮失败不退出（持续采集定位）：最典型场景是 import_with 的锁
                 // fail-closed 30s 超时——另一个命令在等 stdin 确认时 watch 不该死
-                match run_import(&home, None, None, None, None, None, None) {
+                match run_import(&home, None, None, None, None, None, None, None) {
                     Ok(outcome) if outcome.messages_added > 0
                         || outcome.lines_archived > 0
                         || outcome.memory_revisions_added > 0 =>

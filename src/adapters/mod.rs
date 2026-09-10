@@ -10,6 +10,7 @@ pub mod codex;
 pub mod hermes;
 pub mod kimi;
 pub mod opencode;
+pub mod pi;
 pub mod zcode;
 
 use std::path::{Path, PathBuf};
@@ -25,9 +26,11 @@ pub const AGENT_KIMI: &str = "kimi";
 /// hermes：多端网关 agent（~/.hermes/state.db，SQLite 单库源，0.3.9 起）。
 /// cron 来源按 hermes 本人裁定不采（运行日志，非知识资产）。
 pub const AGENT_HERMES: &str = "hermes";
+/// pi：树状 JSONL 文件型源（~/.pi/agent/sessions，2026-09-10 真机样本驱动）。
+pub const AGENT_PI: &str = "pi";
 
-pub fn supported_agents() -> [&'static str; 4] {
-    [AGENT_CLAUDE, AGENT_CODEX, AGENT_ZCODE, AGENT_KIMI]
+pub fn supported_agents() -> [&'static str; 5] {
+    [AGENT_CLAUDE, AGENT_CODEX, AGENT_ZCODE, AGENT_KIMI, AGENT_PI]
 }
 
 /// Recursively find `*.jsonl` session files under a source root.
@@ -100,6 +103,14 @@ pub fn native_id(agent: &str, path: &Path) -> String {
             }
         }
     }
+    if agent == AGENT_PI && stem.len() > 36 {
+        // pi 文件名 <时间戳>_<uuid>.jsonl：尾部 36 位即会话 uuid（与 codex 同法）
+        if let Some(tail) = stem.get(stem.len() - 36..) {
+            if tail.chars().filter(|c| *c == '-').count() == 4 {
+                return tail.to_string();
+            }
+        }
+    }
     stem
 }
 
@@ -124,6 +135,9 @@ pub fn resume_command(agent: &str, native_id: &str) -> Option<String> {
         // hermes 本人验证（2026-08-30）：`hermes --resume SESSION_ID` / `--continue`；
         // 会话 id 是 state.db 持久主键。cron 会话不采，无恢复语义问题。
         AGENT_HERMES => Some(format!("hermes --resume {native_id}")),
+        // pi --help 实测（2026-09-10）：`--session <path|id>` 接受完整/部分 uuid；
+        // `-r` 是交互式挑选不接参数，裸命令口径用 --session。
+        AGENT_PI => Some(format!("pi --session {native_id}")),
         _ => None,
     }
 }
@@ -136,6 +150,7 @@ pub fn parse_chunk(agent: &str, lines: &[(u64, String)]) -> ParseOutput {
         AGENT_CODEX => codex::parse_lines(lines, false),
         AGENT_ZCODE => zcode::parse_lines(lines),
         AGENT_KIMI => kimi::parse_lines(lines),
+        AGENT_PI => pi::parse_lines(lines),
         _ => ParseOutput::default(),
     }
 }
@@ -182,6 +197,10 @@ pub fn capability_matrix() -> serde_json::Value {
           "lineage": "yes", "resume": "yes",
           "writeback": "no", "encrypted": "no",
           "notes": "SQLite 单库源；cron 来源按本人裁定不采；压缩点检测内置待首例校准" },
+        { "agent": AGENT_PI, "transcript": "yes", "search": "yes",
+          "lineage": "no", "resume": "yes",
+          "writeback": "no", "encrypted": "no",
+          "notes": "v3 树状 JSONL；cwd 在会话头行；行内 parentId 是文件内重试分支非跨会话谱系；写回待真机验证后开放" },
     ])
 }
 
@@ -189,6 +208,9 @@ pub fn capability_matrix() -> serde_json::Value {
 pub fn encrypted_watchlist() -> serde_json::Value {
     serde_json::json!([
         { "agent": "trae", "encrypted": "yes", "notes": "ModularData 加密，硬阻断不做" },
-        { "agent": "antigravity", "encrypted": "yes", "notes": "加密 protobuf，硬阻断不做" },
+        // antigravity 的"加密"出自 Swob 对 IDE 主存储（protobuf）的观察；resume-skills
+        // 报道存在明文转录 lane（brain/<id>/.system_generated/logs/transcript.jsonl）。
+        // 两条 lane 可能并存——按样本门禁：本机拿到真实样本核验后才改判，现维持硬阻断。
+        { "agent": "antigravity", "encrypted": "yes", "notes": "加密 protobuf，硬阻断不做（另有明文转录 lane 的报道，待真实样本核验）" },
     ])
 }

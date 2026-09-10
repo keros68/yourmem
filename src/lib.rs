@@ -134,6 +134,12 @@ pub fn default_kimi_root() -> PathBuf {
     home_dir().join(".kimi-code").join("sessions")
 }
 
+/// pi 的会话根：按 cwd 转码目录分桶（`D:\work\x` → `--D--work-x--`），
+/// 桶内 `<时间戳>_<uuid>.jsonl`；转码目录名不参与解析（cwd 在会话头行里）。
+pub fn default_pi_root() -> PathBuf {
+    home_dir().join(".pi").join("agent").join("sessions")
+}
+
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }

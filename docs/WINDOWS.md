@@ -98,6 +98,16 @@ Windows 支持的现状说明与实测记录保留。原则不变：agent 数据
 - opencode Windows 数据目录仍无真实样本（本机实测无 .db）；找到真实库后
   按 `adapters/opencode.rs default_db_path` 是否需要 Windows 分支处理，
   在此之前用 `YOUMEM_OPENCODE_DB`。
+- **单库源只读打开的热 WAL 边界（2026-09-10 登记，未实测）**：opencode/hermes
+  两个 adapter 对已存在的库走 `SQLITE_OPEN_READ_ONLY` 原地打开。agent 正常
+  并发写时只读连接安全（SQLite 自身管理并发）；但若源进程崩溃遗留需恢复的
+  热 WAL，只读连接无法执行恢复、open 直接报错——而两个 adapter 对"库存在
+  但打开失败"是 fail-loud 传播，会毒化整轮 import（区别于文件型源已有
+  `is_file_busy` 跳过容错，单库源不走那条路径）。外部佐证：resume-skills
+  项目对同类问题（读取活跃 SQLite，场景是复制库文件）选择对不支持文件克隆
+  的主机 fail-closed；we 是原地打开，常态更安全，崩溃遗留 WAL 场景同样暴露。
+  真机遇到时修复方向：给单库源 open 加同 `is_file_busy` 语义的容错
+  （打开失败跳过本轮、下轮补采），而不是照搬文件克隆。
 - resume 命令只是字符串展示，无平台逻辑。
 - bundle tar.gz 跨平台互换无已知问题。
 - 签名/公证：不签名发布，NSIS 包有 SmartScreen 提示。
