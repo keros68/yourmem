@@ -1014,6 +1014,8 @@ async function renderSettings() {
         <div class="searchbar" style="margin-top:0">
           <button class="btn" id="storage-usage">查看占用</button>
           <button class="btn" id="storage-compact">回收空闲空间</button>
+          <button class="btn" id="orphan-plan">检查无引用原件</button>
+          <button class="btn danger hidden" id="orphan-run">确认删除无引用原件</button>
         </div>
         <div id="storage-report"></div>
       </div>
@@ -1076,6 +1078,21 @@ async function renderSettings() {
           <button class="btn primary hidden" id="setup-run">确认执行接入</button>
         </div>
         <div id="setup-report"></div>
+      </div>
+      <h2>解除接入与卸载</h2>
+      <div class="memcard">
+        <div class="meta" style="margin-top:0">解除接入会检查所有支持的 agent，只删除 yourmem 的 MCP 项和指令块，其他配置保持不变。彻底清理会再删除 yourmem 资料库；各 agent 自己的原始会话不受影响。</div>
+        <div class="searchbar">
+          <button class="btn" id="disconnect-plan">检测接入残留</button>
+          <button class="btn danger hidden" id="disconnect-run">确认解除全部接入</button>
+        </div>
+        <div id="disconnect-report"></div>
+        <div class="searchbar" style="margin-top:12px">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" id="cleanup-backups" /> 同时删除备份目录</label>
+          <button class="btn danger" id="cleanup-plan">预览彻底清理</button>
+          <button class="btn danger hidden" id="cleanup-run">确认清理并卸载</button>
+        </div>
+        <div id="cleanup-report"></div>
       </div>`)}
 
     ${panel("ai", `
@@ -1385,6 +1402,48 @@ async function renderSettings() {
       btn.disabled = false;
     }
   };
+  $("#disconnect-plan").onclick = async () => {
+    const btn = $("#disconnect-plan"); btn.disabled = true;
+    $("#disconnect-report").innerHTML = '<div class="meta">检测中…</div>';
+    try {
+      const p = await invoke("disconnect_plan");
+      const actions = (p.agents || []).flatMap((a) => a.actions || []);
+      $("#disconnect-report").innerHTML = actions.length
+        ? `<div class="meta">发现 ${actions.length} 项 yourmem 接入残留。执行前会备份相关配置。</div>`
+        : '<div class="meta cap-yes">✓ 未发现 yourmem 接入残留</div>';
+      $("#disconnect-run").classList.toggle("hidden", actions.length === 0);
+    } catch (e) { $("#disconnect-report").innerHTML = `<div class="meta proof-bad">✗ ${esc(String(e))}</div>`; }
+    finally { btn.disabled = false; }
+  };
+  armButton($("#disconnect-run"), "确认解除全部接入", "再次确认解除全部接入", async () => {
+    const r = await invoke("disconnect_run");
+    const removed = (r.agents || []).filter((a) => a.status === "removed").length;
+    $("#disconnect-report").innerHTML = `<div class="meta cap-yes">✓ 已解除 ${removed} 个 agent 的 yourmem 接入</div>`;
+    $("#disconnect-run").classList.add("hidden");
+  });
+  let cleanupToken = null;
+  let cleanupIncludesBackups = false;
+  $("#cleanup-backups").onchange = () => { cleanupToken = null; $("#cleanup-run").classList.add("hidden"); };
+  $("#cleanup-plan").onclick = async () => {
+    const btn = $("#cleanup-plan"); btn.disabled = true;
+    cleanupIncludesBackups = $("#cleanup-backups").checked;
+    $("#cleanup-report").innerHTML = '<div class="meta">统计中…</div>';
+    try {
+      const p = await invoke("local_cleanup_plan", { includeBackups: cleanupIncludesBackups });
+      cleanupToken = p.token;
+      const c = p.cleanup;
+      $("#cleanup-report").innerHTML = `<div class="meta proof-bad">将永久删除核心数据 ${fmtBytes(c.data_bytes)}：${esc(c.data_dir)}${cleanupIncludesBackups ? `<br>同时删除备份 ${fmtBytes(c.backup_bytes)}：${esc(c.backup_dir)}` : ""}<br>不会删除各 agent 的原始会话。</div>`;
+      $("#cleanup-run").classList.remove("hidden");
+    } catch (e) { cleanupToken = null; $("#cleanup-report").innerHTML = `<div class="meta proof-bad">✗ ${esc(String(e))}</div>`; }
+    finally { btn.disabled = false; }
+  };
+  armButton($("#cleanup-run"), "确认清理并卸载", "再次确认：永久删除后不可恢复", async () => {
+    if (!cleanupToken) return;
+    await invoke("local_cleanup_run", { includeBackups: cleanupIncludesBackups, token: cleanupToken });
+    $("#cleanup-report").innerHTML = '<div class="meta cap-yes">✓ 接入和资料库已清理，正在启动卸载程序…</div>';
+    try { await invoke("app_uninstall"); }
+    catch (e) { $("#cleanup-report").innerHTML += `<div class="meta">${esc(String(e))}</div>`; }
+  });
   // 彻底删除的离线档案：查看占用 / 单删 / 清空（armed 二次确认）
   const fmtBytes = (n) => n >= 1073741824 ? `${(n / 1073741824).toFixed(2)} GB`
     : n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1024).toFixed(1)} KB`;
@@ -1433,6 +1492,27 @@ async function renderSettings() {
     }
   };
   $("#storage-usage").onclick = () => { $("#storage-report").innerHTML = '<div class="meta">统计中…</div>'; drawStorage(); };
+  let orphanToken = null;
+  $("#orphan-plan").onclick = async () => {
+    const btn = $("#orphan-plan"); btn.disabled = true;
+    $("#storage-report").innerHTML = '<div class="meta">正在核对对象引用…</div>';
+    try {
+      const p = await invoke("orphan_cleanup_plan");
+      orphanToken = p.token;
+      $("#storage-report").innerHTML = p.files
+        ? `<div class="meta proof-bad">发现 ${p.files} 个无引用或临时对象，可释放 ${fmtBytes(p.bytes)}。删除不影响当前会话与记忆。</div>`
+        : '<div class="meta cap-yes">✓ 未发现无引用对象</div>';
+      $("#orphan-run").classList.toggle("hidden", !p.files);
+    } catch (e) { orphanToken = null; $("#storage-report").innerHTML = `<div class="meta proof-bad">✗ ${esc(String(e))}</div>`; }
+    finally { btn.disabled = false; }
+  };
+  armButton($("#orphan-run"), "确认删除无引用原件", "再次确认删除；当前引用会在执行前复查", async () => {
+    if (!orphanToken) return;
+    const r = await invoke("orphan_cleanup_run", { token: orphanToken });
+    orphanToken = null;
+    $("#orphan-run").classList.add("hidden");
+    $("#storage-report").innerHTML = `<div class="meta cap-yes">✓ 已删除 ${r.removed} 个对象，释放 ${fmtBytes(r.reclaimed_bytes)}</div>`;
+  });
   let curBackupDir = bd.effective;
   $("#backup-dir-save").onclick = async () => {
     const rep = $("#backup-dir-report"), btn = $("#backup-dir-save");
@@ -1605,71 +1685,93 @@ $("#btn-import").onclick = async () => {
 };
 
 (async () => {
-  // 首次启动向导：须在首屏渲染前探测（页面渲染即建库，之后判定恒为 false）
+  // 首次启动向导必须先完成；首屏渲染会建库，不能抢先在系统盘留下资料库。
   let fr = null;
-  try { fr = await invoke("first_run_state"); } catch (e) {}
-  pages.today();
-  if (fr && fr.first_run) showWizard(fr);
+  try { fr = await invoke("first_run_state"); }
+  catch (e) {
+    const ov = document.createElement("div");
+    ov.id = "wizard-overlay";
+    ov.innerHTML = `<div class="wiz-card"><h2 style="margin-top:0">无法读取存储设置</h2><p class="meta proof-bad">${esc(String(e))}</p><p class="meta">为避免在错误位置创建资料库，yourmem 已停止启动。请退出后重试。</p></div>`;
+    document.body.appendChild(ov);
+    return;
+  }
+  if (fr && fr.first_run) showWizard(fr, () => pages.today());
+  else pages.today();
 })();
 
 // ---------------------------------------------------------------- first-run wizard
-// 安装使用向导（1.0.2）：欢迎 + 手动选择备份位置，一步完成，可跳过用默认。
+// 安装使用向导：先选核心数据与备份位置，再允许创建数据库。
 // 只对新装出现（is_first_run：数据目录无 config.json 也无 yourmem.db）。
-function showWizard(fr) {
+function showWizard(fr, onDone) {
   if (document.getElementById("wizard-overlay")) return;
+  const setupAgents = fr.agents || [];
   const ov = document.createElement("div");
   ov.id = "wizard-overlay";
   ov.innerHTML = `
     <div class="wiz-card">
       <h2 style="margin-top:0">欢迎使用 yourmem</h2>
       <p class="meta">把你与 AI 编程助手的对话自动归档、统一检索，数据保存在你自己的电脑上。</p>
-      <h3>备份与导出存到哪里？</h3>
-      <p class="meta">这里存放手动生成的数据库快照、会话导出和删除档案。核心数据仍保存在 ${esc(fr.home)}；留空使用默认位置。</p>
+      <h3>核心数据存到哪里？</h3>
+      <p class="meta">数据库、搜索索引和压缩后的会话原文保存在这里。建议选择空间充足的非系统盘。</p>
       <div class="searchbar">
-        <input type="text" id="wiz-backup-dir" style="flex:1" placeholder="绝对路径，如 D:\\yourmem-backup" value="${esc(fr.suggested || "")}" />
-        <button class="btn" id="wiz-pick">选择文件夹</button>
-        <button class="btn" id="wiz-default">用默认</button>
+        <input type="text" id="wiz-data-dir" style="flex:1" placeholder="绝对路径，如 D:\\yourmem-data" value="${esc(fr.suggested_data || fr.home || "")}" />
+        <button class="btn" id="wiz-data-pick">选择文件夹</button>
       </div>
-      <div class="meta" id="wiz-hint" style="margin:6px 0 12px">默认位置：<span id="wiz-default-path"></span></div>
+      <h3>备份与导出存到哪里？</h3>
+      <p class="meta">这里存放增量快照、完整备份、会话导出和删除档案。必须与核心数据分开。</p>
+      <div class="searchbar">
+        <input type="text" id="wiz-backup-dir" style="flex:1" placeholder="绝对路径，如 D:\\yourmem-backup" value="${esc(fr.suggested_backup || "")}" />
+        <button class="btn" id="wiz-backup-pick">选择文件夹</button>
+      </div>
+      <h3>接入哪些 Agent？</h3>
+      <p class="meta">只接入你勾选的 Agent。未选择的配置不会修改，之后可在“设置 → 接入”中添加。</p>
+      <div class="pillrow" id="wiz-agents">
+        ${setupAgents.map((a) => `<label class="chip" style="cursor:${a.detected ? "pointer" : "default"};opacity:${a.detected ? 1 : .5}"><input type="checkbox" data-wiz-agent="${esc(a.agent)}" ${a.detected ? "" : "disabled"} /> ${esc(a.agent)}${a.detected ? "" : "（未检测到）"}</label>`).join("")}
+      </div>
+      <div class="meta" id="wiz-hint" style="margin:8px 0 12px">当前默认不接入任何 Agent；保存后才会创建资料库。</div>
       <div class="searchbar" style="justify-content:flex-end">
-        <button class="btn" id="wiz-skip">跳过</button>
         <button class="btn primary" id="wiz-done">保存并开始使用</button>
       </div>
     </div>`;
   document.body.appendChild(ov);
-  invoke("backup_dir_get").then((bd) => {
-    if (ov.isConnected) $("#wiz-default-path").textContent = bd.effective;
-  }).catch(() => {});
   const close = () => ov.remove();
-  $("#wiz-pick").onclick = async () => {
-    const input = $("#wiz-backup-dir"), hint = $("#wiz-hint");
-    const buttons = ["#wiz-pick", "#wiz-done", "#wiz-skip", "#wiz-default"].map($);
+  const pick = async (selector) => {
+    const input = $(selector), hint = $("#wiz-hint");
+    const buttons = ["#wiz-data-pick", "#wiz-backup-pick", "#wiz-done"].map($);
     buttons.forEach(b => { b.disabled = true; });
     try {
-      const path = await invoke("backup_dir_pick", { path: input.value.trim() || fr.backup_dir || "" });
+      const path = await invoke("backup_dir_pick", { path: input.value.trim() });
       if (path !== null && ov.isConnected) {
         input.value = path;
-        hint.textContent = "已选择文件夹，保存后生效";
+        hint.textContent = "已选择文件夹，保存后生效。";
       }
     } catch (e) { if (ov.isConnected) hint.textContent = `选择失败：${String(e)}`; }
     finally { buttons.forEach(b => { b.disabled = false; }); }
   };
-  $("#wiz-default").onclick = () => { $("#wiz-backup-dir").value = ""; };
+  $("#wiz-data-pick").onclick = () => pick("#wiz-data-dir");
+  $("#wiz-backup-pick").onclick = () => pick("#wiz-backup-dir");
   $("#wiz-backup-dir").onkeydown = (e) => { if (e.key === "Enter") $("#wiz-done").click(); };
-  $("#wiz-skip").onclick = () => { close(); toast("使用默认备份位置，之后可在 设置 → 备份 修改"); };
   $("#wiz-done").onclick = async () => {
     const btn = $("#wiz-done");
     btn.disabled = true;
     try {
-      const r = await invoke("backup_dir_set", { path: $("#wiz-backup-dir").value.trim() });
+      const r = await invoke("first_run_configure", {
+        dataPath: $("#wiz-data-dir").value.trim(),
+        backupPath: $("#wiz-backup-dir").value.trim(),
+        agents: Array.from(ov.querySelectorAll("[data-wiz-agent]:checked")).map((el) => el.dataset.wizAgent),
+      });
       close();
-      toast(`备份位置：${r.effective}`);
+      onDone();
+      const selected = (r.setup?.agents || []).filter((a) => a.status === "configured").length;
+      if (r.setup?.error) toast(`存储位置已保存；Agent 接入失败，可在设置中重试：${r.setup.error}`);
+      else if (selected) toast(`已保存存储位置并接入 ${selected} 个 Agent`);
+      else toast("已保存存储位置；暂未接入 Agent");
     } catch (e) {
       $("#wiz-hint").textContent = `✗ ${String(e)}`;
       btn.disabled = false;
     }
   };
-  $("#wiz-backup-dir").focus();
+  $("#wiz-data-dir").focus();
 }
 invoke("update_check").then((r) => {
   if (r && r.update_available) toast(`新版本 v${r.latest} 可用（设置 → 通用 → 检查更新）`);

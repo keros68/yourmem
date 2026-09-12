@@ -521,17 +521,42 @@ pub fn insert_messages(conn: &Connection, session_id: &str, msgs: &[NewMessage])
          VALUES (?1,?2,?3,?4,?5,?6,?7)",
     )?;
     for m in msgs {
+        let content = if m.kind == crate::models::MessageKind::ToolResult {
+            tool_result_preview(&m.content, 32_768)
+        } else {
+            m.content.clone()
+        };
         stmt.execute(params![
             session_id,
             m.line_no as i64,
             m.ord as i64,
             m.kind.as_str(),
-            m.content,
+            content,
             m.timestamp,
             m.uuid
         ])?;
     }
     Ok(())
+}
+
+fn tool_result_preview(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+    let split_at = |target: usize| {
+        let mut at = target.min(content.len());
+        while !content.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    };
+    let head = split_at(max_bytes * 3 / 4);
+    let tail = split_at(content.len().saturating_sub(max_bytes / 4));
+    format!(
+        "{}\n\n… [yourmem 已缩短工具输出；完整内容保存在会话原文归档] …\n\n{}",
+        &content[..head],
+        &content[tail..]
+    )
 }
 
 /// 裁定（DESIGN-0.3 §8）：**有意非事务**。本函数只从 ingest 的截断/替换
@@ -2207,5 +2232,15 @@ mod tests {
         assert_eq!(search_hits(&conn, "QUICKRESULT"), 0, "删除后索引同步清空");
         seed_message(&conn, "claude:t5", "tool_result", "replayed QUICKRESULT output");
         assert_eq!(search_hits(&conn, "QUICKRESULT"), 1, "重插后索引同步恢复");
+    }
+
+    #[test]
+    fn tool_result_preview_keeps_head_and_tail() {
+        let content = format!("HEAD{}TAIL", "中".repeat(20_000));
+        let preview = tool_result_preview(&content, 1024);
+        assert!(preview.starts_with("HEAD"));
+        assert!(preview.ends_with("TAIL"));
+        assert!(preview.contains("完整内容保存在会话原文归档"));
+        assert!(preview.len() < content.len());
     }
 }

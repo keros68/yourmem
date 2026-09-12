@@ -9,6 +9,7 @@
 pub mod adapters;
 pub mod backup_location;
 pub mod bundle;
+pub mod cleanup;
 pub mod db;
 pub mod doctor;
 pub mod dossier;
@@ -40,12 +41,48 @@ pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> std::process:
     command
 }
 
-/// Data home: `$YOUMEM_HOME` or `~/.yourmem`.
+/// Data home: `$YOUMEM_HOME`, the desktop first-run choice, or `~/.yourmem`.
 pub fn data_home() -> PathBuf {
     if let Ok(p) = std::env::var("YOUMEM_HOME") {
         return PathBuf::from(p);
     }
+    if let Ok(raw) = std::fs::read_to_string(data_home_pointer()) {
+        let selected = PathBuf::from(raw.trim());
+        if selected.is_absolute() && selected.parent().is_some() {
+            return selected;
+        }
+    }
     home_dir().join(".yourmem")
+}
+
+/// Stable, tiny pointer shared by the desktop app, CLI and MCP processes.
+pub fn data_home_pointer() -> PathBuf {
+    home_dir().join(".yourmem-location")
+}
+
+/// Save a first-run location atomically. Moving an existing library is a
+/// separate copy/verify/switch operation and is intentionally not done here.
+pub fn set_data_home_pointer(path: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(path.is_absolute(), "核心数据位置必须是绝对路径");
+    anyhow::ensure!(path.parent().is_some(), "核心数据不能直接放在磁盘根目录");
+    std::fs::create_dir_all(path)?;
+    let marker = path.join(format!(".write-test-{}", std::process::id()));
+    std::fs::write(&marker, b"yourmem")?;
+    std::fs::remove_file(marker)?;
+    let pointer = data_home_pointer();
+    let tmp = pointer.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, path.to_string_lossy().as_bytes())?;
+    if pointer.exists() {
+        std::fs::remove_file(&pointer)?;
+    }
+    std::fs::rename(tmp, pointer)?;
+    Ok(())
+}
+
+pub fn clear_data_home_pointer() -> anyhow::Result<()> {
+    let pointer = data_home_pointer();
+    if pointer.exists() { std::fs::remove_file(pointer)?; }
+    Ok(())
 }
 
 /// HOME 缺失属运行环境配置错误（launchd/守护进程边界）：fail-loud 好过静默把

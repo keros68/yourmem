@@ -496,6 +496,15 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
     )
     .unwrap_or(0);
 
+    let old_vault_hashes: Vec<String> = if resync {
+        let mut stmt = conn.prepare("SELECT DISTINCT hash FROM vault_lines WHERE session_id = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![session_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    } else {
+        Vec::new()
+    };
+
     let tx = conn.transaction()?;
 
     db::upsert_session(
@@ -516,6 +525,7 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
             rusqlite::params![session_id],
         )?;
         tx.execute("DELETE FROM messages WHERE session_id = ?1", rusqlite::params![session_id])?;
+        tx.execute("DELETE FROM vault_lines WHERE session_id = ?1", rusqlite::params![session_id])?;
         // 压缩点随全量重导重建：先清（文件被截断替换时旧边界行可能已不存在）
         tx.execute(
             "UPDATE sessions SET compact_line_no = NULL WHERE id = ?1",
@@ -577,6 +587,16 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
         )?;
     }
     tx.commit()?;
+    for hash in old_vault_hashes {
+        let referenced: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM vault_lines WHERE hash=?1) OR EXISTS(SELECT 1 FROM memory_revisions WHERE hash=?1)",
+            rusqlite::params![hash],
+            |r| r.get(0),
+        )?;
+        if referenced == 0 {
+            let _ = std::fs::remove_file(vault::object_path(home, &hash));
+        }
+    }
 
     let net = (total - old_count).max(0) as u64;
     // resync 分支的 lines 就是全量重读的 full——两种情况下"本轮归档了多少行"

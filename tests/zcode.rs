@@ -2,7 +2,7 @@
 //! 增量导入与历史行触发的全量重导（resync）。
 
 use yourmem::adapters::{self, zcode};
-use yourmem::{db, ingest};
+use yourmem::{db, ingest, vault};
 
 fn line(query_source: &str, resp_text: &str, tool_calls: serde_json::Value) -> String {
     serde_json::json!({
@@ -246,8 +246,7 @@ fn resync_corrects_inflated_counts_and_byte_fidelity() {
         "SELECT hash FROM vault_lines WHERE session_id = 'zcode:sess_00000000-0000-0000-0000-000000000004' AND line_no = 1",
         [], |r| Ok((r.get(0)?,)),
     ).unwrap();
-    let obj = home.path().join("objects").join(&hash[..2]).join(&hash);
-    let raw = std::fs::read(&obj).unwrap();
+    let raw = vault::read_object(home.path(), &hash, true).unwrap();
     assert_eq!(raw, format!("{body}\r").as_bytes(), "vault 对象必须保留 \\r 字节");
     assert_eq!(raw.last(), Some(&b'\r'), "行尾 \\r 未被剥掉");
 }

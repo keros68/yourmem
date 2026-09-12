@@ -69,16 +69,18 @@ pub fn create(conn: &Connection, home: &Path, out: &Path, filter: &BundleFilter)
     let mut bytes = 0u64;
     let mut missing = 0u64;
     for hash in &keep {
-        let src = vault::object_path(home, hash);
-        if !src.is_file() {
-            missing += 1;
-            continue;
-        }
+        let raw = match vault::read_object(home, hash, true) {
+            Ok(raw) => raw,
+            Err(_) => {
+                missing += 1;
+                continue;
+            }
+        };
         let dst = root.join("objects").join(hash.get(..2).unwrap_or(hash)).join(hash);
         std::fs::create_dir_all(dst.parent().unwrap())?;
-        std::fs::copy(&src, &dst)?;
+        std::fs::write(&dst, &raw)?;
         objects += 1;
-        bytes += std::fs::metadata(&dst)?.len();
+        bytes += raw.len() as u64;
     }
     // 保真是"验"出来的：引用的对象缺一个，恢复出的库就有导不出来的会话，
     // 这种 bundle 不该被创建（宁可失败也不打包一个自洽但残缺的包）。
@@ -551,12 +553,11 @@ fn copy_objects(bundle_root: &Path, target_home: &Path) -> Result<u64> {
         if !entry.file_type().is_file() { continue; }
         let hash = entry.file_name().to_string_lossy().to_string();
         let dst = vault::object_path(target_home, &hash);
-        if dst.is_file() && vault::hash_bytes(&std::fs::read(&dst)?) == hash { continue; }
-        std::fs::create_dir_all(dst.parent().unwrap())?;
-        let mut pending = tempfile::NamedTempFile::new_in(dst.parent().unwrap())?;
-        std::io::copy(&mut std::fs::File::open(entry.path())?, pending.as_file_mut())?;
-        pending.as_file().sync_all()?;
-        pending.persist(&dst).map_err(|e| e.error)?;
+        if dst.is_file() && vault::read_object(target_home, &hash, true).is_ok() { continue; }
+        let raw = std::fs::read(entry.path())?;
+        anyhow::ensure!(vault::hash_bytes(&raw) == hash, "bundle object hash mismatch: {hash}");
+        if dst.exists() { std::fs::remove_file(&dst)?; }
+        anyhow::ensure!(vault::store_line(target_home, &raw)? == hash, "bundle object address mismatch");
         copied += 1;
     }
     Ok(copied)

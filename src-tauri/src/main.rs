@@ -470,13 +470,69 @@ fn auto_purge_set(enabled: bool) -> Result<Value, String> {
 fn first_run_state() -> Result<Value, String> {
     let home = data_home();
     let first_run = yourmem::is_first_run(&home);
-    let suggested = if first_run { suggest_backup_dir() } else { None };
+    let suggested_data = first_run.then(|| suggest_storage_dir("yourmem-data")).flatten();
+    let suggested_backup = first_run.then(|| suggest_storage_dir("yourmem-backup")).flatten();
+    let agents = if first_run {
+        yourmem::setup::detected_setup_agents(&yourmem::setup::Targets::default())
+    } else {
+        Vec::new()
+    };
     Ok(json!({
         "first_run": first_run,
         "home": home,
         "backup_dir": yourmem::backups_dir(&home),
-        "suggested": suggested,
+        "suggested_data": suggested_data,
+        "suggested_backup": suggested_backup,
+        "agents": agents,
     }))
+}
+
+#[tauri::command]
+fn first_run_configure(data_path: String, backup_path: String, agents: Vec<String>) -> Result<Value, String> {
+    let data = std::path::PathBuf::from(data_path.trim());
+    let backup = std::path::PathBuf::from(backup_path.trim());
+    let valid = |p: &std::path::Path| p.is_absolute() && p.parent().is_some();
+    if !valid(&data) || !valid(&backup) {
+        return Err("核心数据和备份都必须选择非磁盘根目录的绝对路径".into());
+    }
+    let key = |p: &std::path::Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let dk = key(&data);
+    let bk = key(&backup);
+    if dk == bk || dk.starts_with(&(bk.clone() + "\\")) || bk.starts_with(&(dk.clone() + "\\")) {
+        return Err("核心数据与备份位置不能相同或互相包含".into());
+    }
+    let nonempty = |p: &std::path::Path| -> Result<bool, String> {
+        if !p.exists() { return Ok(false); }
+        Ok(std::fs::read_dir(p).map_err(|e| e.to_string())?.next().is_some())
+    };
+    if nonempty(&data)? || nonempty(&backup)? {
+        return Err("核心数据和备份都需要选择空目录".into());
+    }
+    std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&backup).map_err(|e| e.to_string())?;
+    let probe = backup.join(format!(".write-test-{}", std::process::id()));
+    std::fs::write(&probe, b"yourmem").and_then(|_| std::fs::remove_file(&probe)).map_err(|e| e.to_string())?;
+    let cfg = json!({
+        "backup_dir": backup,
+        "index_tool_output": false,
+        "snapshot_auto_cleanup": true,
+        "snapshot_keep_recent": 3,
+        "snapshot_keep_monthly": 3,
+    });
+    yourmem::ingest::write_config(&data, &cfg).map_err(|e| e.to_string())?;
+    if let Err(e) = yourmem::set_data_home_pointer(&data) {
+        let _ = std::fs::remove_file(data.join("config.json"));
+        return Err(e.to_string());
+    }
+    let setup = if agents.is_empty() {
+        json!({"agents":[],"skipped":true})
+    } else {
+        match yourmem::setup::execute_selected(&yourmem::setup::Targets::default(), &agents) {
+            Ok(result) => result,
+            Err(e) => json!({"error":e.to_string()}),
+        }
+    };
+    Ok(json!({"data_dir":data,"backup_dir":backup,"setup":setup}))
 }
 
 /// 向导预填建议：`fsutil fsinfo drives` 枚举盘符（系统内置、瞬时、无权限要求），
@@ -484,7 +540,7 @@ fn first_run_state() -> Result<Value, String> {
 /// 调用，枚举盘符本身不会；fsutil 失败/只有一块盘/非 Windows 一律 None。
 /// 输出前缀随系统语言本地化（"Drives:"/"驱动器:"），解析按 token 形状匹配、
 /// 不认标签。注意子命令是 fsinfo——`fsutil fs drives` 在部分系统无效。
-fn suggest_backup_dir() -> Option<String> {
+fn suggest_storage_dir(name: &str) -> Option<String> {
     if !cfg!(target_os = "windows") {
         return None;
     }
@@ -499,7 +555,7 @@ fn suggest_backup_dir() -> Option<String> {
     let system = std::env::var("SystemDrive")
         .unwrap_or_else(|_| "C:".into())
         .to_uppercase();
-    pick_suggestion(&letters, &system)
+    pick_suggestion(&letters, &system, name)
 }
 
 /// 解析 fsutil 输出（形如 "Drives: C:\ D:\ E:\"）里的盘符 token。
@@ -511,12 +567,12 @@ fn parse_drive_letters(text: &str) -> Vec<String> {
 }
 
 /// 取第一个非系统盘的备份目录建议（盘符比较大小写不敏感，输出归一为大写）。
-fn pick_suggestion(letters: &[String], system: &str) -> Option<String> {
+fn pick_suggestion(letters: &[String], system: &str, name: &str) -> Option<String> {
     let system = system.to_uppercase();
     letters
         .iter()
         .find(|l| l.to_uppercase() != system)
-        .map(|l| format!("{}\\yourmem-backup", l.to_uppercase()))
+        .map(|l| format!("{}\\{name}", l.to_uppercase()))
 }
 
 #[cfg(test)]
@@ -537,12 +593,12 @@ mod tests {
     fn pick_suggestion_skips_system_drive() {
         let letters = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
         assert_eq!(
-            pick_suggestion(&letters(&["C:", "D:", "E:"]), "C:"),
+            pick_suggestion(&letters(&["C:", "D:", "E:"]), "C:", "yourmem-backup"),
             Some("D:\\yourmem-backup".into())
         );
-        assert_eq!(pick_suggestion(&letters(&["C:"]), "C:"), None, "只有系统盘不建议");
+        assert_eq!(pick_suggestion(&letters(&["C:"]), "C:", "yourmem-backup"), None, "只有系统盘不建议");
         assert_eq!(
-            pick_suggestion(&letters(&["C:", "c:", "D:"]), "C:"),
+            pick_suggestion(&letters(&["C:", "c:", "D:"]), "C:", "yourmem-backup"),
             Some("D:\\yourmem-backup".into()),
             "盘符大小写不敏感"
         );
@@ -848,6 +904,22 @@ async fn storage_usage() -> Result<Value, String> {
     run_blocking(|| Ok(db::storage_usage(&data_home()))).await
 }
 
+#[tauri::command]
+async fn orphan_cleanup_plan() -> Result<Value, String> {
+    run_blocking(|| {
+        let home = data_home();
+        yourmem::vault::orphan_cleanup_plan(&open()?, &home).map_err(|e| e.to_string())
+    }).await
+}
+
+#[tauri::command]
+async fn orphan_cleanup_run(token: String) -> Result<Value, String> {
+    run_blocking(move || {
+        let home = data_home();
+        yourmem::vault::orphan_cleanup(&open()?, &home, &token).map_err(|e| e.to_string())
+    }).await
+}
+
 /// 整理数据库空闲页（VACUUM）：索引切换 / 大量删除后的磁盘回收。
 #[tauri::command]
 async fn compact_db() -> Result<Value, String> {
@@ -917,6 +989,50 @@ async fn setup_run(agents: Vec<String>) -> Result<Value, String> {
         yourmem::setup::execute_selected(&yourmem::setup::Targets::default(), &agents).map_err(|e| e.to_string())
     })
     .await
+}
+
+fn all_setup_agents() -> Vec<String> {
+    ["claude", "codex", "zcode", "kimi", "gemini", "cursor", "hermes"]
+        .map(str::to_string).to_vec()
+}
+
+#[tauri::command]
+async fn disconnect_plan() -> Result<Value, String> {
+    run_blocking(|| yourmem::setup::remove_plan_selected(&yourmem::setup::Targets::default(), &all_setup_agents()).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+async fn disconnect_run() -> Result<Value, String> {
+    run_blocking(|| yourmem::setup::remove_execute_selected(&yourmem::setup::Targets::default(), &all_setup_agents()).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+async fn local_cleanup_plan(include_backups: bool) -> Result<Value, String> {
+    run_blocking(move || yourmem::cleanup::plan(&data_home(), include_backups).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+async fn local_cleanup_run(include_backups: bool, token: String) -> Result<Value, String> {
+    run_blocking(move || {
+        yourmem::setup::remove_execute_selected(&yourmem::setup::Targets::default(), &all_setup_agents())
+            .map_err(|e| e.to_string())?;
+        let home = data_home();
+        yourmem::cleanup::execute(&home, include_backups, &token).map_err(|e| e.to_string())
+    }).await
+}
+
+#[tauri::command]
+fn app_uninstall() -> Result<(), String> {
+    if !cfg!(target_os = "windows") {
+        return Err("当前系统请从应用程序目录卸载 yourmem".into());
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let uninstaller = exe.parent().unwrap_or(std::path::Path::new(".")).join("uninstall.exe");
+    if !uninstaller.is_file() {
+        return Err(format!("未找到卸载程序：{}。可从 Windows 设置 → 应用卸载。", uninstaller.display()));
+    }
+    std::process::Command::new(uninstaller).spawn().map_err(|e| e.to_string())?;
+    std::process::exit(0);
 }
 
 /// 本地自检（UI-DESIGN §8.5）：只读对账，报告直接渲染在设置页。
@@ -1105,14 +1221,15 @@ fn main() {
             trash_empty_overdue, purge_archives, purge_archive_delete, purge_archive_clear,
             auto_purge_get, auto_purge_set, agent_set_enabled,
             backup_dir_get, backup_dir_set, backup_dir_pick, bundle_path_pick,
-            first_run_state, update_check, update_install, open_url,
+            first_run_state, first_run_configure, update_check, update_install, open_url,
             search, memories, update_memory, artifacts, import_now,
             memory_files, memory_file_show,
             agents_detect, agent_add_root, agent_remove_root,
-            bundle_create, bundle_verify, bundle_restore, project_review, setup_plan, setup_run, app_info,
+            bundle_create, bundle_verify, bundle_restore, project_review, setup_plan, setup_run,
+            disconnect_plan, disconnect_run, local_cleanup_plan, local_cleanup_run, app_uninstall, app_info,
             snapshot_list, snapshot_create, snapshot_export, snapshot_cleanup_plan, snapshot_cleanup,
             doctor,
-            index_status, index_set_tools, storage_usage, compact_db,
+            index_status, index_set_tools, storage_usage, orphan_cleanup_plan, orphan_cleanup_run, compact_db,
         ])
         .run(tauri::generate_context!())
         .expect("error while running yourmem app");

@@ -150,6 +150,15 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Remove every yourmem MCP/instruction entry; optionally delete local data and backups.
+    Teardown {
+        #[arg(long)]
+        delete_data: bool,
+        #[arg(long, requires = "delete_data")]
+        delete_backups: bool,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Agent 数据源：检测五源 + 管理自定义采集根（config.json）。
     Agents {
         #[command(subcommand)]
@@ -487,7 +496,9 @@ fn run_import(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let home = data_home();
-    std::fs::create_dir_all(&home)?;
+    if !matches!(&cli.cmd, Cmd::Teardown { .. }) {
+        std::fs::create_dir_all(&home)?;
+    }
 
     // 本地使用侧指标（DESIGN-0.3 §11）：仅命令名+时间戳，不外传；失败静默。
     let cmd_name = match &cli.cmd {
@@ -516,6 +527,7 @@ fn main() -> Result<()> {
         Cmd::Snapshot { .. } => "snapshot",
         Cmd::RestoreAgents { .. } => "restore-agents",
         Cmd::Setup { .. } => "setup",
+        Cmd::Teardown { .. } => "teardown",
         Cmd::Agents { .. } => "agents",
         Cmd::Index { cmd } => match cmd {
             IndexCmd::Status => "index status",
@@ -528,12 +540,13 @@ fn main() -> Result<()> {
         Cmd::Mcp => "mcp",
     };
     if !matches!(
-        cli.cmd,
+        &cli.cmd,
         Cmd::Mcp
             | Cmd::Snapshot { .. }
             | Cmd::Bundle {
                 cmd: BundleCmd::Restore { .. }
             }
+            | Cmd::Teardown { .. }
     ) {
         if let Ok(conn) = db::open(&home) {
             let _ = db::log_usage(&conn, "cli", cmd_name);
@@ -923,6 +936,27 @@ fn main() -> Result<()> {
                 }
             }
             print_json(&yourmem::setup::execute(&targets)?);
+        }
+
+        Cmd::Teardown { delete_data, delete_backups, yes } => {
+            let targets = yourmem::setup::Targets::default();
+            let agents = ["claude", "codex", "zcode", "kimi", "gemini", "cursor", "hermes"]
+                .map(str::to_string);
+            let disconnect = yourmem::setup::remove_plan_selected(&targets, &agents)?;
+            let cleanup = delete_data.then(|| yourmem::cleanup::plan(&home, delete_backups)).transpose()?;
+            print_json(&json!({"disconnect":disconnect,"cleanup":cleanup}));
+            if !yes {
+                eprint!("确认解除全部 yourmem 接入{}？输入 y 继续: ", if delete_data { "并永久删除所选数据" } else { "" });
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                if line.trim() != "y" { anyhow::bail!("已取消"); }
+            }
+            let removed = yourmem::setup::remove_execute_selected(&targets, &agents)?;
+            let cleaned = match cleanup {
+                Some(p) => Some(yourmem::cleanup::execute(&home, delete_backups, p["token"].as_str().unwrap_or_default())?),
+                None => None,
+            };
+            print_json(&json!({"disconnect":removed,"cleanup":cleaned}));
         }
 
         Cmd::Agents { cmd } => match cmd {

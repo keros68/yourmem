@@ -100,6 +100,47 @@ impl Targets {
             _ => None,
         }
     }
+
+    fn mcp_entry_present(&self, agent: &str) -> bool {
+        match agent {
+            "claude" => json_pointer_present(&self.claude_json, "/mcpServers/yourmem"),
+            "zcode" => json_pointer_present(&self.zcode_config, "/mcp/servers/yourmem"),
+            "kimi" => json_pointer_present(&self.kimi_mcp, "/mcpServers/yourmem"),
+            "gemini" => json_pointer_present(&self.gemini_settings, "/mcpServers/yourmem"),
+            "cursor" => json_pointer_present(&self.cursor_mcp, "/mcpServers/yourmem"),
+            "codex" => std::fs::read_to_string(&self.codex_config)
+                .map(|s| s.lines().any(|line| {
+                    let h = line.trim().split('#').next().unwrap_or("").trim();
+                    h == "[mcp_servers.yourmem]" || h.starts_with("[mcp_servers.yourmem.")
+                }))
+                .unwrap_or(false),
+            "hermes" => std::fs::read_to_string(&self.hermes_config)
+                .map(|s| hermes_has_yourmem_block(&s))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+}
+
+fn json_pointer_present(path: &Path, pointer: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|s| serde_json::from_str::<Value>(&s)
+            .map(|v| v.pointer(pointer).is_some())
+            .unwrap_or_else(|_| s.contains("\"yourmem\"")))
+        .unwrap_or(false)
+}
+
+fn hermes_has_yourmem_block(content: &str) -> bool {
+    let mut in_servers = false;
+    for line in content.lines() {
+        let indent = line.len() - line.trim_start().len();
+        if indent == 0 && !line.trim().is_empty() {
+            in_servers = line.trim() == "mcp_servers:";
+        } else if in_servers && indent == 2 && line.trim() == "yourmem:" {
+            return true;
+        }
+    }
+    false
 }
 
 fn json_registered_command(path: &Path, pointer: &str) -> Option<String> {
@@ -247,6 +288,13 @@ pub fn resolve_cli_exe() -> Result<PathBuf> {
 /// 门控要素 1：预览。返回每个 agent 的每个动作及其当前状态（done/todo/skip）。
 const SETUP_AGENTS: [&str; 7] = ["claude", "codex", "zcode", "kimi", "gemini", "cursor", "hermes"];
 
+pub fn detected_setup_agents(targets: &Targets) -> Vec<Value> {
+    SETUP_AGENTS
+        .iter()
+        .map(|agent| json!({"agent":agent,"detected":targets.agent_present(agent)}))
+        .collect()
+}
+
 /// 只预览用户选中的 agent。桌面端用它把“检测到”与“要接入”分开；CLI 仍默认全选。
 pub fn plan_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
     anyhow::ensure!(!selected.is_empty(), "请至少选择一个要接入的 agent");
@@ -364,6 +412,164 @@ pub fn execute_selected(targets: &Targets, selected: &[String]) -> Result<Value>
 
 pub fn execute(targets: &Targets) -> Result<Value> {
     execute_selected(targets, &SETUP_AGENTS.map(str::to_string))
+}
+
+fn instruction_block_present(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().any(|line| line.trim_start().starts_with('#') && line.contains(INSTRUCTION_MARKER)))
+        .unwrap_or(false)
+}
+
+pub fn remove_plan_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
+    for agent in selected {
+        anyhow::ensure!(SETUP_AGENTS.contains(&agent.as_str()), "不支持解除接入 agent: {agent}");
+    }
+    let mut agents = Vec::new();
+    for agent in SETUP_AGENTS {
+        if !selected.iter().any(|a| a == agent) {
+            continue;
+        }
+        let mut actions = Vec::new();
+        if targets.mcp_entry_present(agent) {
+            let path = match agent {
+                "claude" => &targets.claude_json,
+                "codex" => &targets.codex_config,
+                "zcode" => &targets.zcode_config,
+                "kimi" => &targets.kimi_mcp,
+                "gemini" => &targets.gemini_settings,
+                "cursor" => &targets.cursor_mcp,
+                _ => &targets.hermes_config,
+            };
+            actions.push(json!({"kind":"remove_mcp","path":path}));
+        }
+        if agent == "claude" && instruction_block_present(&targets.claude_md) {
+            actions.push(json!({"kind":"remove_instructions","path":targets.claude_md}));
+        }
+        if agent == "codex" && instruction_block_present(&targets.codex_agents) {
+            actions.push(json!({"kind":"remove_instructions","path":targets.codex_agents}));
+        }
+        agents.push(json!({"agent":agent,"status":if actions.is_empty(){"clean"}else{"detected"},"actions":actions}));
+    }
+    Ok(json!({"agents":agents,"consequences":"只移除 yourmem 的 MCP 配置与指令块；写入前备份配置文件。"}))
+}
+
+pub fn remove_execute_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
+    let plan = remove_plan_selected(targets, selected)?;
+    let mut results = Vec::new();
+    for row in plan["agents"].as_array().cloned().unwrap_or_default() {
+        let name = row["agent"].as_str().unwrap_or_default();
+        if row["actions"].as_array().map(Vec::is_empty).unwrap_or(true) {
+            results.push(json!({"agent":name,"status":"clean"}));
+            continue;
+        }
+        for action in row["actions"].as_array().cloned().unwrap_or_default() {
+            let path = PathBuf::from(action["path"].as_str().unwrap_or_default());
+            match action["kind"].as_str().unwrap_or_default() {
+                "remove_instructions" => remove_instructions(&path)?,
+                "remove_mcp" if name == "codex" => remove_codex_mcp(&path)?,
+                "remove_mcp" if name == "hermes" => remove_hermes_mcp(&path)?,
+                "remove_mcp" => remove_json_mcp(&path, name)?,
+                _ => {}
+            }
+        }
+        results.push(json!({"agent":name,"status":"removed"}));
+    }
+    Ok(json!({"agents":results}))
+}
+
+fn remove_json_mcp(path: &Path, agent: &str) -> Result<()> {
+    let mut v = read_json_config(path)?;
+    let parent = if agent == "zcode" {
+        v.pointer_mut("/mcp/servers")
+    } else {
+        v.pointer_mut("/mcpServers")
+    };
+    let changed = parent
+        .and_then(Value::as_object_mut)
+        .and_then(|o| o.remove("yourmem"))
+        .is_some();
+    if changed {
+        backup_then_write(path, serde_json::to_string_pretty(&v)?.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn remove_codex_mcp(path: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    let mut skip = false;
+    for line in lines {
+        let t = line.trim();
+        if t.starts_with('[') {
+            let header = t.split('#').next().unwrap_or("").trim();
+            skip = header == "[mcp_servers.yourmem]"
+                || header.starts_with("[mcp_servers.yourmem.");
+        }
+        if !skip {
+            out.push(line);
+        }
+    }
+    let mut cleaned = out.join("\n");
+    if !cleaned.is_empty() { cleaned.push('\n'); }
+    if cleaned != content {
+        backup_then_write(path, cleaned.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn remove_hermes_mcp(path: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = Vec::new();
+    let mut in_servers = false;
+    let mut skip = false;
+    for line in content.lines() {
+        let indent = line.len() - line.trim_start().len();
+        if indent == 0 && !line.trim().is_empty() {
+            in_servers = line.trim() == "mcp_servers:";
+            skip = false;
+        } else if in_servers && indent == 2 && !line.trim().is_empty() {
+            skip = line.trim() == "yourmem:";
+        }
+        if !skip { out.push(line); }
+    }
+    let mut cleaned = out.join("\n");
+    if !cleaned.is_empty() { cleaned.push('\n'); }
+    if cleaned != content { backup_then_write(path, cleaned.as_bytes())?; }
+    Ok(())
+}
+
+fn heading_level(line: &str) -> Option<usize> {
+    let t = line.trim_start();
+    let n = t.bytes().take_while(|b| *b == b'#').count();
+    (n > 0 && t.as_bytes().get(n) == Some(&b' ')).then_some(n)
+}
+
+fn remove_instructions(path: &Path) -> Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    let mut skip_level = None;
+    for line in lines {
+        if let Some(level) = skip_level {
+            if heading_level(line).map(|n| n <= level).unwrap_or(false) {
+                skip_level = None;
+            } else {
+                continue;
+            }
+        }
+        if line.contains(INSTRUCTION_MARKER) {
+            if let Some(level) = heading_level(line) {
+                skip_level = Some(level);
+                continue;
+            }
+        }
+        out.push(line);
+    }
+    let mut cleaned = out.join("\n");
+    if !cleaned.is_empty() { cleaned.push('\n'); }
+    if cleaned != content { backup_then_write(path, cleaned.as_bytes())?; }
+    Ok(())
 }
 
 /// 追加式后缀，完整保留原文件名（`foo.md` → `foo.md.bak-…`）。
@@ -577,6 +783,42 @@ mod tests {
         for v in [&k, &g, &c] {
             assert_eq!(v["mcpServers"]["yourmem"]["args"][0], "mcp");
         }
+    }
+
+    #[test]
+    fn teardown_removes_only_owned_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("mcp.json");
+        std::fs::write(&json_path, r#"{"mcpServers":{"yourmem":{"command":"x"},"other":{"command":"keep"}},"theme":"dark"}"#).unwrap();
+        remove_json_mcp(&json_path, "claude").unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert!(v["mcpServers"].get("yourmem").is_none());
+        assert_eq!(v["mcpServers"]["other"]["command"], "keep");
+        assert_eq!(v["theme"], "dark");
+
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "theme = 'dark'\n[mcp_servers.yourmem]\ncommand='x'\n[mcp_servers.yourmem.env]\nA='B'\n[mcp_servers.other]\ncommand='keep'\n").unwrap();
+        remove_codex_mcp(&toml).unwrap();
+        let out = std::fs::read_to_string(toml).unwrap();
+        assert!(out.contains("theme = 'dark'") && out.contains("[mcp_servers.other]"));
+        assert!(!out.contains("mcp_servers.yourmem"));
+
+        let yaml = dir.path().join("config.yaml");
+        std::fs::write(&yaml, "theme: dark\nmcp_servers:\n  yourmem:\n    command: x\n  other:\n    command: keep\nnext: yes\n").unwrap();
+        remove_hermes_mcp(&yaml).unwrap();
+        let out = std::fs::read_to_string(yaml).unwrap();
+        assert!(out.contains("other:") && out.contains("next: yes"));
+        assert!(!out.contains("yourmem:"));
+    }
+
+    #[test]
+    fn teardown_removes_repeated_instruction_sections_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        std::fs::write(&path, "# Keep\nA\n## yourmem 跨 agent 记忆库（MCP）\nold\n## Keep two\nB\n## yourmem 跨 agent 记忆库（MCP）\nold2\n## End\nC\n").unwrap();
+        remove_instructions(&path).unwrap();
+        let out = std::fs::read_to_string(path).unwrap();
+        assert_eq!(out, "# Keep\nA\n## Keep two\nB\n## End\nC\n");
     }
 }
 

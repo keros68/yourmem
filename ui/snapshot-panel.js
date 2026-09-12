@@ -12,8 +12,8 @@ export function snapshotPanelHtml() {
         <div id="snapshot-report" role="status" aria-live="polite"></div>
         <div id="snapshot-list" class="scrollbox" style="margin-top:8px"></div>
         <div class="searchbar" style="margin-top:12px">
-          <label>保留最近 <input id="snapshot-keep-recent" type="number" min="1" step="1" value="7" style="width:64px" /> 份</label>
-          <label>保留最近 <input id="snapshot-keep-monthly" type="number" min="0" step="1" value="6" style="width:64px" /> 个月的月度快照</label>
+          <label>保留最近 <input id="snapshot-keep-recent" type="number" min="1" step="1" value="3" style="width:64px" /> 份</label>
+          <label>保留最近 <input id="snapshot-keep-monthly" type="number" min="0" step="1" value="3" style="width:64px" /> 个月的月度快照</label>
           <span class="meta">按最近有快照的月份各保留最新一份，再与最近份数合并</span>
           <button class="btn" id="snapshot-cleanup-plan">生成清理计划</button>
           <button class="btn danger hidden" id="snapshot-cleanup-confirm">确认清理</button>

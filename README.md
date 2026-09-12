@@ -54,7 +54,7 @@ yourmem 提供标准 stdio MCP 接口。一键接入支持 Claude Code、Codex�
 
 1.1.9 起可在“设置 → 通用”中直接下载并安装后续更新。1.1.8 及更早版本需要先手动安装一次 1.1.9。
 
-首次启动时可以选择备份目录，也可以跳过并使用默认位置。
+首次启动必须分别选择核心数据和备份位置，保存后才创建资料库。向导会列出检测到的 Agent，默认均不接入；只修改用户主动勾选的 Agent，之后也可在设置中补充。建议把两个存储目录放在空间充足的非系统盘。
 
 ## 开始使用
 
@@ -77,9 +77,9 @@ yourmem 提供标准 stdio MCP 接口。一键接入支持 Claude Code、Codex�
 
 ## 数据保存在哪里
 
-数据目录默认为 `~/.yourmem`，可用环境变量 `YOUMEM_HOME` 修改。数据库快照、导出文件等备份可以在设置中指定到其他磁盘。原始归档对象仍保存在数据目录；异盘完整备份需使用“创建备份”，同时保存数据库和原始记录。
+桌面版首次启动会保存一个很小的位置指针 `~/.yourmem-location`，核心数据实际写入向导选择的目录；`YOUMEM_HOME` 仍可用于命令行或受管环境覆盖该选择。备份目录单独选择。会话原文对象在核心数据目录内透明压缩，数据库只保留大型工具输出的首尾预览，完整内容仍可从归档还原。
 
-设置 → 备份中的“日常增量快照”在备份目录的 `snapshots-v1` 中保存压缩数据库与原件。不同日期的快照共享相同原件，每份变化后的数据库仍完整保存；原件独立于正式资料库，因此需要整体保存快照仓库。按保留规则清理前会先展示计划并要求再次确认。迁移或恢复时，选择快照导出独立完整备份，再执行校验与恢复。
+设置 → 备份中的“日常增量快照”在备份目录的 `snapshots-v1` 中保存压缩数据库与原件。不同日期共享相同原件；新安装默认保留最近 3 份和最近 3 个月的月度快照，并在创建后自动清理更早数据。手动修改保留规则仍需先预览再确认。迁移或恢复时，选择快照导出独立完整备份，再执行校验与恢复。
 
 1.1.0 起创建及导出的完整备份采用 v2 格式，省略可重建的搜索索引，恢复时重建。恢复新包需要 1.1.0 或更新版本；原有 v1 备份仍可恢复。已有备份不会自动转换或删除。
 
@@ -88,7 +88,7 @@ yourmem 日常只读取各 AI 编程助手的原始数据。只有以下操作�
 - 一键接入；
 - 把已归档的对话写回原工具。
 
-这两类操作都会先显示计划，由用户确认，并在修改前备份原文件。卸载 yourmem 不会删除数据目录。
+这两类操作都会先显示计划，由用户确认，并在修改前备份原文件。设置 → 接入提供“解除接入与卸载”：统一移除 Claude Code、Codex、ZCode、Kimi Code、Gemini CLI、Cursor 和 Hermes 中的 yourmem 项，可选择同时永久删除核心数据与备份；各 agent 自己的原始会话不会删除。
 
 yourmem 不需要云端账号，也不会把聊天和记忆上传到服务端。当前不提供多设备实时同步、数据加密或基于 embedding 的语义搜索。
 
@@ -109,8 +109,11 @@ yourmem bundle create -o yourmem.tar.gz
 yourmem snapshot create                # 创建日常增量快照
 yourmem snapshot list                  # 查看快照及仓库占用
 yourmem snapshot export <ID> -o move.tar.gz
-yourmem snapshot plan --keep-recent 7 --keep-monthly 6
+yourmem snapshot plan --keep-recent 3 --keep-monthly 3
 yourmem doctor                         # 本地自检
+yourmem teardown                       # 解除全部 agent 接入
+yourmem teardown --delete-data         # 再删除核心数据
+yourmem teardown --delete-data --delete-backups
 ```
 
 按项目导出（`bundle create --project 项目名`）仅包含所选项目的记忆与原生记忆修订，全局记忆不随包携带。

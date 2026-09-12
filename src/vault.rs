@@ -9,9 +9,14 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::{collections::HashSet, io::{Read, Write}};
+
+const COMPRESSED_MAGIC: &[u8; 8] = b"YMEMGZ1\0";
+const COMPRESS_MIN_BYTES: usize = 256;
 
 pub fn objects_root(home: &Path) -> PathBuf {
     home.join("objects")
@@ -37,7 +42,7 @@ pub fn store_line(home: &Path, bytes: &[u8]) -> Result<String> {
     // content would otherwise share one temp file and could rename over each
     // other mid-write (the object itself is immutable, the race is only on tmp).
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
+    std::fs::write(&tmp, encode_object(bytes)?)?;
     std::fs::rename(&tmp, &path)?;
     Ok(hash)
 }
@@ -54,7 +59,8 @@ pub fn store_bytes(home: &Path, bytes: &[u8]) -> Result<String> {
 /// `backup export` ("恢复出来的文件与原件逐字节一致" must be checked, not assumed).
 pub fn read_object(home: &Path, hash: &str, verify: bool) -> Result<Vec<u8>> {
     let path = object_path(home, hash);
-    let bytes = std::fs::read(&path).with_context(|| format!("missing vault object {hash}"))?;
+    let stored = std::fs::read(&path).with_context(|| format!("missing vault object {hash}"))?;
+    let bytes = decode_object(&stored).with_context(|| format!("decode vault object {hash}"))?;
     if verify {
         anyhow::ensure!(
             hex_sha256(&bytes) == hash,
@@ -62,6 +68,25 @@ pub fn read_object(home: &Path, hash: &str, verify: bool) -> Result<Vec<u8>> {
         );
     }
     Ok(bytes)
+}
+
+fn encode_object(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() < COMPRESS_MIN_BYTES { return Ok(bytes.to_vec()); }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(bytes)?;
+    let compressed = encoder.finish()?;
+    if compressed.len() + COMPRESSED_MAGIC.len() >= bytes.len() { return Ok(bytes.to_vec()); }
+    let mut stored = Vec::with_capacity(COMPRESSED_MAGIC.len() + compressed.len());
+    stored.extend_from_slice(COMPRESSED_MAGIC);
+    stored.extend_from_slice(&compressed);
+    Ok(stored)
+}
+
+fn decode_object(stored: &[u8]) -> Result<Vec<u8>> {
+    if !stored.starts_with(COMPRESSED_MAGIC) { return Ok(stored.to_vec()); }
+    let mut decoded = Vec::new();
+    GzDecoder::new(&stored[COMPRESSED_MAGIC.len()..]).read_to_end(&mut decoded)?;
+    Ok(decoded)
 }
 
 pub fn hash_bytes(bytes: &[u8]) -> String {
@@ -203,6 +228,56 @@ pub fn status(conn: &Connection, home: &Path) -> Result<Value> {
     }))
 }
 
+fn orphan_inventory(conn: &Connection, home: &Path) -> Result<Vec<(String, u64)>> {
+    let mut refs = HashSet::new();
+    for sql in ["SELECT DISTINCT hash FROM vault_lines", "SELECT DISTINCT hash FROM memory_revisions"] {
+        let mut stmt = conn.prepare(sql)?;
+        refs.extend(stmt.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?);
+    }
+    let mut rows = Vec::new();
+    let root = objects_root(home);
+    if root.is_dir() {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() { continue; }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let valid_hash = name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+            if name.contains(".tmp.") || (valid_hash && !refs.contains(&name)) {
+                rows.push((entry.path().to_string_lossy().to_string(), entry.metadata().map(|m| m.len()).unwrap_or(0)));
+            }
+        }
+    }
+    rows.sort();
+    Ok(rows)
+}
+
+pub fn orphan_cleanup_plan(conn: &Connection, home: &Path) -> Result<Value> {
+    let rows = orphan_inventory(conn, home)?;
+    Ok(json!({"token":hash_bytes(&serde_json::to_vec(&rows)?),"files":rows.len(),
+        "bytes":rows.iter().map(|x|x.1).sum::<u64>()}))
+}
+
+pub fn orphan_cleanup(conn: &Connection, home: &Path, token: &str) -> Result<Value> {
+    let _lock = crate::ingest::ImportLockTx::acquire(home, std::time::Duration::from_secs(120))?;
+    let rows = orphan_inventory(conn, home)?;
+    anyhow::ensure!(hash_bytes(&serde_json::to_vec(&rows)?) == token, "对象库已变化，请重新预览");
+    let mut removed = 0u64;
+    let mut reclaimed = 0u64;
+    for (raw, size) in rows {
+        let path = PathBuf::from(&raw);
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let referenced: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM vault_lines WHERE hash=?1) OR EXISTS(SELECT 1 FROM memory_revisions WHERE hash=?1)",
+            rusqlite::params![name], |r| r.get(0))?;
+        if referenced == 0 && path.is_file() {
+            std::fs::remove_file(&path)?;
+            removed += 1;
+            reclaimed += size;
+        }
+    }
+    Ok(json!({"removed":removed,"reclaimed_bytes":reclaimed}))
+}
+
 // ------------------------------------------------------------ db snapshots
 
 fn snapshots_dir(home: &Path) -> PathBuf {
@@ -316,5 +391,38 @@ mod tests {
         let v = verify_session(&conn, dir.path(), "a:x").unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["failed"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn compresses_large_objects_and_reads_legacy_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "repeated tool output ".repeat(20_000).into_bytes();
+        let hash = store_line(dir.path(), &raw).unwrap();
+        let path = object_path(dir.path(), &hash);
+        assert!(path.metadata().unwrap().len() < raw.len() as u64 / 4);
+        assert_eq!(read_object(dir.path(), &hash, true).unwrap(), raw);
+        let legacy = b"legacy uncompressed object";
+        let legacy_hash = hash_bytes(legacy);
+        let legacy_path = object_path(dir.path(), &legacy_hash);
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, legacy).unwrap();
+        assert_eq!(read_object(dir.path(), &legacy_hash, true).unwrap(), legacy);
+    }
+
+    #[test]
+    fn orphan_cleanup_preserves_referenced_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(dir.path()).unwrap();
+        let keep = store_line(dir.path(), b"referenced object").unwrap();
+        let remove = store_line(dir.path(), b"unreferenced object").unwrap();
+        conn.execute(
+            "INSERT INTO vault_lines(session_id,line_no,hash) VALUES('test',1,?1)",
+            rusqlite::params![keep],
+        ).unwrap();
+        let p = orphan_cleanup_plan(&conn, dir.path()).unwrap();
+        assert_eq!(p["files"], 1);
+        orphan_cleanup(&conn, dir.path(), p["token"].as_str().unwrap()).unwrap();
+        assert!(object_path(dir.path(), &keep).is_file());
+        assert!(!object_path(dir.path(), &remove).exists());
     }
 }

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Read,
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -118,7 +118,10 @@ fn decode(repo: &Path, hash: &str, out: &Path) -> Result<()> {
     Ok(())
 }
 fn put(repo: &Path, source: &Path, expected: Option<&str>) -> Result<(String, u64)> {
-    let hash = hash_reader(std::fs::File::open(source)?)?;
+    put_bytes(repo, &std::fs::read(source)?, expected)
+}
+fn put_bytes(repo: &Path, bytes: &[u8], expected: Option<&str>) -> Result<(String, u64)> {
+    let hash = hash_reader(Cursor::new(bytes))?;
     if let Some(expected) = expected {
         ensure!(hash == expected, "原件校验失败");
     }
@@ -134,7 +137,7 @@ fn put(repo: &Path, source: &Path, expected: Option<&str>) -> Result<(String, u6
     let mut tmp = tempfile::NamedTempFile::new_in(repo.join("blobs"))?;
     let mut encoder =
         flate2::write::GzEncoder::new(tmp.as_file_mut(), flate2::Compression::default());
-    std::io::copy(&mut std::fs::File::open(source)?, &mut encoder)?;
+    encoder.write_all(bytes)?;
     encoder.finish()?;
     tmp.as_file().sync_all()?;
     ensure!(
@@ -147,6 +150,15 @@ fn put(repo: &Path, source: &Path, expected: Option<&str>) -> Result<(String, u6
     let size = tmp.as_file().metadata()?.len();
     tmp.persist_noclobber(dst).map_err(|e| e.error)?;
     Ok((hash, size))
+}
+
+fn configured_policy(home: &Path) -> (usize, usize, bool) {
+    let cfg = crate::ingest::read_config(home);
+    (
+        cfg["snapshot_keep_recent"].as_u64().unwrap_or(3) as usize,
+        cfg["snapshot_keep_monthly"].as_u64().unwrap_or(3) as usize,
+        cfg["snapshot_auto_cleanup"].as_bool().unwrap_or(false),
+    )
 }
 fn manifests(repo: &Path) -> Result<Vec<Snapshot>> {
     safe_dirs(repo)?;
@@ -202,9 +214,10 @@ fn inventory(repo: &Path) -> Result<BTreeMap<String, u64>> {
 }
 pub fn list(home: &Path) -> Result<Value> {
     let repo = root(home);
+    let (recent, monthly, auto) = configured_policy(home);
     if !repo.exists() {
         return Ok(
-            json!({"root":repo,"repository_bytes":0,"snapshots":[],"policy":{"keep_recent":7,"keep_monthly":6}}),
+            json!({"root":repo,"repository_bytes":0,"snapshots":[],"policy":{"keep_recent":recent,"keep_monthly":monthly,"auto_cleanup":auto}}),
         );
     }
     let _lock = lock(&repo)?;
@@ -220,7 +233,7 @@ pub fn list(home: &Path) -> Result<Value> {
     let policy = if repo.join("policy.json").exists() {
         serde_json::from_slice::<Value>(&std::fs::read(repo.join("policy.json"))?)?
     } else {
-        json!({"keep_recent":7,"keep_monthly":6})
+        json!({"keep_recent":recent,"keep_monthly":monthly,"auto_cleanup":auto})
     };
     Ok(
         json!({"root":repo,"repository_bytes":bytes,"policy":policy,"snapshots":rows.iter().map(|s|json!({
@@ -246,9 +259,9 @@ pub fn create(home: &Path) -> Result<Value> {
     let mut objects_bytes = 0;
     for hash in &hashes {
         ensure!(hash_ok(hash), "原件地址无效");
-        let path = vault::object_path(home, hash);
-        objects_bytes += path.metadata()?.len();
-        let (_, added) = put(&repo, &path, Some(hash))?;
+        let raw = vault::read_object(home, hash, true)?;
+        objects_bytes += raw.len() as u64;
+        let (_, added) = put_bytes(&repo, &raw, Some(hash))?;
         if added > 0 {
             new_objects += 1;
         }
@@ -278,7 +291,15 @@ pub fn create(home: &Path) -> Result<Value> {
     pending
         .persist_noclobber(repo.join("snapshots").join(format!("{}.json", s.id)))
         .map_err(|e| e.error)?;
-    Ok(json!({"id":s.id,"new_objects":new_objects,"new_bytes":new_bytes}))
+    let (recent, monthly, auto) = configured_policy(home);
+    let cleaned = if auto {
+        let p = plan(&repo, recent, monthly)?;
+        apply_plan(&repo, &p)?
+    } else {
+        json!({"removed":0,"reclaimed_bytes":0})
+    };
+    Ok(json!({"id":s.id,"new_objects":new_objects,"new_bytes":new_bytes,
+        "auto_removed":cleaned["removed"],"auto_reclaimed_bytes":cleaned["reclaimed_bytes"]}))
 }
 fn inspect_db(repo: &Path, s: &Snapshot, tmp: &Path) -> Result<()> {
     decode(repo, &s.db_hash, tmp)?;
@@ -425,6 +446,25 @@ pub fn cleanup(home: &Path, recent: usize, monthly: usize, token: &str) -> Resul
         p["token"].as_str() == Some(token),
         "备份已变化，请重新预览清理计划"
     );
+    let result = apply_plan(&repo, &p)?;
+    let mut cfg = crate::ingest::read_config(home);
+    cfg["snapshot_keep_recent"] = json!(recent);
+    cfg["snapshot_keep_monthly"] = json!(monthly);
+    cfg["snapshot_auto_cleanup"] = json!(true);
+    crate::ingest::write_config(home, &cfg)?;
+    let mut pending = tempfile::NamedTempFile::new_in(&repo)?;
+    serde_json::to_writer(
+        pending.as_file_mut(),
+        &json!({"keep_recent":recent,"keep_monthly":monthly,"auto_cleanup":true}),
+    )?;
+    pending.as_file().sync_all()?;
+    pending
+        .persist(repo.join("policy.json"))
+        .map_err(|e| e.error)?;
+    Ok(result)
+}
+
+fn apply_plan(repo: &Path, p: &Value) -> Result<Value> {
     // Remove manifests first; a crash only leaves extra blobs for the next sweep.
     for id in p["remove_ids"].as_array().unwrap() {
         std::fs::remove_file(
@@ -435,14 +475,5 @@ pub fn cleanup(home: &Path, recent: usize, monthly: usize, token: &str) -> Resul
     for hash in p["unused"].as_array().unwrap() {
         std::fs::remove_file(blob(&repo, hash.as_str().unwrap()))?;
     }
-    let mut pending = tempfile::NamedTempFile::new_in(&repo)?;
-    serde_json::to_writer(
-        pending.as_file_mut(),
-        &json!({"keep_recent":recent,"keep_monthly":monthly}),
-    )?;
-    pending.as_file().sync_all()?;
-    pending
-        .persist(repo.join("policy.json"))
-        .map_err(|e| e.error)?;
     Ok(json!({"removed":p["remove_count"],"reclaimed_bytes":p["reclaim_bytes"]}))
 }
