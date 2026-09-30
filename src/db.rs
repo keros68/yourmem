@@ -631,14 +631,6 @@ pub fn update_source_file(conn: &Connection, path: &str, agent: &str, bytes: u64
     Ok(())
 }
 
-pub fn delete_source_file(conn: &Connection, agent: &str, path: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM source_files WHERE agent = ?1 AND path = ?2",
-        params![agent, path],
-    )?;
-    Ok(())
-}
-
 // ------------------------------------------------------------------ search
 
 pub struct SearchOpts {

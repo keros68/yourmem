@@ -41,9 +41,15 @@ pub fn setup(app: &mut App) -> tauri::Result<()> {
     // A single sequential worker survives window hiding. The shared ingest entry
     // point handles disabled sources, custom roots and the cross-process lock.
     // Delay the first run so the first-launch screen can render before collection.
-    let home = yourmem::data_home();
+    // The data home is resolved on every pass: the first-run wizard and local
+    // cleanup change it while the app is running, and an unconfigured home must
+    // not be created by collection.
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
+        let home = yourmem::data_home();
+        if yourmem::is_first_run(&home) {
+            continue;
+        }
         if let Err(e) = yourmem::ingest::import_defaults(&home) {
             eprintln!("yourmem background import: {e:#}");
         }

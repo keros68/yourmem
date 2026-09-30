@@ -411,44 +411,34 @@ fn read_session_tail_and_preview() {
 }
 
 #[test]
-fn truncated_source_file_is_reimported() {
+fn truncated_source_file_keeps_archived_content() {
     let (home, src) = setup();
     let mut conn = db::open(home.path()).unwrap();
     ingest::import_all(&mut conn, home.path(), &roots(src.path()), None, None).unwrap();
     let before = db::read_session(&conn, "claude:aaaa-1111", 60, None, false).unwrap();
     assert_eq!(before["total_messages"], 5);
+    db::set_session_deleted(&conn, "claude:aaaa-1111", true).unwrap();
 
-    // Agent replaces the file with a shorter one (session reset / truncation):
-    // file_len < imported_bytes must drop everything derived and re-import.
+    // The source file is truncated / replaced by a shorter one: the archive is
+    // now the only copy of the old content and must survive untouched.
     let f = src.path().join("claude").join("aaaa-1111.jsonl");
-    let old_len = std::fs::metadata(&f).unwrap().len();
-    let short = "{\"type\":\"user\",\"uuid\":\"n1\",\"timestamp\":\"2026-08-03T09:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"重新开始，全新会话内容\"}}\n";
-    assert!((short.len() as u64) < old_len, "fixture must actually shrink");
+    let original = std::fs::read_to_string(&f).unwrap();
+    let short = "{\"type\":\"user\",\"uuid\":\"n1\",\"timestamp\":\"2026-08-03T09:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"重新开始，全新会话内容\"}}
+";
+    assert!(short.len() < original.len(), "fixture must actually shrink");
     std::fs::write(&f, short).unwrap();
 
     let outcome = ingest::import_all(&mut conn, home.path(), &roots(src.path()), None, None).unwrap();
-    assert_eq!(outcome.messages_added, 1);
+    assert_eq!(outcome.files_shrunk, 1);
+    assert_eq!(outcome.messages_added, 0);
 
-    // Old derived state is gone: session, search hits, vault manifest.
+    db::set_session_deleted(&conn, "claude:aaaa-1111", false)
+        .expect("trash state must be preserved");
     let after = db::read_session(&conn, "claude:aaaa-1111", 60, None, false).unwrap();
-    assert_eq!(after["total_messages"], 1);
-    let stale = db::search(&conn, &db::SearchOpts {
-        query: "LST".into(), project: None, agent: None, kind: None, limit: 10,
-    })
-    .unwrap();
-    assert_eq!(stale.len(), 0, "content from the replaced file must not survive");
-
+    assert_eq!(after["total_messages"], 5);
     let out = home.path().join("exported.jsonl");
-    let n = vault::export_session(&conn, home.path(), "claude:aaaa-1111", &out).unwrap();
-    assert_eq!(n, 1);
-    assert_eq!(std::fs::read_to_string(&out).unwrap(), short);
-
-    // and further appends still work on the re-imported file
-    let mut content = String::from(short);
-    content.push_str("{\"type\":\"user\",\"uuid\":\"n2\",\"timestamp\":\"2026-08-03T09:01:00Z\",\"message\":{\"role\":\"user\",\"content\":\"截断后的增量\"}}\n");
-    std::fs::write(&f, content).unwrap();
-    let more = ingest::import_all(&mut conn, home.path(), &roots(src.path()), None, None).unwrap();
-    assert_eq!(more.messages_added, 1);
+    vault::export_session(&conn, home.path(), "claude:aaaa-1111", &out).unwrap();
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), original);
 }
 
 #[test]

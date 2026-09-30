@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 /// 全局指令片段（与 scripts/setup-agents.md 保持一致——改这里同步改那里）。
@@ -741,6 +741,10 @@ mod tests {
         let h = res["agents"].as_array().unwrap().iter().find(|a| a["agent"] == "hermes").unwrap();
         assert_eq!(h["actions"][0]["status"], "done");
         let after1 = std::fs::read_to_string(&targets.hermes_config).unwrap();
+        assert!(after1.starts_with("mcp_servers:
+  yourmem:
+"), "行内空映射须改为块写法：{after1}");
+        assert!(!after1.contains("{}"));
         // 幂等：测试环境的 exe 探不出版本会判 stale 重注册，但产物内容必须逐字节稳定
         execute(&targets).unwrap();
         let after2 = std::fs::read_to_string(&targets.hermes_config).unwrap();
@@ -916,6 +920,16 @@ fn register_hermes_mcp(path: &Path, exe: &str) -> Result<()> {
     let ms = lines.iter().position(|l| {
         !l.trim_start().starts_with('#') && l.starts_with("mcp_servers:")
     });
+    if let Some(i) = ms {
+        // 行内空值（`mcp_servers: {}` / `null` / `~`）改成块写法，否则下面插入的
+        // 缩进子键会让整个文件解析失败；行内非空映射无法安全改写，交给用户处理
+        let inline = lines[i]["mcp_servers:".len()..].split(" #").next().unwrap_or("").trim();
+        match inline {
+            "" => {}
+            "{}" | "null" | "~" => lines[i] = "mcp_servers:".to_string(),
+            _ => bail!("{} 的 mcp_servers 使用行内写法，请改为多行写法后重试", path.display()),
+        }
+    }
     let new_content = match ms {
         None => {
             // 无 mcp_servers 段：整段追加

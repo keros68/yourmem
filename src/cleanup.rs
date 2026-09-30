@@ -42,19 +42,41 @@ pub fn plan(home: &Path, include_backups: bool) -> Result<Value> {
     let backup = safe_directory(&crate::backups_dir(home))?;
     ensure!(!data.starts_with(&backup), "备份目录不能包含核心数据目录");
     let backup_separate = !backup.starts_with(&data);
+    // 备份在数据目录内且选择保留：删除数据目录时绕开备份子树
+    let backups_kept_inside = !include_backups && !backup_separate && backup.exists();
+    let data_bytes = if backups_kept_inside { bytes(home).saturating_sub(bytes(&backup)) } else { bytes(home) };
     let payload = json!({
         "data_dir": data,
-        "data_bytes": bytes(home),
+        "data_bytes": data_bytes,
         "backup_dir": backup,
         "backup_bytes": if include_backups && backup_separate { bytes(&backup) } else { 0 },
         "include_backups": include_backups,
         "backup_separate": backup_separate,
+        "backups_kept_inside": backups_kept_inside,
         "location_pointer": crate::data_home_pointer(),
         "preserved": [crate::default_claude_root(), crate::default_codex_root(), crate::default_zcode_root(), crate::default_kimi_root(), crate::default_pi_root(), crate::adapters::opencode::default_db_path(), crate::adapters::hermes::default_db_path()],
         "preserved_scope": "所有 agent 自有会话与用户配置中除 yourmem 条目外的内容",
     });
     let token = format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?));
     Ok(json!({"token":token,"cleanup":payload}))
+}
+
+/// 删除 `dir` 下除 `keep`（及其上级目录链）以外的全部内容。
+fn remove_all_except(dir: &Path, keep: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path == keep {
+            continue;
+        }
+        if keep.starts_with(&path) {
+            remove_all_except(&path, keep)?;
+        } else if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn execute(home: &Path, include_backups: bool, token: &str) -> Result<Value> {
@@ -66,8 +88,12 @@ pub fn execute(home: &Path, include_backups: bool, token: &str) -> Result<Value>
     let data = PathBuf::from(current["cleanup"]["data_dir"].as_str().context("清理计划缺少数据目录")?);
     let backup = PathBuf::from(current["cleanup"]["backup_dir"].as_str().context("清理计划缺少备份目录")?);
     let backup_separate = current["cleanup"]["backup_separate"].as_bool().unwrap_or(false);
+    let backups_kept_inside = current["cleanup"]["backups_kept_inside"].as_bool().unwrap_or(false);
     let active_home = safe_directory(&crate::data_home()).ok();
-    if data.exists() {
+    if backups_kept_inside {
+        remove_all_except(&data, &backup)
+            .with_context(|| format!("删除核心数据目录 {}", data.display()))?;
+    } else if data.exists() {
         std::fs::remove_dir_all(&data)
             .with_context(|| format!("删除核心数据目录 {}", data.display()))?;
     }
@@ -79,7 +105,7 @@ pub fn execute(home: &Path, include_backups: bool, token: &str) -> Result<Value>
             .with_context(|| format!("删除备份目录 {}", backup.display()))?;
     }
     Ok(
-        json!({"removed_data":data,"removed_backups":include_backups && backup_separate,"backup_dir":backup}),
+        json!({"removed_data":data,"removed_backups":include_backups && backup_separate,"backups_kept_inside":backups_kept_inside,"backup_dir":backup}),
     )
 }
 
@@ -101,5 +127,26 @@ mod tests {
         assert!(execute(&home, true, "wrong").is_err());
         execute(&home, true, p["token"].as_str().unwrap()).unwrap();
         assert!(!home.exists() && !backup.exists());
+    }
+
+    #[test]
+    fn cleanup_keeps_backups_inside_data_dir_when_not_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("yourmem-data");
+        let backup = home.join("backups");
+        std::fs::create_dir_all(backup.join("db")).unwrap();
+        std::fs::create_dir_all(home.join("objects").join("ab")).unwrap();
+        std::fs::write(home.join("yourmem.db"), b"db").unwrap();
+        std::fs::write(home.join("objects").join("ab").join("x"), b"obj").unwrap();
+        std::fs::write(backup.join("db").join("snap.db"), b"snapshot").unwrap();
+        let p = plan(&home, false).unwrap();
+        assert_eq!(p["cleanup"]["backups_kept_inside"], true);
+        execute(&home, false, p["token"].as_str().unwrap()).unwrap();
+        assert!(backup.join("db").join("snap.db").exists());
+        assert!(!home.join("yourmem.db").exists() && !home.join("objects").exists());
+
+        let p = plan(&home, true).unwrap();
+        execute(&home, true, p["token"].as_str().unwrap()).unwrap();
+        assert!(!home.exists());
     }
 }

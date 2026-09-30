@@ -381,3 +381,50 @@ fn migrate_v4_dedup_remaps_pointers_and_recounts() {
     ).unwrap();
     assert_eq!(idx, 1, "唯一索引已建");
 }
+
+#[test]
+fn resync_keeps_memory_source_pointers() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("r");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("model-io-sess_00000000-0000-0000-0000-000000000009.jsonl");
+    let sid = "zcode:sess_00000000-0000-0000-0000-000000000009";
+    std::fs::write(&f, line("main_turn", "回复一", serde_json::json!([])) + "\n"
+        + &line("main_turn", "回复二", serde_json::json!([])) + "\n").unwrap();
+    let mut conn = db::open(home.path()).unwrap();
+    let roots = vec![(adapters::AGENT_ZCODE, dir.clone())];
+    ingest::import_all(&mut conn, home.path(), &roots, None, None).unwrap();
+
+    let target: i64 = conn.query_row(
+        "SELECT id FROM messages WHERE session_id = ?1 AND content = '回复二'", [sid], |r| r.get(0),
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO memories(id, scope, type, content, status, source_session_id, source_message_id, created_at, updated_at)
+         VALUES ('mem_z', 'global', 'fact', '来自回复二', 'confirmed', ?1, ?2, '2026-08-23T00:00:00Z', '2026-08-23T00:00:00Z')",
+        rusqlite::params![sid, target],
+    ).unwrap();
+
+    // 每次追加带历史快照的行都会触发整文件重导
+    for (i, reply) in ["回复三", "回复四"].iter().enumerate() {
+        let hist = serde_json::json!({
+            "type": "model_io",
+            "querySource": "main_turn",
+            "startedAt": "2026-08-23T09:00:00Z",
+            "request": { "body": { "messages": [
+                {"role": "user", "content": [{"type": "text", "text": format!("用户问{i}")}]}
+            ] } },
+            "response": {"text": reply, "toolCalls": []}
+        });
+        let mut w = std::fs::OpenOptions::new().append(true).open(&f).unwrap();
+        use std::io::Write;
+        writeln!(w, "{hist}").unwrap();
+        drop(w);
+        ingest::import_all(&mut conn, home.path(), &roots, None, None).unwrap();
+        let pointed: Option<String> = conn.query_row(
+            "SELECT msg.content FROM memories m LEFT JOIN messages msg ON msg.id = m.source_message_id WHERE m.id = 'mem_z'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(pointed.as_deref(), Some("回复二"), "第 {i} 次重导后指针丢失");
+    }
+}

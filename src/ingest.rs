@@ -22,6 +22,8 @@ pub struct ImportOutcome {
     /// Windows 文件占用锁：agent 正在写时读取被拒（PermissionDenied），本轮
     /// 跳过该文件——增量采集设计下 offset 未推进，下轮自然补采，无损。
     pub files_skipped: usize,
+    /// 源文件比已归档的字节数短（被截断或覆盖）：保留已归档内容，不导入该文件。
+    pub files_shrunk: usize,
     pub messages_added: u64,
     pub lines_archived: u64,
     pub opencode_sessions_updated: usize,
@@ -309,6 +311,7 @@ pub fn import_all(
         files_seen: 0,
         files_updated: 0,
         files_skipped: 0,
+        files_shrunk: 0,
         messages_added: 0,
         lines_archived: 0,
         opencode_sessions_updated: 0,
@@ -331,6 +334,11 @@ pub fn import_all(
                     // 会话文件）：跳过本轮，offset 未推进，下轮增量补采。
                     out.files_skipped += 1;
                     eprintln!("yourmem import: 文件被占用，本轮跳过（下轮补采）：{}", path.display());
+                    continue;
+                }
+                Err(e) if e.downcast_ref::<SourceShrunk>().is_some() => {
+                    out.files_shrunk += 1;
+                    eprintln!("yourmem import: 源文件比已归档内容短，保留已归档内容并跳过：{}", path.display());
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -382,14 +390,13 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
     let native_id = adapters::native_id(agent, path);
     let session_id = adapters::session_key(agent, &native_id);
 
-    // File replaced / truncated: drop everything derived from it and redo.
+    // File truncated or replaced by a shorter one: the archive is the only
+    // remaining copy of the old content, so keep it and leave the file alone.
     if let Some(s) = &state {
         if file_len < s.imported_bytes {
-            db::delete_session_data(conn, &session_id)?;
-            db::delete_source_file(conn, agent, &path_str)?;
+            return Err(SourceShrunk.into());
         }
     }
-    let state = db::source_file_state(conn, agent, &path_str)?;
     let (start_offset, start_line) = state
         .as_ref()
         .map(|s| (s.imported_bytes, s.line_count))
@@ -517,7 +524,21 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
         &meta,
         0,
     )?;
+    // 重导前记下来源指针指向的消息坐标（行号、序号、类型、正文），重插后按坐标
+    // 重新挂回；对不上的指针置空。
+    let mut pointed: Vec<(i64, i64, i64, String, String)> = Vec::new();
     if resync {
+        let mut stmt = tx.prepare(
+            "SELECT m.rowid, msg.line_no, msg.ord, msg.kind, msg.content
+             FROM memories m JOIN messages msg ON msg.id = m.source_message_id
+             WHERE m.source_session_id = ?1",
+        )?;
+        pointed = stmt
+            .query_map(rusqlite::params![session_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
         // messages rowid 删除后会被复用：先断开指向本会话消息的来源指针，
         // 否则重导后指针可能错挂到无关消息（同 delete_session_data 的处理）
         tx.execute(
@@ -533,6 +554,15 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
         )?;
     }
     db::insert_messages(&tx, &session_id, &messages)?;
+    for (memory_rowid, line, ord, kind, content) in &pointed {
+        tx.execute(
+            "UPDATE memories SET source_message_id = (
+                 SELECT id FROM messages
+                 WHERE session_id = ?1 AND line_no = ?2 AND ord = ?3 AND kind = ?4 AND content = ?5
+             ) WHERE rowid = ?6",
+            rusqlite::params![session_id, line, ord, kind, content, memory_rowid],
+        )?;
+    }
     tx.execute(
         "UPDATE sessions SET message_count = (SELECT COUNT(*) FROM messages WHERE session_id = ?1) WHERE id = ?1",
         rusqlite::params![session_id],
@@ -610,6 +640,7 @@ pub fn outcome_json(o: &ImportOutcome) -> Value {
         "files_seen": o.files_seen,
         "files_updated": o.files_updated,
         "files_skipped": o.files_skipped,
+        "files_shrunk": o.files_shrunk,
         "opencode_sessions_updated": o.opencode_sessions_updated,
         "messages_added": o.messages_added,
         "lines_archived": o.lines_archived,
@@ -624,6 +655,17 @@ pub fn outcome_json(o: &ImportOutcome) -> Value {
 /// ERROR_LOCK_VIOLATION），不是 error 5 的 PermissionDenied——两者都要接住）。
 /// raw_os_error 数值平台相关，Windows 码值只在 Windows 分支比对；Unix 上
 /// 读文件几乎不会 PermissionDenied，行为不变。
+#[derive(Debug)]
+struct SourceShrunk;
+
+impl std::fmt::Display for SourceShrunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source file is shorter than its archived content")
+    }
+}
+
+impl std::error::Error for SourceShrunk {}
+
 fn is_file_busy(e: &anyhow::Error) -> bool {
     e.chain().any(|c| match c.downcast_ref::<std::io::Error>() {
         Some(io) => {

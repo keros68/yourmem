@@ -1432,7 +1432,7 @@ async function renderSettings() {
       const p = await invoke("local_cleanup_plan", { includeBackups: cleanupIncludesBackups });
       cleanupToken = p.token;
       const c = p.cleanup;
-      $("#cleanup-report").innerHTML = `<div class="meta proof-bad">将永久删除核心数据 ${fmtBytes(c.data_bytes)}：${esc(c.data_dir)}${cleanupIncludesBackups ? `<br>同时删除备份 ${fmtBytes(c.backup_bytes)}：${esc(c.backup_dir)}` : ""}<br>不会删除各 agent 的原始会话。</div>`;
+      $("#cleanup-report").innerHTML = `<div class="meta proof-bad">将永久删除核心数据 ${fmtBytes(c.data_bytes)}：${esc(c.data_dir)}${cleanupIncludesBackups ? `<br>同时删除备份 ${fmtBytes(c.backup_bytes)}：${esc(c.backup_dir)}` : ""}${c.backups_kept_inside ? `<br>保留数据目录内的备份：${esc(c.backup_dir)}` : ""}<br>不会删除各 agent 的原始会话。</div>`;
       $("#cleanup-run").classList.remove("hidden");
     } catch (e) { cleanupToken = null; $("#cleanup-report").innerHTML = `<div class="meta proof-bad">✗ ${esc(String(e))}</div>`; }
     finally { btn.disabled = false; }
