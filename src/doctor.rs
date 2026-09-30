@@ -84,9 +84,10 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
         let rows = stmt.query_map(rusqlite::params![SAMPLE_LIMIT], |r| r.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
+    let store = vault::Store::open(home)?;
     let mut bad = 0u64;
     for h in &sample {
-        if vault::read_object(home, h, true).is_err() {
+        if store.get(h, true).is_err() {
             bad += 1;
         }
     }
@@ -104,10 +105,9 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
         let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    let missing = referenced
-        .iter()
-        .filter(|h| !vault::object_path(home, h).is_file())
-        .count();
+    let stored: std::collections::HashSet<String> =
+        store.inventory()?.into_iter().map(|(h, _)| h).collect();
+    let missing = referenced.iter().filter(|h| !stored.contains(*h)).count();
     checks.push(if missing == 0 {
         check("vault_missing", "ok", format!("{} 个引用对象全部在盘", referenced.len()))
     } else {
@@ -117,22 +117,8 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
     // 5. 盘上未被引用的对象（泄漏：既不属 vault_lines 也不属 memory_revisions）
     let refset: std::collections::HashSet<&str> =
         referenced.iter().map(String::as_str).collect();
-    let mut orphans = 0u64;
-    let mut tmp_residue = 0u64;
-    let root = vault::objects_root(home);
-    if root.is_dir() {
-        for entry in walkdir::WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.contains(".tmp.") {
-                tmp_residue += 1;
-            } else if !refset.contains(name.as_str()) {
-                orphans += 1;
-            }
-        }
-    }
+    let orphans = stored.iter().filter(|h| !refset.contains(h.as_str())).count();
+    let tmp_residue = vault::tmp_files(home).len();
     checks.push(if tmp_residue == 0 {
         check("tmp_residue", "ok", "无崩溃残留的 tmp 文件")
     } else {
@@ -151,7 +137,7 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
         let hashes: Vec<String> = stmt
             .query_map([], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let m = hashes.iter().filter(|h| !vault::object_path(home, h).is_file()).count();
+        let m = hashes.iter().filter(|h| !stored.contains(*h)).count();
         m
     };
     checks.push(if cur_missing == 0 {

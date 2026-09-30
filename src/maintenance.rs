@@ -1,7 +1,7 @@
-//! Background maintenance run by the desktop collection worker: periodic
-//! incremental snapshots, a daily self-check and removal of stale object
-//! temp files. Results live in `maintenance.json` so the UI only has to show
-//! problems.
+//! Background maintenance run by the desktop collection worker: moving
+//! legacy object files into the object store, periodic incremental snapshots,
+//! a daily self-check and removal of stale object temp files. Results live in
+//! `maintenance.json` so the UI only has to show problems.
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -13,6 +13,7 @@ const DOCTOR_INTERVAL_SECS: u64 = 86_400;
 /// real archive the first snapshot runs for hours while holding the import lock.
 const DEFAULT_SNAPSHOT_INTERVAL_DAYS: u64 = 0;
 const STALE_TMP: Duration = Duration::from_secs(86_400);
+const MIGRATE_BATCH: usize = 20_000;
 
 fn state_path(home: &Path) -> PathBuf {
     home.join("maintenance.json")
@@ -77,6 +78,21 @@ pub fn run_due(home: &Path) -> Result<Value> {
     let mut state = status(home);
     let now = now_secs();
     let mut ran = Vec::new();
+
+    // Earlier versions wrote one file per object; move them into the object
+    // store a batch per pass so collection is never held up for long.
+    if crate::vault::objects_root(home).is_dir() {
+        match crate::vault::migrate_legacy(home, MIGRATE_BATCH) {
+            Ok(r) if r["moved"].as_u64().unwrap_or(0) > 0 => {
+                let moved = state["migration"]["moved"].as_u64().unwrap_or(0) + r["moved"].as_u64().unwrap_or(0);
+                state["migration"] = json!({"moved": moved, "remaining": r["remaining"], "skipped": r["skipped"]});
+                save(home, &state)?;
+                ran.push("migration");
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("yourmem object migration: {e:#}"),
+        }
+    }
 
     let interval_days = snapshot_interval_days(home);
     if interval_days > 0 && due(&state["snapshot_attempt_at"], interval_days * 86_400, now) {

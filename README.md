@@ -77,9 +77,9 @@ yourmem 提供标准 stdio MCP 接口。一键接入支持 Claude Code、Codex�
 
 ## 数据保存在哪里
 
-桌面版首次启动会保存一个很小的位置指针 `~/.yourmem-location`，核心数据实际写入向导选择的目录；`YOUMEM_HOME` 仍可用于命令行或受管环境覆盖该选择。备份目录单独选择。会话原文对象在核心数据目录内透明压缩，数据库只保留大型工具输出的首尾预览，完整内容仍可从归档还原。
+桌面版首次启动会保存一个很小的位置指针 `~/.yourmem-location`，核心数据实际写入向导选择的目录；`YOUMEM_HOME` 仍可用于命令行或受管环境覆盖该选择。备份目录单独选择。会话原文集中保存在核心数据目录的对象库文件 `objects.db` 中并透明压缩；早期版本逐个文件保存的原文由桌面端在后台分批迁入，也可运行 `yourmem backup migrate` 一次完成。数据库只保留大型工具输出的首尾预览，完整内容仍可从归档还原。
 
-设置 → 备份中的“日常增量快照”在备份目录的 `snapshots-v1` 中保存压缩数据库与原件。不同日期共享相同原件；新安装默认保留最近 3 份和最近 3 个月的月度快照，并在创建后自动清理更早数据。手动修改保留规则仍需先预览再确认。迁移或恢复时，选择快照导出独立完整备份，再执行校验与恢复。
+设置 → 备份中的“日常增量快照”在备份目录的 `snapshots-v1` 中保存压缩数据库与原件。不同日期共享相同原件，每次只复制新增部分；默认保留最近 3 份和最近 3 个月的月度快照，并在创建后自动清理更早数据。手动修改保留规则仍需先预览再确认。迁移或恢复时，选择快照导出独立完整备份，再执行校验与恢复。
 
 1.1.0 起创建及导出的完整备份采用 v2 格式，省略可重建的搜索索引，恢复时重建。恢复新包需要 1.1.0 或更新版本；原有 v1 备份仍可恢复。已有备份不会自动转换或删除。
 
@@ -105,12 +105,13 @@ yourmem dossier [项目名] --markdown     # 导出项目卷宗
 yourmem session trash                  # 查看回收站
 yourmem memory add --type decision --content "结论"
 yourmem backup db                      # 创建数据库快照
+yourmem backup migrate                 # 把早期版本的原文文件迁入对象库
 yourmem bundle create -o yourmem.tar.gz
 yourmem snapshot create                # 创建日常增量快照
 yourmem snapshot list                  # 查看快照及仓库占用
 yourmem snapshot export <ID> -o move.tar.gz
 yourmem snapshot plan --keep-recent 3 --keep-monthly 3
-yourmem doctor                         # 本地自检
+yourmem doctor                         # 本地自检（桌面端每天在后台运行）
 yourmem teardown                       # 解除全部 agent 接入
 yourmem teardown --delete-data         # 再删除核心数据
 yourmem teardown --delete-data --delete-backups

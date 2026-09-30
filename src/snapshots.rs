@@ -91,6 +91,18 @@ fn lock(repo: &Path) -> Result<ImportLockTx> {
 fn blob(repo: &Path, hash: &str) -> PathBuf {
     repo.join("blobs").join(format!("{hash}.gz"))
 }
+/// Vault objects shared by all snapshots, in one file. Database copies stay in
+/// `blobs/`; repositories from earlier versions also hold objects there.
+fn repo_store(repo: &Path) -> Result<vault::Store> {
+    vault::Store::open_at(repo, &repo.join("objects.db"))
+}
+/// Every object in the repository with its stored size: `blobs/` files and
+/// the object store.
+fn contents(repo: &Path) -> Result<BTreeMap<String, u64>> {
+    let mut all = inventory(repo)?;
+    all.extend(repo_store(repo)?.inventory()?);
+    Ok(all)
+}
 /// Scratch space inside the backup repository: a snapshot writes a full copy of
 /// the database, which must land on the backup disk rather than the system drive.
 fn work_dir(repo: &Path) -> Result<tempfile::TempDir> {
@@ -268,19 +280,37 @@ pub fn create(home: &Path) -> Result<Value> {
     let hashes: BTreeSet<_> = bundle::referenced_hashes(&snap)?.into_iter().collect();
     let schema_version = snap.pragma_query_value(None, "user_version", |r| r.get(0))?;
     drop(snap);
+    // 只复制仓库里还没有的对象，按批写入仓库的对象库
+    let store = vault::Store::open(home)?;
+    let rstore = repo_store(&repo)?;
+    let legacy = inventory(&repo)?;
     let mut new_objects = 0;
     let mut new_bytes = 0;
     let mut objects_bytes = 0;
+    let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
+    let flush = |batch: &mut Vec<(String, Vec<u8>)>| -> Result<u64> {
+        rstore.put_many(batch.iter().map(|(_, b)| b.as_slice()))?;
+        let mut added = 0;
+        for (hash, _) in batch.iter() {
+            added += rstore.stored_len(hash)?.unwrap_or(0);
+        }
+        batch.clear();
+        Ok(added)
+    };
     for hash in &hashes {
         ensure!(hash_ok(hash), "原件地址无效");
-        let raw = vault::read_object(home, hash, true)?;
+        let raw = store.get(hash, true)?;
         objects_bytes += raw.len() as u64;
-        let (_, added) = put_bytes(&repo, &raw, Some(hash))?;
-        if added > 0 {
-            new_objects += 1;
+        if legacy.contains_key(hash) || rstore.contains(hash)? {
+            continue;
         }
-        new_bytes += added;
+        new_objects += 1;
+        batch.push((hash.clone(), raw));
+        if batch.len() == 1000 {
+            new_bytes += flush(&mut batch)?;
+        }
     }
+    new_bytes += flush(&mut batch)?;
     let (db_hash, added) = put(&repo, &path, None)?;
     new_bytes += added;
     let s = Snapshot {
@@ -370,11 +400,16 @@ pub fn export(home: &Path, id: &str, out: &Path) -> Result<Value> {
     let root = temp.path().join("snapshot");
     std::fs::create_dir_all(root.join("db"))?;
     inspect_db(&repo, s, &root.join("db/snapshot.sqlite"))?;
+    let rstore = repo_store(&repo)?;
     let mut bytes = 0u64;
     for hash in &s.hashes {
         let dst = vault::object_path(&root, hash);
         std::fs::create_dir_all(dst.parent().unwrap())?;
-        decode(&repo, hash, &dst)?;
+        if rstore.contains(hash)? {
+            std::fs::write(&dst, rstore.get(hash, true)?)?;
+        } else {
+            decode(&repo, hash, &dst)?;
+        }
         bytes += dst.metadata()?.len();
     }
     ensure!(bytes == s.objects_bytes, "快照原件大小不一致");
@@ -402,7 +437,7 @@ fn plan(repo: &Path, recent: usize, monthly: usize) -> Result<Value> {
         "至少保留最近 1 份；最近份数最多 1000，每月份数最多 120"
     );
     let rows = manifests(repo)?;
-    let files = inventory(repo)?;
+    let files = contents(repo)?;
     let mut months = BTreeSet::new();
     let mut keep = BTreeSet::new();
     let mut remove = Vec::new();
@@ -486,8 +521,15 @@ fn apply_plan(repo: &Path, p: &Value) -> Result<Value> {
                 .join(format!("{}.json", id.as_str().unwrap())),
         )?;
     }
+    let rstore = repo_store(repo)?;
     for hash in p["unused"].as_array().unwrap() {
-        std::fs::remove_file(blob(&repo, hash.as_str().unwrap()))?;
+        let hash = hash.as_str().unwrap();
+        let file = blob(repo, hash);
+        if file.exists() {
+            std::fs::remove_file(file)?;
+        } else {
+            rstore.remove(hash)?;
+        }
     }
     Ok(json!({"removed":p["remove_count"],"reclaimed_bytes":p["reclaim_bytes"]}))
 }

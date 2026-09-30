@@ -1042,15 +1042,15 @@ fn object_copy_failure_preserves_database_and_allows_restore_retry() {
     for merge in [false, true] {
         let target = tempfile::tempdir().unwrap();
         if merge { db::open(target.path()).unwrap(); }
-        std::fs::create_dir_all(target.path().join("objects")).unwrap();
-        let blocker = target.path().join("objects").join(&hash[..2]);
-        std::fs::write(&blocker, "synthetic obstruction").unwrap();
+        // 对象库位置被目录占住：对象写入失败
+        let blocker = vault::store_db_path(target.path());
+        std::fs::create_dir_all(&blocker).unwrap();
         assert!(bundle::restore(&out, target.path(), merge).is_err());
         if merge {
             let c = db::open(target.path()).unwrap();
             assert_eq!(db::recent_sessions(&c, None, 10).unwrap().len(), 0);
         } else { assert!(!target.path().join("yourmem.db").exists()); }
-        std::fs::remove_file(blocker).unwrap();
+        std::fs::remove_dir(blocker).unwrap();
         bundle::restore(&out, target.path(), merge).unwrap();
         let c = db::open(target.path()).unwrap();
         assert_eq!(db::recent_sessions(&c, None, 10).unwrap().len(), 2);
@@ -1067,7 +1067,10 @@ fn restore_repairs_corrupt_existing_objects_and_previews_conflicts() {
     let target = tempfile::tempdir().unwrap();
     bundle::restore(&out, target.path(), false).unwrap();
     let hash: String = conn.query_row("SELECT hash FROM vault_lines LIMIT 1", [], |r| r.get(0)).unwrap();
-    std::fs::write(vault::object_path(target.path(), &hash), "damaged").unwrap();
+    rusqlite::Connection::open(vault::store_db_path(target.path()))
+        .unwrap()
+        .execute("UPDATE objects SET data = x'00' WHERE hash = ?1", [&hash])
+        .unwrap();
     let preview = bundle::restore_plan(&out, target.path()).unwrap();
     assert_eq!(preview["merge_plan"]["sessions_skipped"], 2);
     bundle::restore(&out, target.path(), true).unwrap();

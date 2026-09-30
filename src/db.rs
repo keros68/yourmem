@@ -850,7 +850,7 @@ pub fn storage_usage(home: &Path) -> Value {
             .map(|m| m.len())
             .sum()
     };
-    let objects = crate::vault::objects_root(home);
+    let objects = crate::vault::store_db_path(home);
     let backups = crate::backups_dir(home);
     json!({
         "data_dir": home.display().to_string(),
@@ -858,7 +858,8 @@ pub fn storage_usage(home: &Path) -> Value {
         "backups_dir": backups.display().to_string(),
         "db_bytes": std::fs::metadata(home.join("yourmem.db")).map(|m| m.len()).unwrap_or(0)
             + std::fs::metadata(home.join("yourmem.db-wal")).map(|m| m.len()).unwrap_or(0),
-        "objects_bytes": dir_bytes(&objects),
+        "objects_bytes": crate::vault::store_disk_bytes(home) + crate::vault::tmp_files(home)
+            .iter().map(|p| p.metadata().map(|m| m.len()).unwrap_or(0)).sum::<u64>(),
         "backups_bytes": dir_bytes(&backups),
     })
 }

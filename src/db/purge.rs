@@ -49,10 +49,11 @@ pub fn purge_plan(conn: &Connection, home: &Path, session_id: &str) -> Result<Va
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
     let exclusive_objects = exclusive.len() as i64;
+    let store = crate::vault::Store::open(home)?;
     let exclusive_bytes: u64 = exclusive
         .iter()
-        .map(|h| std::fs::metadata(crate::vault::object_path(home, h)).map(|m| m.len()).unwrap_or(0))
-        .sum();
+        .map(|h| store.stored_len(h).map(|n| n.unwrap_or(0)))
+        .sum::<Result<u64>>()?;
     Ok(json!({
         "session_id": session_id, "in_trash": true,
         "deleted_at": deleted_at, "age_days": age_days,
@@ -205,30 +206,23 @@ fn rusqlite_value_to_json(v: rusqlite::types::Value) -> Value {
 
 /// 对象移入归档目录：优先 rename（同盘瞬时）；失败（备份位置与数据目录
 /// 跨盘，Windows 报 os error 17）退化为 copy_fallback。
-fn move_object(src: &Path, dst: &Path) -> Result<()> {
-    if std::fs::rename(src, dst).is_ok() {
-        return Ok(());
-    }
-    copy_fallback(src, dst)
-}
-
-/// 跨盘退路：先 copy 进同目录 tmp 再落位——目标只以完整形态出现，中途崩溃
-/// 源未动、gc_pending 仍在，下轮 sweep 重试，不产生半截归档对象
-/// （「先归档再删」语义在跨盘下不变）。
-fn copy_fallback(src: &Path, dst: &Path) -> Result<()> {
+/// 先把对象按存储形态写进归档目录（tmp 再 rename，只以完整形态出现），
+/// 再从对象库删除；中途崩溃时对象仍在库里、gc_pending 仍在，下轮 sweep 重试，
+/// 不产生半截归档对象。
+fn archive_object(store: &crate::vault::Store, hash: &str, dst: &Path) -> Result<()> {
+    use std::io::Write;
     let tmp = dst.with_extension(format!("tmp.{}", std::process::id()));
-    if let Err(e) = std::fs::copy(src, &tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&store.raw(hash)?)?;
+    f.sync_all()?;
+    drop(f);
     std::fs::rename(&tmp, dst)?;
-    std::fs::remove_file(src)?;
-    Ok(())
+    store.remove(hash)
 }
 
 /// 归档式 GC：处理整个 gc_pending 队列（本会话的候选已入队）——对每个
 /// hash 双重引用复查（vault_lines ∪ memory_revisions），无引用则移入
-/// 备份目录（move_object：同盘 rename / 跨盘 copy）并出队；有引用则保留
+/// 备份目录（archive_object）并出队；有引用则保留
 /// 出队；对象已不在则直接出队（幂等）。
 fn archive_objects(conn: &Connection, home: &Path, backup_dir: &Path) -> Result<(u64, u64)> {
     let pending: Vec<String> = {
@@ -236,6 +230,7 @@ fn archive_objects(conn: &Connection, home: &Path, backup_dir: &Path) -> Result<
         let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
+    let store = crate::vault::Store::open(home)?;
     let mut removed = 0u64;
     let mut kept = 0u64;
     for hash in pending {
@@ -245,8 +240,7 @@ fn archive_objects(conn: &Connection, home: &Path, backup_dir: &Path) -> Result<
             params![hash],
             |r| r.get(0),
         )?;
-        let src = crate::vault::object_path(home, &hash);
-        if referenced > 0 || !src.is_file() {
+        if referenced > 0 || !store.contains(&hash)? {
             if referenced > 0 { kept += 1; }
             conn.execute("DELETE FROM gc_pending WHERE hash = ?1", params![hash])?;
             continue;
@@ -268,9 +262,9 @@ fn archive_objects(conn: &Connection, home: &Path, backup_dir: &Path) -> Result<
         std::fs::create_dir_all(backup_dir.join(shard))?;
         let dst = backup_dir.join(shard).join(&hash);
         if dst.exists() {
-            std::fs::remove_file(&src)?;
+            store.remove(&hash)?;
         } else {
-            move_object(&src, &dst)?;
+            archive_object(&store, &hash, &dst)?;
         }
         conn.execute("DELETE FROM gc_pending WHERE hash = ?1", params![hash])?;
         removed += 1;
@@ -318,10 +312,11 @@ pub fn trash_overdue_plan(conn: &Connection, home: &Path) -> Result<Value> {
         let rows = stmt.query_map(params![cutoff], |r| r.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
+    let store = crate::vault::Store::open(home)?;
     let joint_bytes: u64 = joint_exclusive
         .iter()
-        .map(|h| std::fs::metadata(crate::vault::object_path(home, h)).map(|m| m.len()).unwrap_or(0))
-        .sum();
+        .map(|h| store.stored_len(h).map(|n| n.unwrap_or(0)))
+        .sum::<Result<u64>>()?;
     let mut plans = Vec::new();
     for sid in &overdue {
         let p = purge_plan(conn, home, sid)?;
@@ -354,32 +349,17 @@ pub fn purge_trash(conn: &mut Connection, home: &Path, ids: &[String]) -> Result
 mod tests {
     use super::*;
     #[test]
-    fn move_object_renames_in_place_and_copy_fallback_completes() {
+    fn archive_object_writes_the_stored_form_then_removes_it() {
         let dir = tempfile::tempdir().unwrap();
-        let mk = |name: &str| {
-            let p = dir.path().join(name).join("obj");
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            p
-        };
-        // rename 主路径（同目录树）：内容到达、源移除
-        let src = mk("a");
-        std::fs::write(&src, b"payload").unwrap();
-        let dst = mk("b");
-        move_object(&src, &dst).unwrap();
-        assert!(!src.exists());
+        let home = dir.path().join("home");
+        let hash = crate::vault::store_line(&home, b"payload").unwrap();
+        let store = crate::vault::Store::open(&home).unwrap();
+        let dst = dir.path().join("archive").join(&hash);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        archive_object(&store, &hash, &dst).unwrap();
+        assert!(!store.contains(&hash).unwrap());
         assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
-        // copy 退路（跨盘 rename 失败时走的分支）：内容到达、源移除、无 tmp 残留
-        let src2 = mk("c");
-        std::fs::write(&src2, b"payload2").unwrap();
-        let dst2 = mk("d");
-        copy_fallback(&src2, &dst2).unwrap();
-        assert!(!src2.exists());
-        assert_eq!(std::fs::read(&dst2).unwrap(), b"payload2");
-        assert_eq!(
-            std::fs::read_dir(dst2.parent().unwrap()).unwrap().count(),
-            1,
-            "归档目录只留对象本身，tmp 已清理"
-        );
+        assert_eq!(std::fs::read_dir(dst.parent().unwrap()).unwrap().count(), 1, "无 tmp 残留");
     }
 
 }

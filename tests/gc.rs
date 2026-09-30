@@ -115,7 +115,7 @@ fn object_exists(home: &std::path::Path, conn: &rusqlite::Connection, sid: &str,
     else {
         return false; // 行都没了：对象自然无从谈起
     };
-    yourmem::vault::object_path(home, &hash).is_file()
+    yourmem::vault::Store::open(home).unwrap().contains(&hash).unwrap()
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn gc_removes_exclusive_keeps_shared_objects() {
         .unwrap();
     let r = db::purge_session(&mut conn, home.path(), &c, false, false).unwrap();
     assert_eq!(r["archived_objects"], 1);
-    assert!(!yourmem::vault::object_path(home.path(), &c_hash).is_file(), "c 清除后独占对象归档（离开主库）");
+    assert!(!yourmem::vault::Store::open(home.path()).unwrap().contains(&c_hash).unwrap(), "c 清除后独占对象归档（离开主库）");
     // FTS：独占内容再也搜不到
     let hits = db::search(&conn, &db::SearchOpts {
         query: "独占行内容".into(), project: None, agent: None, kind: None, limit: 10,
@@ -213,7 +213,7 @@ fn retention_gate_and_memory_revision_protection() {
     .unwrap();
     let r = db::purge_session(&mut conn, home.path(), &a, false, false).unwrap();
     // a 清了，但共享行+memory 修订双引用：对象保留
-    assert!(yourmem::vault::object_path(home.path(), &hash).is_file(), "memory_revisions 引用的对象不得归档");
+    assert!(yourmem::vault::Store::open(home.path()).unwrap().contains(&hash).unwrap(), "memory_revisions 引用的对象不得归档");
     assert_eq!(r["kept_shared_objects"], 1);
 }
 

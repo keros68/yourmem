@@ -443,6 +443,9 @@ enum BackupCmd {
         #[arg(long, default_value = "10")]
         keep: usize,
     },
+    /// Move objects stored as individual files by earlier versions into the
+    /// object store (the desktop app does this in the background).
+    Migrate,
 }
 
 fn print_json(v: &Value) {
@@ -856,6 +859,18 @@ fn main() -> Result<()> {
                 BackupCmd::Db { keep } => {
                     let result = vault::snapshot_db(&conn, &home, keep)?;
                     print_json(&result);
+                }
+                BackupCmd::Migrate => {
+                    let (mut moved, mut skipped) = (0, 0);
+                    loop {
+                        let r = vault::migrate_legacy(&home, 20_000)?;
+                        moved += r["moved"].as_u64().unwrap_or(0);
+                        skipped += r["skipped"].as_u64().unwrap_or(0);
+                        if r["remaining"] != true {
+                            break;
+                        }
+                    }
+                    print_json(&json!({ "moved": moved, "skipped": skipped }));
                 }
             }
         }

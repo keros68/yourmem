@@ -56,8 +56,9 @@ fn shared_snapshots_export_restore_and_cleanup_keep_referenced_objects() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
+    let live = rusqlite::Connection::open(vault::store_db_path(home.path())).unwrap();
     for hash in &hashes {
-        std::fs::remove_file(vault::object_path(home.path(), hash)).unwrap();
+        live.execute("DELETE FROM objects WHERE hash = ?1", [hash]).unwrap();
     }
     let plan = snapshots::cleanup_plan(home.path(), 1, 0).unwrap();
     assert_eq!(plan["remove_count"], 2);
@@ -128,7 +129,10 @@ fn corrupt_source_cannot_publish_snapshot_and_orphans_can_be_previewed() {
     let hash: String = conn
         .query_row("SELECT hash FROM vault_lines LIMIT 1", [], |r| r.get(0))
         .unwrap();
-    std::fs::write(vault::object_path(home.path(), &hash), b"damaged").unwrap();
+    rusqlite::Connection::open(vault::store_db_path(home.path()))
+        .unwrap()
+        .execute("UPDATE objects SET data = CAST('damaged' AS BLOB) WHERE hash = ?1", [&hash])
+        .unwrap();
     assert!(snapshots::create(home.path()).is_err());
     assert!(snapshots::list(home.path()).unwrap()["snapshots"]
         .as_array()

@@ -512,6 +512,7 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
         Vec::new()
     };
 
+    let store = vault::Store::open(home)?;
     let tx = conn.transaction()?;
 
     db::upsert_session(
@@ -593,8 +594,9 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
         }
     }
 
-    for (n, raw_bytes, _) in &lines {
-        let hash = vault::store_line(home, raw_bytes)?;
+    // 对象先于引用它的清单行落盘：对象库独立提交（完全同步），崩溃最多留下无引用对象
+    let hashes = store.put_many(lines.iter().map(|(_, raw, _)| raw.as_slice()))?;
+    for ((n, _, _), hash) in lines.iter().zip(&hashes) {
         tx.execute(
             "INSERT OR REPLACE INTO vault_lines(session_id, line_no, hash) VALUES (?1,?2,?3)",
             rusqlite::params![session_id, *n as i64, hash],
@@ -624,7 +626,7 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
             |r| r.get(0),
         )?;
         if referenced == 0 {
-            let _ = std::fs::remove_file(vault::object_path(home, &hash));
+            let _ = store.remove(&hash);
         }
     }
 

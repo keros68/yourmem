@@ -456,7 +456,10 @@ fn vault_export_detects_corruption() {
             |r| r.get(0),
         )
         .unwrap();
-    std::fs::write(vault::object_path(home.path(), &hash), b"tampered").unwrap();
+    rusqlite::Connection::open(vault::store_db_path(home.path()))
+        .unwrap()
+        .execute("UPDATE objects SET data = CAST('tampered' AS BLOB) WHERE hash = ?1", [&hash])
+        .unwrap();
 
     let out = home.path().join("exported.jsonl");
     assert!(vault::export_session(&conn, home.path(), "claude:aaaa-1111", &out).is_err());

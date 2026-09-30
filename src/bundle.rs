@@ -68,8 +68,9 @@ pub fn create(conn: &Connection, home: &Path, out: &Path, filter: &BundleFilter)
     let mut objects = 0u64;
     let mut bytes = 0u64;
     let mut missing = 0u64;
+    let store = vault::Store::open(home)?;
     for hash in &keep {
-        let raw = match vault::read_object(home, hash, true) {
+        let raw = match store.get(hash, true) {
             Ok(raw) => raw,
             Err(_) => {
                 missing += 1;
@@ -541,25 +542,37 @@ pub fn restore(bundle: &Path, target_home: &Path, merge: bool) -> Result<Value> 
     }))
 }
 
-/// Copy complete objects atomically; reuse verified objects and replace damaged copies.
+/// Copy complete objects; reuse verified objects and replace damaged copies.
 fn copy_objects(bundle_root: &Path, target_home: &Path) -> Result<u64> {
-    let mut copied = 0u64;
     let objects_dir = bundle_root.join("objects");
     if !objects_dir.is_dir() {
         return Ok(0);
     }
+    let store = vault::Store::open(target_home)?;
+    let mut batch: Vec<Vec<u8>> = Vec::new();
+    let mut copied = 0u64;
+    let flush = |batch: &mut Vec<Vec<u8>>| -> Result<()> {
+        store.put_many(batch.iter().map(Vec::as_slice))?;
+        batch.clear();
+        Ok(())
+    };
     for entry in walkdir::WalkDir::new(&objects_dir) {
         let entry = entry?;
         if !entry.file_type().is_file() { continue; }
         let hash = entry.file_name().to_string_lossy().to_string();
-        let dst = vault::object_path(target_home, &hash);
-        if dst.is_file() && vault::read_object(target_home, &hash, true).is_ok() { continue; }
+        if store.contains(&hash)? {
+            if store.get(&hash, true).is_ok() { continue; }
+            store.remove(&hash)?;
+        }
         let raw = std::fs::read(entry.path())?;
         anyhow::ensure!(vault::hash_bytes(&raw) == hash, "bundle object hash mismatch: {hash}");
-        if dst.exists() { std::fs::remove_file(&dst)?; }
-        anyhow::ensure!(vault::store_line(target_home, &raw)? == hash, "bundle object address mismatch");
+        batch.push(raw);
         copied += 1;
+        if batch.len() == 1000 {
+            flush(&mut batch)?;
+        }
     }
+    flush(&mut batch)?;
     Ok(copied)
 }
 
