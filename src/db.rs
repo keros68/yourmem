@@ -1406,6 +1406,35 @@ pub fn usage_summary(conn: &Connection, days: u32) -> Result<Vec<Value>> {
 pub const MEMORY_TYPES: [&str; 7] =
     ["fact", "decision", "rule", "task", "lesson", "preference", "context"];
 pub const MEMORY_SCOPES: [&str; 3] = ["global", "project", "session"];
+
+/// Days a memory stays current after its last update, by type; None = no expiry.
+/// Current focus and open tasks go stale quickly, facts slowly; decisions,
+/// rules, lessons and preferences hold until superseded.
+pub fn memory_ttl_days(r#type: &str) -> Option<i64> {
+    match r#type {
+        "context" | "task" => Some(30),
+        "fact" => Some(180),
+        _ => None,
+    }
+}
+
+fn memory_is_stale(r#type: &str, status: &str, updated_at: &str) -> bool {
+    if !matches!(status, "suggested" | "confirmed") {
+        return false;
+    }
+    let (Some(days), Ok(updated)) = (memory_ttl_days(r#type), chrono::DateTime::parse_from_rfc3339(updated_at)) else {
+        return false;
+    };
+    (chrono::Utc::now() - updated.with_timezone(&chrono::Utc)).num_days() > days
+}
+
+/// A lesson that already has two similar active ones has recurred: worth
+/// turning into a rule.
+pub fn promotion_hint(r#type: &str, similar: &[Value]) -> Option<&'static str> {
+    (r#type == "lesson" && similar.len() >= 2).then_some(
+        "同类经验已至少出现 3 次：可整理成一条规则（type=rule，待用户确认），再用 update_memory supersede 旧经验",
+    )
+}
 pub const MEMORY_STATUSES: [&str; 4] = ["suggested", "confirmed", "superseded", "archived"];
 
 pub struct MemoryInput<'a> {
@@ -1468,6 +1497,7 @@ pub fn save_memory(conn: &Connection, input: &MemoryInput<'_>) -> Result<String>
 }
 
 fn memory_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let stale = memory_is_stale(&r.get::<_, String>(4)?, &r.get::<_, String>(6)?, &r.get::<_, String>(11)?);
     Ok(json!({
         "id": r.get::<_, String>(0)?,
         "project_id": r.get::<_, Option<i64>>(1)?,
@@ -1484,6 +1514,8 @@ fn memory_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         // 来源会话的 agent（无来源指针的记忆为 null——手动 add 的没有 agent 归属）
         "source_agent": r.get::<_, Option<String>>(12)?,
         "source_line_no": r.get::<_, Option<i64>>(13)?,
+        // 超过该类型有效期未更新：可能过时，确认仍有效即可刷新
+        "stale": stale,
     }))
 }
 
@@ -1601,8 +1633,12 @@ pub fn find_similar(conn: &Connection, content: &str, project_id: Option<i64>, r
     if chars.len() < 3 {
         return Ok(Vec::new());
     }
-    let tri = |start: usize| chars[start..start + 3].iter().collect::<String>();
     let n = chars.len();
+    // 短文本的 3/4 处取样会越过末尾，起点收到 n-3
+    let tri = |start: usize| {
+        let start = start.min(n - 3);
+        chars[start..start + 3].iter().collect::<String>()
+    };
     let probes = [
         tri(0),
         tri(n / 4),

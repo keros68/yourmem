@@ -322,6 +322,7 @@ input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px;
 .pill.kimi { color: #c4b5fd; background: rgba(196, 181, 253, 0.12); }
 .pill.hermes { color: var(--teal, #5eead4); background: rgba(94, 234, 212, 0.12); }
 .pill.suggested { color: var(--yellow); background: rgba(251, 191, 36, 0.12); }
+.pill.stale { color: var(--yellow); background: rgba(251, 191, 36, 0.12); }
 .pill.confirmed { color: var(--green); background: rgba(74, 222, 128, 0.12); }
 .pill.superseded, .pill.archived { color: var(--red); background: rgba(248, 113, 113, 0.10); text-decoration: line-through; }
 

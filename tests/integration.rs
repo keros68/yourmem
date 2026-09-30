@@ -1076,3 +1076,39 @@ fn project_add_archive_restore_lifecycle() {
     assert!(!created3 && id3 == id1, "重登记归档路径返回原项目");
     assert_eq!(db::list_projects(&conn).unwrap().len(), 1, "重登记即恢复");
 }
+
+#[test]
+fn memory_freshness_and_rule_promotion() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let save = |t: &str, content: &str| {
+        db::save_memory_with_similar(&conn, &db::MemoryInput {
+            project_id: None, scope: "global", r#type: t, content,
+            status: None, source_session_id: None, source_message_id: None,
+        }).unwrap()
+    };
+    let (ctx, _) = save("context", "本月主攻存储改造");
+    let (dec, _) = save("decision", "对象集中存放在一个库文件里");
+    conn.execute(
+        "UPDATE memories SET updated_at = '2026-01-01T00:00:00.000Z' WHERE id IN (?1, ?2)",
+        rusqlite::params![ctx, dec],
+    ).unwrap();
+    let stale = |id: &str| -> bool {
+        db::list_memories(&conn, &db::MemoryFilter {
+            project_id: None, scope: None, r#type: None, status: None, agent: None,
+            include_global: true, limit: 50,
+        }).unwrap()
+            .into_iter().find(|m| m["id"] == id).unwrap()["stale"].as_bool().unwrap()
+    };
+    assert!(stale(&ctx), "近期状况超过 30 天未更新即可能过时");
+    assert!(!stale(&dec), "决策没有有效期");
+    db::update_memory_status(&conn, &ctx, "confirm", None).unwrap();
+    assert!(!stale(&ctx), "确认仍有效后刷新");
+
+    let lesson = "Windows 上逐个读写大量小文件很慢，批量操作要先合并";
+    assert!(db::promotion_hint("lesson", &save("lesson", lesson).1).is_none());
+    assert!(db::promotion_hint("lesson", &save("lesson", lesson).1).is_none());
+    let (_, similar) = save("lesson", lesson);
+    assert!(db::promotion_hint("lesson", &similar).is_some(), "第三次出现提示升级为规则");
+    assert!(db::promotion_hint("fact", &similar).is_none());
+}

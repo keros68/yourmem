@@ -756,6 +756,9 @@ fn main() -> Result<()> {
                                 m["id"].as_str().unwrap_or("?"), m["shared_trigrams"]);
                         }
                     }
+                    if let Some(hint) = db::promotion_hint(&r#type, &similar) {
+                        eprintln!("提示：{hint}");
+                    }
                     print_json(&json!({ "memory_id": id, "similar_count": similar.len() }));
                 }
                 MemoryCmd::List { project, scope, r#type, status, agent, limit } => {

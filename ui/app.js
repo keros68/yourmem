@@ -891,6 +891,7 @@ const memCard = (m) => {
     <div class="meta">
       <span class="pill">${esc(m.type)}</span>
       <span class="pill ${esc(m.status)}">${esc(m.status)}</span>
+      ${m.stale ? `<span class="pill stale" title="超过该类型的有效期未更新">可能过时</span>` : ""}
       ${m.source_agent ? `<span class="pill ${esc(m.source_agent)}">${esc(m.source_agent)}</span>` : ""}
       <span>${esc(m.scope)}${m.project ? " · " + esc(m.project) : ""}</span>
       <span>${fmtTime(m.updated_at)}</span>
@@ -898,6 +899,7 @@ const memCard = (m) => {
       <code class="mid" data-copy="${esc(m.id)}" title="记忆 ID：${esc(m.id)}（点击复制）·「取代」其他记忆时填入">${esc(m.id.slice(0, 10))}</code>
       ${m.source_session_id ? `<span data-src="${esc(m.source_session_id)}"${m.source_line_no != null ? ` data-line="${m.source_line_no}"` : ""} style="cursor:pointer;color:var(--accent)">来源 ↗</span>` : '<span>来源未指定</span>'}
       ${m.status === "suggested" ? `<button class="btn small primary" data-act="confirm" data-id="${esc(m.id)}">确认</button>` : ""}
+      ${m.stale && m.status === "confirmed" ? `<button class="btn small" data-act="confirm" data-id="${esc(m.id)}">仍有效</button>` : ""}
       ${active ? `<button class="btn small" data-supersede="${esc(m.id)}" title="取代：标记此记忆已被更新的记忆替代——选择取代者（搜索内容或粘贴 ID），形成可追溯的演变链">取代</button>` : ""}
       ${active ? `<button class="btn small" data-act="archive" data-id="${esc(m.id)}">归档</button>` : ""}
     </div>

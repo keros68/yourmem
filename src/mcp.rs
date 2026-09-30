@@ -249,6 +249,7 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
                 "note": if similar.is_empty() { Value::Null } else {
                     json!("检测到疑似重复：更新优于复制——若语义重复，用 update_memory supersede 旧条或请用户确认后再保留两条")
                 },
+                "promote_hint": db::promotion_hint(&r#type, &similar),
             }))
         }
 
@@ -414,7 +415,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "save_memory",
-                "description": "Save reusable knowledge. Decisions/rules default to suggested until user confirmation. Pass session_id and message_id for provenance. Check similar: supersede duplicates instead of accumulating copies. For lessons/preferences include scope, failed attempts, Why, How-to-apply, actual validation results and review conditions; mark untested claims. Do not duplicate git, code or AGENTS.md/CLAUDE.md.",
+                "description": "Save reusable knowledge. Decisions/rules default to suggested until user confirmation. Pass session_id and message_id for provenance. Check similar: supersede duplicates instead of accumulating copies. For lessons/preferences include scope, failed attempts, Why, How-to-apply and review conditions; keep observed results apart from inference. Do not duplicate git, code or AGENTS.md/CLAUDE.md.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
