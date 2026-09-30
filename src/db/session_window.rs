@@ -21,6 +21,8 @@ pub fn session_window(
     let total = result["total_messages"].as_u64().unwrap_or(0);
     let start = match offset {
         Some(n) => n as u64,
+        // 无定位目标：最后一页，即对话停下的地方
+        None if line.is_none() && message_id.is_none() => total.saturating_sub(150),
         None => {
             let (focus_line, focus_ord) = match message_id {
                 Some(id) => conn.query_row("SELECT line_no, ord FROM messages WHERE id=?1 AND session_id=?2",

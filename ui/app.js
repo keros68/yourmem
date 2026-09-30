@@ -82,9 +82,20 @@ function bindCopyButtons(scope) {
 }
 
 // ---------------------------------------------------------------- today
+// 后台维护（快照、自检）只在出问题时提示
+function maintenanceNoticeHtml(st) {
+  const items = [];
+  if (st?.snapshot?.ok === false) items.push(`自动快照失败：${st.snapshot.error}`);
+  for (const p of st?.doctor?.problems || []) items.push(p.detail);
+  if (!items.length) return "";
+  return `<div class="notice"><span>后台自检发现 ${items.length} 个问题：${items.map(esc).join("；")}</span><button class="btn small" id="maint-open">打开设置</button></div>`;
+}
+
 async function renderToday() {
-  const dg = await invoke("daily_digest");
-  $("#page-today").innerHTML = todayOverviewHtml(dg);
+  const [dg, maint] = await Promise.all([invoke("daily_digest"), invoke("maintenance_status").catch(() => ({}))]);
+  $("#page-today").innerHTML = maintenanceNoticeHtml(maint) + todayOverviewHtml(dg);
+  const maintOpen = $("#maint-open");
+  if (maintOpen) maintOpen.onclick = () => { settingsTab = "general"; document.querySelector('.nav[data-page="settings"]').click(); };
   document.querySelectorAll("#page-today [data-work-session]").forEach((b) => {
     b.onclick = () => showSession(b.dataset.workSession);
   });
@@ -95,6 +106,8 @@ async function renderToday() {
 
 const localDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 let activityDay = localDay(new Date());
+// 停留在"今天"时跟随日期：常驻托盘跨过午夜后打开的仍是当天
+let activityFollowsToday = true;
 let activityDigest = null;
 let activityState = { project: "all", agent: "all", selected: null, tab: "activities" };
 let activityAiResponse = null;
@@ -183,9 +196,10 @@ function paintActivity() {
     activityState.project = e.target.value; activityState.selected = e.target.value === "all" ? null : e.target.value; activityState.tab = "activities"; paintActivity();
   };
   $("#activity-agent-filter").onchange = (e) => { activityState.agent = e.target.value; activityState.selected = null; paintActivity(); };
-  $("#activity-day").onchange = (e) => { if (e.target.value) { activityDay = e.target.value; activityDigest = null; pages.activity(); } };
-  $("#activity-prev").onclick = () => { activityDay = shiftDay(activityDay, -1); activityDigest = null; pages.activity(); };
-  $("#activity-next").onclick = () => { activityDay = shiftDay(activityDay, 1); activityDigest = null; pages.activity(); };
+  const goDay = (day) => { activityDay = day; activityFollowsToday = day === localDay(new Date()); pages.activity(); };
+  $("#activity-day").onchange = (e) => { if (e.target.value) goDay(e.target.value); };
+  $("#activity-prev").onclick = () => goDay(shiftDay(activityDay, -1));
+  $("#activity-next").onclick = () => goDay(shiftDay(activityDay, 1));
   $("#activity-export").onclick = async () => {
     const b = $("#activity-export"); b.disabled = true;
     try {
@@ -198,7 +212,8 @@ function paintActivity() {
 }
 
 async function renderActivity() {
-  if (!activityDigest || activityDigest.day !== activityDay) activityDigest = await invoke("daily_digest", { day: activityDay });
+  if (activityFollowsToday) activityDay = localDay(new Date());
+  activityDigest = await invoke("daily_digest", { day: activityDay });
   paintActivity();
 }
 
@@ -1683,6 +1698,20 @@ $("#btn-import").onclick = async () => {
     label.textContent = "采集新对话";
   }
 };
+
+// 后台采集到新内容后刷新当前页。抽屉打开、正在输入、有勾选项或停在其他页时不打断。
+const AUTO_REFRESH_PAGES = new Set(["today", "activity", "projects", "sessions"]);
+window.__TAURI__.event?.listen?.("collected", () => {
+  const current = document.querySelector(".nav.active")?.dataset.page;
+  const el = document.activeElement;
+  const typing = el && (["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) || el.isContentEditable);
+  if (!AUTO_REFRESH_PAGES.has(current) || typing || !$("#drawer").classList.contains("hidden")) return;
+  if (current === "sessions" && sessChecked.size) return;
+  pageRenderers[current]().catch(() => {});
+});
+window.__TAURI__.event?.listen?.("maintenance", () => {
+  if (document.querySelector(".nav.active")?.dataset.page === "today") pageRenderers.today().catch(() => {});
+});
 
 (async () => {
   // 首次启动向导必须先完成；首屏渲染会建库，不能抢先在系统盘留下资料库。

@@ -160,21 +160,28 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
         check("memory_files", "fail", format!("{cur_missing} 个 memory 文件的当前修订对象缺失"))
     });
 
-    // 7. 独立数据库快照新鲜度；bundle 可存到任意位置，不在此项检查范围内。
-    let snapshots = vault::list_snapshots(home)?;
-    let detail = match snapshots.last() {
-        None => ("warn", "未发现独立数据库快照，可用 backup db 创建。此项不检查 .tar.gz 完整备份；完整备份请在设置的备份页校验。".to_string()),
-        Some(p) => {
-            let age = std::fs::metadata(p)
-                .and_then(|m| m.modified())
-                .map(|t| std::time::SystemTime::now().duration_since(t).unwrap_or_default())
-                .unwrap_or_default();
-            let days = age.as_secs() / 86400;
-            if days > 7 {
-                ("warn", format!("最近快照 {days} 天前（共 {} 份）", snapshots.len()))
-            } else {
-                ("ok", format!("最近快照 {days} 天前（共 {} 份）", snapshots.len()))
-            }
+    // 7. 快照新鲜度：增量快照与独立数据库快照取较新者；bundle 可存到任意位置，
+    // 不在此项检查范围内。
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut count = 0usize;
+    let files = vault::list_snapshots(home)?;
+    count += files.len();
+    if let Some(t) = files.last().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()) {
+        newest = Some(t);
+    }
+    if let Ok(Some((created_at, n))) = crate::snapshots::latest(home) {
+        count += n;
+        if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&created_at) {
+            let t = std::time::SystemTime::from(t);
+            newest = Some(newest.map_or(t, |cur| cur.max(t)));
+        }
+    }
+    let detail = match newest {
+        None => ("warn", "尚无快照。此项不检查 .tar.gz 完整备份；完整备份请在设置的备份页校验。".to_string()),
+        Some(t) => {
+            let days = std::time::SystemTime::now().duration_since(t).unwrap_or_default().as_secs() / 86400;
+            let status = if days > 7 { "warn" } else { "ok" };
+            (status, format!("最近快照 {days} 天前（共 {count} 份）"))
         }
     };
     checks.push(check("db_snapshot", detail.0, detail.1));

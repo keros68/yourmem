@@ -16,6 +16,7 @@ pub mod dossier;
 pub mod organizer;
 pub mod ingest;
 pub mod mcp;
+pub mod maintenance;
 pub mod memfiles;
 pub mod models;
 pub mod restore;

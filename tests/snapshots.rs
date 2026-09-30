@@ -142,6 +142,8 @@ fn retention_unions_recent_snapshots_with_latest_in_each_month() {
     let home = tempfile::tempdir().unwrap();
     let source = tempfile::tempdir().unwrap();
     append(home.path(), source.path(), 1);
+    // 只验证清理计划的保留规则，创建时不自动清理
+    yourmem::ingest::write_config(home.path(), &json!({"snapshot_auto_cleanup": false})).unwrap();
     let mut ids = Vec::new();
     for date in [
         "2026-01-01",

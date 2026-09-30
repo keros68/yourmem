@@ -1,7 +1,7 @@
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    App, AppHandle, Manager,
+    App, AppHandle, Emitter, Manager,
 };
 
 pub fn show_main(app: &AppHandle) {
@@ -44,14 +44,28 @@ pub fn setup(app: &mut App) -> tauri::Result<()> {
     // The data home is resolved on every pass: the first-run wizard and local
     // cleanup change it while the app is running, and an unconfigured home must
     // not be created by collection.
+    // After collection it notifies the window so the open page refreshes, then
+    // runs whatever maintenance is due (snapshots, self-check).
+    let handle = app.handle().clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
         let home = yourmem::data_home();
         if yourmem::is_first_run(&home) {
             continue;
         }
-        if let Err(e) = yourmem::ingest::import_defaults(&home) {
-            eprintln!("yourmem background import: {e:#}");
+        match yourmem::ingest::import_defaults(&home) {
+            Ok(o) if o.messages_added > 0 || o.memory_revisions_added > 0 => {
+                let _ = handle.emit("collected", yourmem::ingest::outcome_json(&o));
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("yourmem background import: {e:#}"),
+        }
+        match yourmem::maintenance::run_due(&home) {
+            Ok(r) if r["ran"].as_array().is_some_and(|a| !a.is_empty()) => {
+                let _ = handle.emit("maintenance", yourmem::maintenance::status(&home));
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("yourmem maintenance: {e:#}"),
         }
     });
     Ok(())

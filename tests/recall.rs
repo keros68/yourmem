@@ -99,6 +99,10 @@ fn focused_windows_page_both_ways_and_retrieve_full_text() {
     assert_eq!(before["total_messages"], 200);
     assert_eq!(before["messages"].as_array().unwrap().len(), 50);
     assert_eq!(before["has_after"], false);
+    let tail = db::session_window(&c, "s", None, None, None, false).unwrap();
+    assert_eq!(tail["window_offset"], 250, "无定位目标时打开最后一页");
+    assert_eq!(tail["messages"].as_array().unwrap().len(), 150);
+    assert_eq!(tail["has_after"], false);
     db::set_session_deleted(&c, "s", true).unwrap();
     assert!(db::session_window(&c, "s", None, None, None, false).is_err());
     assert!(db::message_content(&c, "s", mid).is_err());

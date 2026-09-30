@@ -91,6 +91,11 @@ fn lock(repo: &Path) -> Result<ImportLockTx> {
 fn blob(repo: &Path, hash: &str) -> PathBuf {
     repo.join("blobs").join(format!("{hash}.gz"))
 }
+/// Scratch space inside the backup repository: a snapshot writes a full copy of
+/// the database, which must land on the backup disk rather than the system drive.
+fn work_dir(repo: &Path) -> Result<tempfile::TempDir> {
+    Ok(tempfile::Builder::new().prefix(".work-").tempdir_in(repo)?)
+}
 fn hash_reader(mut reader: impl Read) -> Result<String> {
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 65536];
@@ -157,7 +162,7 @@ fn configured_policy(home: &Path) -> (usize, usize, bool) {
     (
         cfg["snapshot_keep_recent"].as_u64().unwrap_or(3) as usize,
         cfg["snapshot_keep_monthly"].as_u64().unwrap_or(3) as usize,
-        cfg["snapshot_auto_cleanup"].as_bool().unwrap_or(false),
+        cfg["snapshot_auto_cleanup"].as_bool().unwrap_or(true),
     )
 }
 fn manifests(repo: &Path) -> Result<Vec<Snapshot>> {
@@ -212,6 +217,15 @@ fn inventory(repo: &Path) -> Result<BTreeMap<String, u64>> {
     }
     Ok(files)
 }
+/// Creation time of the newest snapshot and the number of snapshots.
+pub fn latest(home: &Path) -> Result<Option<(String, usize)>> {
+    let repo = root(home);
+    if !repo.exists() {
+        return Ok(None);
+    }
+    let rows = manifests(&repo)?;
+    Ok(rows.first().map(|s| (s.created_at.clone(), rows.len())))
+}
 pub fn list(home: &Path) -> Result<Value> {
     let repo = root(home);
     let (recent, monthly, auto) = configured_policy(home);
@@ -245,7 +259,7 @@ pub fn create(home: &Path) -> Result<Value> {
     let repo = root(home);
     let _repo_lock = lock(&repo)?;
     let _import_lock = ImportLockTx::acquire(home, std::time::Duration::from_secs(120))?;
-    let tmp = tempfile::tempdir()?;
+    let tmp = work_dir(&repo)?;
     let path = tmp.path().join("snapshot.sqlite");
     let conn = db::open(home)?;
     conn.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
@@ -392,7 +406,7 @@ fn plan(repo: &Path, recent: usize, monthly: usize) -> Result<Value> {
     let mut months = BTreeSet::new();
     let mut keep = BTreeSet::new();
     let mut remove = Vec::new();
-    let tmp = tempfile::tempdir()?;
+    let tmp = work_dir(repo)?;
     let mut reclaim = 0u64;
     for (i, s) in rows.iter().enumerate() {
         inspect_db(repo, s, &tmp.path().join("db.sqlite"))?;

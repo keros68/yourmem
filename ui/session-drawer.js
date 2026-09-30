@@ -16,9 +16,7 @@ async function showSession(sessionId, lineNo = null, precompact = false, offset 
   const request = begin();
   let d;
   try {
-    d = lineNo != null || offset != null || messageId != null
-      ? await invoke("session_window", { sessionId, line: lineNo, offset, messageId, beforeCompact: precompact })
-      : await invoke("session", { sessionId, max: 500, line: null, beforeCompact: precompact });
+    d = await invoke("session_window", { sessionId, line: lineNo, offset, messageId, beforeCompact: precompact });
   } catch (e) {
     if (!isCurrent(request)) return;
     toast(`读取对话失败：${e}`);
@@ -37,17 +35,8 @@ async function showSession(sessionId, lineNo = null, precompact = false, offset 
       )
     : `<div class="lchain"><span class="lnode cur">本对话</span><span style="color:var(--faint)">（暂无可追溯的继承关系）</span></div>`;
   const msgHtml = (m) => `<div class="msg ${esc(m.kind)}" data-line="${m.line_no}" data-message="${m.message_id}"><div class="kind">${esc(m.kind)} · L${m.line_no} · ${fmtTime(m.timestamp)}</div><div class="content">${esc(m.content)}</div>${m.truncated ? `<button class="btn small" data-full-message="${m.message_id}">展开原文</button>` : ""}</div>`;
-  // 长对话分块渲染：首屏 150 条，点按钮继续——500+ 条详情不卡的关键。
-  // 来源指针跳转（lineNo）指向后块时首屏直接覆盖到目标行（codex 一审：
-  // 只渲染前 150 会让定位静默失败，§7.1 跳转要求被分块破坏）。
-  const CHUNK = 150;
-  let targetIdx = -1;
-  if (messageId != null) targetIdx = d.messages.findIndex((m) => m.message_id === messageId);
-  else if (lineNo != null) targetIdx = d.messages.findIndex((m) => m.line_no === lineNo);
-  let shown = targetIdx >= 0
-    ? Math.min(Math.max(CHUNK, targetIdx + 1), d.messages.length)
-    : Math.min(CHUNK, d.messages.length);
-  let msgs = d.messages.slice(0, shown).map(msgHtml).join("");
+  // 每次最多 150 条（一页），前文/后文翻页；无定位目标时是最后一页
+  const msgs = d.messages.map(msgHtml).join("");
   // §4 续聊支持：只展示与复制，不代为执行
   const copyRow = `
     <div class="meta" style="margin:8px 0">
@@ -80,29 +69,16 @@ async function showSession(sessionId, lineNo = null, precompact = false, offset 
     ${compactRow}
     ${proofRow}
     ${ltree.truncated ? `<div class="meta">仅显示部分谱系节点（上限 ${ltree.node_limit}）</div>` : ""}
-    ${d.window_offset != null ? `<div class="searchbar"><button class="btn small" id="context-before" ${d.has_before ? "" : "disabled"}>前文</button><span>${d.messages.length ? d.window_offset + 1 : 0}–${d.window_offset + d.messages.length} / ${d.total_messages}</span><button class="btn small" id="context-after" ${d.has_after ? "" : "disabled"}>后文</button></div>` : ""}
-    ${d.window_offset == null ? '<button class="btn small" id="context-browse">浏览全部前后文</button>' : ""}
+    ${d.has_before || d.has_after ? `<div class="searchbar"><button class="btn small" id="context-before" ${d.has_before ? "" : "disabled"}>前文</button><span>${d.messages.length ? d.window_offset + 1 : 0}–${d.window_offset + d.messages.length} / ${d.total_messages}</span><button class="btn small" id="context-after" ${d.has_after ? "" : "disabled"}>后文</button></div>` : ""}
     ${msgs || '<div class="empty">无消息</div>'}
-    ${shown < d.messages.length ? `<div style="text-align:center;margin:10px 0"><button class="btn small" id="msg-more">显示更多（剩余 ${d.messages.length - shown} 条）</button></div>` : ""}
   `, request);
-  if (d.window_offset != null) {
-    $("#context-before").onclick = () => showSession(sessionId, lineNo, precompact, Math.max(0, d.window_offset - 150), messageId);
+  const before = $("#context-before");
+  if (before) {
+    before.onclick = () => showSession(sessionId, lineNo, precompact, Math.max(0, d.window_offset - 150), messageId);
     $("#context-after").onclick = () => showSession(sessionId, lineNo, precompact, d.window_offset + 150, messageId);
   }
-  const browse = $("#context-browse");
-  if (browse) browse.onclick = () => showSession(sessionId, null, precompact, Math.max(0, (d.total_messages || 0) - 150));
   const pcBtn = document.getElementById("btn-precompact");
   if (pcBtn) pcBtn.onclick = () => showSession(sessionId, null, !precompact);
-  const more = document.getElementById("msg-more");
-  if (more) {
-    more.onclick = () => {
-      const next = Math.min(shown + CHUNK, d.messages.length);
-      more.closest("div").insertAdjacentHTML("beforebegin", d.messages.slice(shown, next).map(msgHtml).join(""));
-      shown = next;
-      if (shown >= d.messages.length) more.remove();
-      else more.textContent = `显示更多（剩余 ${d.messages.length - shown} 条）`;
-    };
-  }
   // 谱系图节点可点 + 当前节点滚入视口（统一走 afterGraphRender，换向重渲染也用它）
   document.querySelectorAll("#drawer-content [data-full-message]").forEach(btn => {
     btn.onclick = async () => {

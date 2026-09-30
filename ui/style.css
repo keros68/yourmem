@@ -661,6 +661,8 @@ pre.memfile {
 .state { padding: 40px 20px; text-align: center; color: var(--dim); border: 1px dashed var(--border); border-radius: var(--radius); margin: 20px 0; }
 .state.loading::after { content: "…"; }
 .state.error { color: var(--red); border-color: rgba(248, 113, 113, 0.3); }
+.notice { display: flex; gap: 10px; align-items: center; padding: 10px 14px; margin: 0 0 14px; border: 1px solid rgba(248, 113, 113, 0.3); border-radius: var(--radius); color: var(--red); font-size: 13px; }
+.notice span { flex: 1; }
 .lchain { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 8px 0; font-size: 12.5px; }
 .lnode { padding: 2px 10px; border-radius: 8px; background: var(--bg3); border: 1px solid var(--border-strong); cursor: pointer; font-family: ui-monospace, monospace; }
 .lnode:hover { border-color: var(--accent); }

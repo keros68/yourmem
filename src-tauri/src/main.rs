@@ -279,16 +279,12 @@ fn sessions(project_id: Option<i64>, limit: Option<u32>) -> Result<Value, String
 }
 
 #[tauri::command]
-fn session(session_id: String, max: Option<u32>, line: Option<i64>, before_compact: Option<bool>) -> Result<Value, String> {
-    let conn = open()?;
-    let _ = db::log_usage(&conn, "app", "session");
-    db::read_session(&conn, &session_id, max.unwrap_or(500), line, before_compact.unwrap_or(false))
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 fn session_window(session_id: String, line: Option<i64>, offset: Option<u32>, message_id: Option<i64>, before_compact: Option<bool>) -> Result<Value, String> {
-    db::session_window(&open()?, &session_id, line, offset, message_id, before_compact.unwrap_or(false)).map_err(|e| e.to_string())
+    let conn = open()?;
+    if line.is_none() && offset.is_none() && message_id.is_none() {
+        let _ = db::log_usage(&conn, "app", "session");
+    }
+    db::session_window(&conn, &session_id, line, offset, message_id, before_compact.unwrap_or(false)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1035,6 +1031,12 @@ fn app_uninstall() -> Result<(), String> {
     std::process::exit(0);
 }
 
+/// 后台维护（快照、自检）的最近结果。
+#[tauri::command]
+fn maintenance_status() -> Value {
+    yourmem::maintenance::status(&data_home())
+}
+
 /// 本地自检（UI-DESIGN §8.5）：只读对账，报告直接渲染在设置页。
 #[tauri::command]
 async fn doctor() -> Result<Value, String> {
@@ -1212,7 +1214,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            session_window, message_content, stats, today, projects, context, project_dossier, daily_digest, daily_digest_export, sessions, session,
+            session_window, message_content, maintenance_status, stats, today, projects, context, project_dossier, daily_digest, daily_digest_export, sessions,
             ai_settings_get, ai_settings_save, ai_organize_day, ai_summary_save,
             project_add, project_archive, project_restore, open_in_finder,
             session_proof, session_verify, session_export, session_writeback_plan,

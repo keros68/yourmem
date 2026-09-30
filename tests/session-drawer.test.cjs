@@ -122,11 +122,13 @@ test('search focus preserves exact message id and paging fetches the adjacent wi
   assert.equal(f.content.innerHTML,html);
 });
 
-test('ordinary tail view offers access to earlier archived messages', async () => {
+test('opening a session shows the last page and pages back to earlier messages', async () => {
   const f=fixture();
   const open=f.drawer.showSession('A');
-  f.requests[0].resolve({...data('A'),total_messages:900}); await open;
-  f.get('context-browse').onclick();
+  assert.equal(f.requests[0].command,'session_window');
+  assert.equal(f.requests[0].args.offset,null);
+  f.requests[0].resolve({...data('A'),total_messages:900,window_offset:750,has_before:true,has_after:false}); await open;
+  f.get('context-before').onclick();
   assert.equal(f.requests.at(-1).command,'session_window');
-  assert.equal(f.requests.at(-1).args.offset,750);
+  assert.equal(f.requests.at(-1).args.offset,600);
 });
