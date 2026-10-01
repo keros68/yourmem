@@ -120,6 +120,23 @@ fn resolve_home(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
 /// 首次启动判定：数据目录里既无 config.json 也无 yourmem.db 才算新装——
 /// 升级用户/已有数据的目录不受向导打扰。桌面端须在首个页面打开数据库
 /// 之前调用（页面渲染即建库，之后此判定恒为 false）。
+/// Whether `path` lies in `root` or below it. Separators are normalized and,
+/// on Windows, case is ignored.
+pub fn is_under_dir(path: &str, root: &Path) -> bool {
+    let norm = |s: &str| {
+        let s = s.replace('\\', "/").trim_end_matches('/').to_string();
+        if cfg!(windows) { s.to_lowercase() } else { s }
+    };
+    let (p, r) = (norm(path), norm(&root.to_string_lossy()));
+    !r.is_empty() && (p == r || p.starts_with(&format!("{r}/")))
+}
+
+/// Agents run scratch work in the system temp directory; such working
+/// directories are not projects the user maintains.
+pub fn is_temp_path(path: &str) -> bool {
+    is_under_dir(path, &std::env::temp_dir())
+}
+
 /// Backup name next to `path`: `<name>.bak-YYYYMMDD-HHMMSS`, with `-2`, `-3`…
 /// appended when a backup from the same second already exists.
 pub fn fresh_backup_path(path: &Path) -> PathBuf {

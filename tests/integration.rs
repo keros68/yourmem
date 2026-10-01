@@ -1153,3 +1153,57 @@ fn stats_leave_out_sessions_in_trash() {
     assert_eq!(after["messages"].as_i64().unwrap(), before["messages"].as_i64().unwrap() - 5);
     assert_eq!(after["sessions_trash"], 1);
 }
+
+#[test]
+fn temp_dir_projects_start_archived_and_stay_restored() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let scratch = std::env::temp_dir().join("agent-run-123");
+    let scratch = scratch.to_string_lossy().to_string();
+    let id = db::upsert_project(&conn, &scratch, "agent-run-123").unwrap();
+    let archived: Option<String> = conn.query_row(
+        "SELECT archived_at FROM projects WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+    assert!(archived.is_some(), "临时目录项目新建即归档");
+    conn.execute("UPDATE projects SET archived_at = NULL WHERE id = ?1", [id]).unwrap();
+    db::upsert_project(&conn, &scratch, "agent-run-123").unwrap();
+    let archived: Option<String> = conn.query_row(
+        "SELECT archived_at FROM projects WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+    assert!(archived.is_none(), "用户恢复后不再归档");
+    let normal = db::upsert_project(&conn, "/work/real-project", "real-project").unwrap();
+    let archived: Option<String> = conn.query_row(
+        "SELECT archived_at FROM projects WHERE id = ?1", [normal], |r| r.get(0)).unwrap();
+    assert!(archived.is_none());
+}
+
+#[test]
+fn path_under_dir_ignores_separator_style() {
+    let root = std::path::Path::new("D:/scratch/Temp");
+    assert!(yourmem::is_under_dir(r"D:\scratch\Temp\run1", root));
+    assert!(yourmem::is_under_dir("D:/scratch/Temp", root));
+    assert!(!yourmem::is_under_dir("D:/scratch/Temporary", root));
+    #[cfg(windows)]
+    assert!(yourmem::is_under_dir(r"d:\SCRATCH\temp\x", root));
+}
+
+#[test]
+fn empty_sessions_stay_out_of_lists() {
+    let (home, src) = setup();
+    let mut conn = db::open(home.path()).unwrap();
+    ingest::import_all(&mut conn, home.path(), &roots(src.path()), None, None).unwrap();
+    let before = db::recent_sessions(&conn, None, 50).unwrap().len();
+    conn.execute("UPDATE sessions SET message_count = 0 WHERE id = 'claude:aaaa-1111'", []).unwrap();
+    let after = db::recent_sessions(&conn, None, 50).unwrap();
+    assert_eq!(after.len(), before - 1);
+    assert!(after.iter().all(|s| s["session_id"] != "claude:aaaa-1111"));
+}
+
+#[test]
+fn trash_rows_carry_the_first_user_message() {
+    let (home, src) = setup();
+    let mut conn = db::open(home.path()).unwrap();
+    ingest::import_all(&mut conn, home.path(), &roots(src.path()), None, None).unwrap();
+    db::set_session_deleted(&conn, "claude:aaaa-1111", true).unwrap();
+    let trash = db::trash_sessions(&conn).unwrap();
+    let row = trash.iter().find(|s| s["session_id"] == "claude:aaaa-1111").unwrap();
+    assert!(row["preview"].as_str().is_some_and(|p| !p.is_empty()), "{row}");
+}

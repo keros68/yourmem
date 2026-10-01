@@ -397,6 +397,7 @@ async function showProject(pid) {
     <tr class="clickable" data-sid="${esc(t.session_id)}">
       <td class="c-time">${fmtTime(t.started_at)}</td>
       <td class="c-agent"><span class="pill ${esc(t.agent)}">${esc(t.agent)}</span></td>
+      <td class="prev" title="${esc(t.title || "")}">${esc(t.title || "—")}</td>
       <td>${t.link_type ? `<span class="pill" title="← ${esc(t.parent_session_id || "")}">${esc(t.link_type)}</span>` : ""}</td>
       <td class="c-num">${t.messages}</td>
       <td class="c-num">${t.artifacts || ""}</td></tr>`).join("");
@@ -415,7 +416,7 @@ async function showProject(pid) {
     <h2>决策板（活跃 ${decs.filter((m) => m.status === "confirmed").length} / 历史 ${decs.length}）</h2>
     <div class="scrollbox">${decisionRows + orphanSuperseded || '<div class="empty">暂无决策/规则记忆</div>'}</div>
     <h2>时间线（${(d.timeline || []).length}）</h2>
-    ${timelineRows ? `<div class="scrollbox"><table><tr><th class="c-time">开始</th><th class="c-agent">agent</th><th>链</th><th class="c-num">消息</th><th class="c-num">artifact</th></tr>${timelineRows}</table></div>` : '<div class="empty">暂无对话</div>'}
+    ${timelineRows ? `<div class="scrollbox"><table><tr><th class="c-time">开始</th><th class="c-agent">agent</th><th class="c-prev">摘要</th><th>链</th><th class="c-num">消息</th><th class="c-num">artifact</th></tr>${timelineRows}</table></div>` : '<div class="empty">暂无对话</div>'}
     ${lineageGraphHtml(
       (d.timeline || []).map((t) => ({ session_id: t.session_id, agent: t.agent, started_at: t.started_at, messages: t.messages, title: t.title })),
       d.lineage_edges || (d.timeline || []).filter((t) => t.link_type && t.parent_session_id).map((t) => ({ p: t.parent_session_id, c: t.session_id, lt: t.link_type }))
@@ -630,7 +631,7 @@ async function drawTrash() {
     <div id="trash-table"></div>`;
   $("#trash-back").onclick = () => { sessTrash = false; renderSessions(); };
   $("#trash-table").innerHTML = d.trash.length
-    ? sessTable(d.trash, { project: true, fixed: true, select: true, action: "trash", deleted: true })
+    ? sessTable(d.trash, { project: true, preview: true, fixed: true, select: true, action: "trash", deleted: true })
     : '<div class="empty">回收站为空</div>';
   const bulk = $("#trash-bulk");
   const syncBulk = () => {

@@ -260,11 +260,14 @@ pub fn project_dossier(conn: &Connection, project_id: i64) -> Result<Value> {
 pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
     let (lo, hi) = day_bounds_utc(day)?;
     let tx = conn.unchecked_transaction()?;
-    let in_day = "(started_at >= ?1 AND started_at < ?2) OR (ended_at >= ?1 AND ended_at < ?2)";
+    let in_day = "(s.started_at >= ?1 AND s.started_at < ?2) OR (s.ended_at >= ?1 AND s.ended_at < ?2)";
+    // 当天概况只计用户在维护的工作：排除回收站、空会话和已废弃项目（含临时目录现场）
+    let visible = "s.deleted_at IS NULL AND s.message_count > 0
+        AND NOT EXISTS (SELECT 1 FROM projects ap WHERE ap.id = s.project_id AND ap.archived_at IS NOT NULL)";
     // messages 口径：跨日会话的全部历史消息计入其落入当日的每一天（计数语义
     // 是"活跃度"而非"当日新消息"——SUM 比 message 表按时间戳数便宜且够用）
     let (sessions, messages): (i64, i64) = tx.query_row(
-        &format!("SELECT COUNT(*), COALESCE(SUM(message_count),0) FROM sessions WHERE deleted_at IS NULL AND ({in_day})"),
+        &format!("SELECT COUNT(*), COALESCE(SUM(s.message_count),0) FROM sessions s WHERE {visible} AND ({in_day})"),
         params![lo, hi],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -273,7 +276,7 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
             &format!(
                 "SELECT p.id, p.name, p.path, COUNT(*), COALESCE(SUM(s.message_count),0)
                  FROM sessions s JOIN projects p ON p.id = s.project_id
-                 WHERE s.deleted_at IS NULL AND ({in_day})
+                 WHERE {visible} AND ({in_day})
                  GROUP BY p.id ORDER BY COUNT(*) DESC"
             ),
         )?;
@@ -296,10 +299,10 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
     let memories_added = count("SELECT COUNT(*) FROM memories WHERE created_at >= ?1 AND created_at < ?2")?;
     let decisions_added = count(
         "SELECT COUNT(*) FROM memories WHERE created_at >= ?1 AND created_at < ?2 AND type IN ('decision','rule')")?;
-    let artifacts_added = count(
+    let artifacts_added = count(&format!(
         "SELECT COUNT(*) FROM session_artifacts a JOIN sessions s ON s.id = a.session_id
-         WHERE s.deleted_at IS NULL AND a.created_at >= ?1 AND a.created_at < ?2",
-    )?;
+         WHERE {visible} AND a.created_at >= ?1 AND a.created_at < ?2"
+    ))?;
     let open_tasks = crate::db::open_tasks(&tx, None)?;
     // 工作账本：会话是保存单位，项目才是用户理解每天工作的单位。这里只做
     // 确定性归并，标题/末条回复/产物/待办都保留来源，不生成新的事实。
@@ -317,7 +320,7 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
                          WHERE m.session_id=s.id AND m.kind='assistant'
                          ORDER BY m.line_no DESC,m.ord DESC LIMIT 1),
                         (SELECT COUNT(*) FROM session_artifacts a WHERE a.session_id=s.id)
-                 FROM sessions s WHERE s.project_id=?3 AND s.deleted_at IS NULL AND ({in_day})
+                 FROM sessions s WHERE s.project_id=?3 AND {visible} AND ({in_day})
                  ORDER BY COALESCE(s.ended_at,s.started_at) DESC,s.id"
             ))?;
             let rows = stmt.query_map(params![lo, hi, pid], |r| Ok(json!({
@@ -335,7 +338,7 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
         let agents = {
             let mut stmt = tx.prepare(&format!(
                 "SELECT s.agent,COUNT(*),COALESCE(SUM(s.message_count),0)
-                 FROM sessions s WHERE s.project_id=?3 AND s.deleted_at IS NULL AND ({in_day})
+                 FROM sessions s WHERE s.project_id=?3 AND {visible} AND ({in_day})
                  GROUP BY s.agent ORDER BY COUNT(*) DESC,s.agent"
             ))?;
             let rows = stmt.query_map(params![lo, hi, pid], |r| Ok(json!({

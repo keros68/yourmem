@@ -448,6 +448,20 @@ fn migrate(conn: &Connection) -> Result<()> {
                    AND s.ended_at IS NOT NULL
                    AND julianday(s.ended_at) < julianday(session_artifacts.created_at));",
         )?;
+        // 同版本：已有的临时目录项目一次性归入已废弃项目（新项目在 upsert_project 处理）
+        let temp_projects: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT id, path FROM projects WHERE archived_at IS NULL")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, path)| crate::is_temp_path(path))
+                .map(|(id, _)| id)
+                .collect()
+        };
+        let now = now_iso();
+        for id in temp_projects {
+            conn.execute("UPDATE projects SET archived_at = ?2 WHERE id = ?1", params![id, now])?;
+        }
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -481,10 +495,13 @@ pub fn project_root_for(cwd: &str) -> (String, String) {
 
 pub fn upsert_project(conn: &Connection, path: &str, name: &str) -> Result<i64> {
     let now = now_iso();
+    // 系统临时目录下的工作目录是 agent 的临时运行现场：新建时即归入已废弃项目，
+    // 数据照常采集；用户恢复后不再改动（ON CONFLICT 不碰 archived_at）
+    let archived = crate::is_temp_path(path).then(|| now.clone());
     conn.execute(
-        "INSERT INTO projects(path, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)
+        "INSERT INTO projects(path, name, created_at, updated_at, archived_at) VALUES (?1, ?2, ?3, ?3, ?4)
          ON CONFLICT(path) DO UPDATE SET updated_at = excluded.updated_at",
-        params![path, name, now],
+        params![path, name, now, archived],
     )?;
     let id: i64 = conn.query_row("SELECT id FROM projects WHERE path = ?1", params![path], |r| r.get(0))?;
     Ok(id)
@@ -926,7 +943,7 @@ fn list_projects_q(conn: &Connection, archived: bool) -> Result<Vec<Value>> {
                 GROUP_CONCAT(DISTINCT s.agent) AS agents,
                 p.archived_at
          FROM projects p
-         LEFT JOIN sessions s ON s.project_id = p.id AND s.deleted_at IS NULL
+         LEFT JOIN sessions s ON s.project_id = p.id AND s.deleted_at IS NULL AND s.message_count > 0
          WHERE {filter}
          GROUP BY p.id ORDER BY last_activity DESC"
     ))?;
@@ -1281,7 +1298,8 @@ pub fn recent_sessions(conn: &Connection, project_id: Option<i64>, limit: u32) -
                    AND substr(ltrim(m.content), 1, 1) NOT IN ('<', '#')
                  ORDER BY m.line_no, m.ord LIMIT 1)
          FROM sessions s LEFT JOIN projects p ON p.id = s.project_id
-         WHERE s.deleted_at IS NULL AND (?1 IS NULL OR s.project_id = ?1)
+         WHERE s.deleted_at IS NULL AND s.message_count > 0 AND p.archived_at IS NULL
+           AND (?1 IS NULL OR s.project_id = ?1)
          ORDER BY s.ended_at DESC LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![project_id, limit as i64], |r| {
@@ -1324,7 +1342,11 @@ pub use purge::{TRASH_RETENTION_DAYS, purge_plan, purge_session, gc_sweep, trash
 
 pub fn trash_sessions(conn: &Connection) -> Result<Vec<Value>> {
     let mut stmt = conn.prepare(
-        "SELECT s.id, s.agent, p.name, s.started_at, s.ended_at, s.message_count, s.deleted_at
+        "SELECT s.id, s.agent, p.name, s.started_at, s.ended_at, s.message_count, s.deleted_at,
+                (SELECT replace(substr(m.content, 1, 160), char(10), ' ')
+                 FROM messages m WHERE m.session_id = s.id AND m.kind = 'user'
+                   AND substr(ltrim(m.content), 1, 1) NOT IN ('<', '#')
+                 ORDER BY m.line_no, m.ord LIMIT 1)
          FROM sessions s LEFT JOIN projects p ON p.id = s.project_id
          WHERE s.deleted_at IS NOT NULL ORDER BY s.deleted_at DESC",
     )?;
@@ -1347,6 +1369,7 @@ pub fn trash_sessions(conn: &Connection) -> Result<Vec<Value>> {
             "ended_at": r.get::<_, Option<String>>(4)?,
             "messages": r.get::<_, i64>(5)?,
             "deleted_at": deleted_at,
+            "preview": r.get::<_, Option<String>>(7)?,
             "overdue": overdue,
             "remaining_days": remaining_days,
         }))
