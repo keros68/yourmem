@@ -517,3 +517,37 @@ fn render_markdown_sanitizes_free_text() {
     assert!(art_line.contains("`` /tmp/dos-proj/we`ird.md ``"),
         "含反引号路径必须加宽围栏: {art_line}");
 }
+
+#[test]
+fn artifacts_count_on_the_day_they_were_made_not_the_import_day() {
+    let home = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let dir = src.path().join("claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("old.jsonl"), concat!(
+        r#"{"type":"user","cwd":"/tmp/art-proj","uuid":"o1","timestamp":"2026-08-23T09:00:00Z","message":{"role":"user","content":"写个报告"}}"#, "\n",
+        r#"{"type":"assistant","uuid":"o2","timestamp":"2026-08-23T09:05:00Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/tmp/art-proj/report.md","content":"x"}}]}}"#, "\n",
+    )).unwrap();
+    let mut conn = db::open(home.path()).unwrap();
+    ingest::import_all(&mut conn, home.path(), &[(adapters::AGENT_CLAUDE, dir)], None, None).unwrap();
+
+    assert_eq!(dossier::daily_digest(&conn, "2026-08-23").unwrap()["artifacts_added"], 1);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    assert_eq!(dossier::daily_digest(&conn, &today).unwrap()["artifacts_added"], 0, "导入当天不算新增");
+}
+
+#[test]
+fn schema_v13_moves_imported_artifact_times_to_the_session_end() {
+    let (home, _pid) = fixture();
+    {
+        let conn = db::open(home.path()).unwrap();
+        conn.execute_batch(
+            "UPDATE session_artifacts SET created_at = '2026-10-01T02:00:00.000Z';
+             PRAGMA user_version = 12;",
+        ).unwrap();
+    }
+    let conn = db::open(home.path()).unwrap();
+    let at: String = conn.query_row(
+        "SELECT created_at FROM session_artifacts WHERE session_id = 'claude:dos1'", [], |r| r.get(0)).unwrap();
+    assert!(at.starts_with("2026-08-23T09:01"), "{at}");
+}

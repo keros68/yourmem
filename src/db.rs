@@ -282,7 +282,7 @@ pub fn open(home: &Path) -> Result<Connection> {
 /// Current schema version, stamped into `PRAGMA user_version` by migrate().
 /// Bump this (and add a migration step below) whenever the schema changes;
 /// bundle manifests record it (DESIGN-0.3 §5.1 `schema_version`).
-pub const SCHEMA_VERSION: i32 = 12;
+pub const SCHEMA_VERSION: i32 = 13;
 
 /// Idempotent column additions for databases created by older versions.
 /// `user_version` drives the fast path: a database already stamped with the
@@ -426,15 +426,29 @@ fn migrate(conn: &Connection) -> Result<()> {
     // 旧库的 messages_ai/ad 无 WHEN 过滤（全量单表索引）——换触发器 + 整表重建
     // 对话层索引。三步同事务：崩溃整体回滚到旧形态，下次 open 重走。重建量
     // ≈ 非工具输出行数（真实库约 14 万行，分钟内）；磁盘回收交给 index compact。
-    conn.execute_batch(
-        "BEGIN IMMEDIATE;
-         DROP TRIGGER IF EXISTS messages_ai;
-         DROP TRIGGER IF EXISTS messages_ad;
-         INSERT INTO messages_fts(messages_fts) VALUES('delete-all');
-         INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages WHERE kind <> 'tool_result';
-         COMMIT;",
-    )?;
+    if version < 12 {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             DROP TRIGGER IF EXISTS messages_ai;
+             DROP TRIGGER IF EXISTS messages_ad;
+             INSERT INTO messages_fts(messages_fts) VALUES('delete-all');
+             INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages WHERE kind <> 'tool_result';
+             COMMIT;",
+        )?;
+    }
     conn.execute_batch(TRIGGERS_SQL)?;
+    // v13：产物时间原先记的是导入时刻，首次导入会把全部历史产物算成"当天新增"。
+    // 晚于所属会话结束时间的记录即事后导入，改为会话结束时间（幂等）。
+    if version < 13 {
+        conn.execute_batch(
+            "UPDATE session_artifacts SET created_at = (
+                 SELECT s.ended_at FROM sessions s WHERE s.id = session_artifacts.session_id)
+             WHERE EXISTS (
+                 SELECT 1 FROM sessions s WHERE s.id = session_artifacts.session_id
+                   AND s.ended_at IS NOT NULL
+                   AND julianday(s.ended_at) < julianday(session_artifacts.created_at));",
+        )?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -1878,9 +1892,11 @@ pub fn insert_artifacts(
     project_id: Option<i64>,
     artifacts: &[crate::models::NewArtifact],
 ) -> Result<()> {
+    // 产物时间取所属会话的结束时间（调用方已写入本批消息的会话行）：实时采集时
+    // 即最新消息时间，补导历史时是会话实际结束时间，而不是导入时刻
     let mut stmt = conn.prepare(
         "INSERT OR IGNORE INTO session_artifacts(session_id, project_id, path, tool, created_at)
-         VALUES (?1,?2,?3,?4,?5)",
+         VALUES (?1,?2,?3,?4, COALESCE((SELECT ended_at FROM sessions WHERE id = ?1), ?5))",
     )?;
     for a in artifacts {
         stmt.execute(params![session_id, project_id, a.path, a.tool, now_iso()])?;
