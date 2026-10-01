@@ -15,37 +15,19 @@ const activityStamp = (a) => String(a?.ended_at || a?.started_at || "");
 
 const agentDot = (agent) => `<span class="activity-agent ${esc(agent)}"><i></i>${esc(agent)}</span>`;
 
-export function todayOverviewHtml(digest) {
+function dayStatsHtml(digest) {
   const projects = digest?.project_activity || [];
-  const recent = projects.flatMap((p) => (p.activities || []).map((a) => ({ ...a, project: p.project })))
-    .sort((a, b) => activityStamp(b).localeCompare(activityStamp(a))).slice(0, 5);
-  const tasks = (digest?.open_tasks || []).slice(0, 3);
-  const handoffs = (digest?.recent_handoffs || []).slice(0, 2);
-  const agentsToday = new Set(projects.flatMap((p) => (p.activities || []).map((a) => a.agent))).size;
+  const agents = new Set(projects.flatMap((p) => (p.activities || []).map((a) => a.agent))).size;
   const stats = [
-    ["folder", projects.length, "活跃项目", "今日有对话"],
-    ["message-circle", digest?.sessions || 0, "新增对话", `${agentsToday} 个 Agent`],
-    ["archive", digest?.messages || 0, "消息", "今日活跃会话"],
-    ["file-text", digest?.artifacts_added || 0, "产物", "今日新增"],
+    ["folder", projects.length, "活跃项目", "当天有对话"],
+    ["message-circle", digest?.sessions || 0, "对话", `${agents} 个 Agent`],
+    ["archive", digest?.messages || 0, "消息", "当天活跃对话"],
+    ["file-text", digest?.artifacts_added || 0, "产物", "当天新增"],
   ];
-  const statHtml = stats.map(([icon, value, label, hint]) => `<article class="today-stat">
+  return `<div class="today-stats">${stats.map(([icon, value, label, hint]) => `<article class="today-stat">
     <span class="today-stat-icon"><img src="icons/${icon}.svg" alt=""></span>
     <strong>${Number(value).toLocaleString("zh-CN")}</strong><span>${label}</span><small>${hint}</small>
-  </article>`).join("");
-  const recentHtml = recent.length ? recent.map((a) => `<button class="today-activity" data-work-session="${esc(a.session_id)}">
-    <time>${fmtTime(activityStamp(a))}</time><span class="today-activity-main"><strong>${esc(clipped(a.title, 90) || "未命名对话")}</strong>
-    <span>${esc(clipped(a.tail, 150) || "尚无 Agent 回复")}</span></span>${agentDot(a.agent)}</button>`).join("")
-    : '<div class="today-empty">今天还没有活动</div>';
-  const taskHtml = tasks.length ? tasks.map((t) => `<div class="today-task"><img src="icons/square.svg" alt=""><span><b>${esc(clipped(t.content, 76))}</b><small>${esc(t.project || "全局")}${t.agent ? ` · ${esc(t.agent)}` : ""}</small></span></div>`).join("")
-    : '<div class="today-empty">暂无未完成任务</div>';
-  const handoffHtml = handoffs.length ? handoffs.map((h) => `<article class="today-handoff"><header><b>${esc(h.project)}</b><time>${fmtTime(h.created_at)}</time></header><p>${esc(clipped(h.next_steps || h.title, 120))}</p></article>`).join("")
-    : '<div class="today-empty">暂无交接</div>';
-  return `<div class="today-heading"><div><span>${esc(digest?.day || "")}</span><h1>今天 <em>Today</em></h1><p>快速掌握今天发生了什么；需要逐项追踪时进入动态。</p></div>
-    <button class="btn primary" id="open-activity">查看动态</button></div>
-    <div class="today-stats">${statHtml}</div>
-    <div class="today-overview"><section class="today-panel today-recent"><header><div><h2>最近活动</h2><p>按时间汇总各 Agent 的最新工作</p></div><button id="open-activity-all">查看全部 →</button></header><div>${recentHtml}</div></section>
-      <div class="today-side"><section class="today-panel"><header><div><h2>未完成任务</h2><p>${digest?.open_tasks?.length || 0} 项需要继续推进</p></div></header><div class="today-task-list">${taskHtml}</div></section>
-      <section class="today-panel"><header><div><h2>最近交接</h2><p>跨 Agent 延续工作的入口</p></div></header><div>${handoffHtml}</div></section></div></div>`;
+  </article>`).join("")}</div>`;
 }
 
 const activityTabs = (project, active) => [
@@ -98,7 +80,9 @@ export function activityPageHtml(digest, state = {}) {
   const projectRows = projects.map((p) => `<button class="activity-project ${selected === p ? "on" : ""}" data-activity-project="${p.project_id}"><header><strong>${esc(p.project)}</strong><time>${fmtTime(activityStamp(p.activities?.[0]))}</time></header>
     <p>${esc(clipped(p.activities?.[0]?.tail || "当天有活动记录", 92))}</p><footer><span>${p.sessions} 对话</span><span>${p.messages} 消息</span><i>${(p.agents || []).map((a) => `<b class="dot ${esc(a.agent)}"></b>`).join("")}</i></footer></button>`).join("");
   const today = state.today || "";
-  return `<div class="activity-heading"><span>Daily activity</span><h1>动态</h1><p>按日期、项目和 Agent 查看工作进展；每条信息都可以回到来源对话。</p></div>
+  const isToday = !today || digest?.day === today;
+  return `<div class="activity-heading"><span>${esc(digest?.day || "")}</span><h1>${isToday ? "今天" : "当天"}${isToday ? " <em>Today</em>" : ""}</h1><p>按项目和 Agent 查看工作进展；每条信息都可以回到来源对话。</p></div>
+    ${dayStatsHtml(digest)}
     <div class="activity-toolbar"><div class="activity-date"><button id="activity-prev" title="前一天"><img src="icons/chevron-left.svg" alt=""></button><label><input id="activity-day" type="date" value="${esc(digest?.day || "")}" ${today ? `max="${esc(today)}"` : ""}></label><button id="activity-next" title="后一天" ${today && digest?.day >= today ? "disabled" : ""}><img src="icons/chevron-right.svg" alt=""></button></div>
       <label class="activity-select"><span>项目</span><select id="activity-project-filter"><option value="all">全部项目</option>${projectOptions}</select></label>
       <label class="activity-select"><span>Agent</span><select id="activity-agent-filter"><option value="all">全部 Agent</option>${agentOptions}</select></label>

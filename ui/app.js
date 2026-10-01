@@ -2,7 +2,7 @@ import { loadProjectRecall } from "./project-recall.js";
 import { graphDepths } from "./graph-layout.js";
 import { createSessionDrawer } from "./session-drawer.js";
 import { snapshotPanelHtml, bindSnapshotPanel } from "./snapshot-panel.js";
-import { todayOverviewHtml, activityPageHtml, aiSummaryHtml } from "./workbench.js";
+import { activityPageHtml, aiSummaryHtml } from "./workbench.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -91,24 +91,12 @@ function maintenanceNoticeHtml(st) {
   return `<div class="notice"><span>后台自检发现 ${items.length} 个问题：${items.map(esc).join("；")}</span><button class="btn small" id="maint-open">打开设置</button></div>`;
 }
 
-async function renderToday() {
-  const [dg, maint] = await Promise.all([invoke("daily_digest"), invoke("maintenance_status").catch(() => ({}))]);
-  $("#page-today").innerHTML = maintenanceNoticeHtml(maint) + todayOverviewHtml(dg);
-  const maintOpen = $("#maint-open");
-  if (maintOpen) maintOpen.onclick = () => { settingsTab = "general"; document.querySelector('.nav[data-page="settings"]').click(); };
-  document.querySelectorAll("#page-today [data-work-session]").forEach((b) => {
-    b.onclick = () => showSession(b.dataset.workSession);
-  });
-  const open = () => document.querySelector('.nav[data-page="activity"]').click();
-  $("#open-activity").onclick = open;
-  $("#open-activity-all").onclick = open;
-}
-
 const localDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 let activityDay = localDay(new Date());
 // 停留在"今天"时跟随日期：常驻托盘跨过午夜后打开的仍是当天
 let activityFollowsToday = true;
 let activityDigest = null;
+let maintState = {};
 let activityState = { project: "all", agent: "all", selected: null, tab: "activities" };
 let activityAiResponse = null;
 const activitySaved = new Set();
@@ -184,8 +172,10 @@ async function showActivityAi(digest) {
 }
 
 function paintActivity() {
-  const root = $("#page-activity");
-  root.innerHTML = activityPageHtml(activityDigest, { ...activityState, today: localDay(new Date()) });
+  const root = $("#page-today");
+  root.innerHTML = maintenanceNoticeHtml(maintState) + activityPageHtml(activityDigest, { ...activityState, today: localDay(new Date()) });
+  const maintOpen = $("#maint-open");
+  if (maintOpen) maintOpen.onclick = () => { settingsTab = "general"; document.querySelector('.nav[data-page="settings"]').click(); };
   root.querySelectorAll("[data-work-session]").forEach((b) => { b.onclick = () => showSession(b.dataset.workSession); });
   root.querySelectorAll("[data-handoff-path]").forEach((b) => { b.onclick = () => invoke("open_in_finder", { path: b.dataset.handoffPath, reveal: true }).catch((e) => toast(String(e))); });
   root.querySelectorAll("[data-activity-project]").forEach((b) => {
@@ -196,7 +186,7 @@ function paintActivity() {
     activityState.project = e.target.value; activityState.selected = e.target.value === "all" ? null : e.target.value; activityState.tab = "activities"; paintActivity();
   };
   $("#activity-agent-filter").onchange = (e) => { activityState.agent = e.target.value; activityState.selected = null; paintActivity(); };
-  const goDay = (day) => { activityDay = day; activityFollowsToday = day === localDay(new Date()); pages.activity(); };
+  const goDay = (day) => { activityDay = day; activityFollowsToday = day === localDay(new Date()); pages.today(); };
   $("#activity-day").onchange = (e) => { if (e.target.value) goDay(e.target.value); };
   $("#activity-prev").onclick = () => goDay(shiftDay(activityDay, -1));
   $("#activity-next").onclick = () => goDay(shiftDay(activityDay, 1));
@@ -211,9 +201,13 @@ function paintActivity() {
   $("#activity-ai").onclick = () => showActivityAi(activityDigest);
 }
 
-async function renderActivity() {
+// 今天页：当天概况 + 按项目和 Agent 的动态明细；停留在今天时跟随日期
+async function renderToday() {
   if (activityFollowsToday) activityDay = localDay(new Date());
-  activityDigest = await invoke("daily_digest", { day: activityDay });
+  [activityDigest, maintState] = await Promise.all([
+    invoke("daily_digest", { day: activityDay }),
+    invoke("maintenance_status").catch(() => ({})),
+  ]);
   paintActivity();
 }
 
@@ -716,6 +710,7 @@ let memStatus = "";
 let memAgent = "";
 let memType = "";
 let memView = "list";
+const memAuxOpen = new Set(); // 记忆页底部折叠区的展开状态，重绘后保持
 const AGENT_LIST = ["", "claude", "codex", "opencode", "zcode", "kimi", "hermes", "pi"];
 const shortId = (sid) => (sid ? sid.split(":")[1] || sid : "");
 
@@ -739,7 +734,6 @@ async function renderMemory() {
   const counts = d.memories.length;
   $("#page-memory").innerHTML = `
     <h1>记忆 <span class="en">Memory</span></h1>
-    <details class="memcard"><summary>新增记忆模板</summary><div class="content">用于把可复用的经验、决策或偏好保存为一条记忆；它不会从对话中自动生成。按实际证据填写，未验证内容标为待验证，再通过 agent 的 save_memory 或 CLI memory add 保存。</div><pre>${esc(EXPERIENCE_TEMPLATE)}</pre><button class="btn small" data-copy="${esc(EXPERIENCE_TEMPLATE)}">复制模板</button></details>
     <div class="searchbar">
       <select id="mem-status">
         ${memView === "graph" ? '<option value="all">全部状态（关系图）</option>' : ""}
@@ -768,14 +762,23 @@ async function renderMemory() {
     <div style="color:var(--dim);margin-bottom:10px">${memView !== "graph" && counts >= 200 ? "最近 200 条" : `${counts} 条`}${memView === "graph" ? " · 显示全部来源与类型，点节点高亮演变链" : ""}</div>
     ${suggestedCount >= 21 ? `<div class="digest digest-error">待确认记忆积压 20+ 条（容量纪律：先处理积压，再新增）</div>` : ""}
     ${memView === "graph" ? memoryGraphHtml(d.memories) : `<div class="scrollbox">${d.memories.map(memCard).join("") || '<div class="empty">暂无记忆</div>'}</div>`}
-    <h2 style="margin-top:24px">原生 memory 备份</h2>
-    <div style="color:var(--dim);margin-bottom:8px">agent 自己的 memory 文件（MEMORY.md / AGENTS.md）的整文件快照与修订历史——只读备份，独立于上方治理记忆</div>
-    ${nf.memory_files.map((f) => `
-      <div class="memcard clickable" data-mfid="${f.id}">
-        <div class="content" style="word-break:break-all">${esc(f.path)}</div>
-        <div class="meta"><span class="pill ${esc(f.agent)}">${esc(f.agent)}</span>
-          <span>${esc(f.scope)}</span><span>${f.revisions} 个修订</span><span>${fmtTime(f.last_captured)}</span></div>
-      </div>`).join("") || '<div class="empty">暂无（执行 import 后显示）</div>'}`;
+    <details class="mem-aux" data-aux="files" style="margin-top:24px" ${memAuxOpen.has("files") ? "open" : ""}>
+      <summary>原生记忆文件（${nf.memory_files.length}）</summary>
+      <div style="color:var(--dim);margin:8px 0">agent 自己的 MEMORY.md / AGENTS.md 的整文件快照与修订历史，只读，独立于上方记忆</div>
+      ${nf.memory_files.map((f) => `
+        <div class="memcard clickable" data-mfid="${f.id}">
+          <div class="content" style="word-break:break-all">${esc(f.path)}</div>
+          <div class="meta"><span class="pill ${esc(f.agent)}">${esc(f.agent)}</span>
+            <span>${esc(f.scope)}</span><span>${f.revisions} 个修订</span><span>${fmtTime(f.last_captured)}</span></div>
+        </div>`).join("") || '<div class="empty">暂无</div>'}
+    </details>
+    <details class="mem-aux" data-aux="template" ${memAuxOpen.has("template") ? "open" : ""}>
+      <summary>新增记忆模板</summary>
+      <div class="memcard"><div class="content">用于把可复用的经验、决策或偏好保存为一条记忆；它不会从对话中自动生成。按实际证据填写，未验证内容标为待验证，再通过 agent 的 save_memory 或 CLI memory add 保存。</div><pre>${esc(EXPERIENCE_TEMPLATE)}</pre><button class="btn small" data-copy="${esc(EXPERIENCE_TEMPLATE)}">复制模板</button></div>
+    </details>`;
+  document.querySelectorAll("#page-memory .mem-aux").forEach((el) => {
+    el.addEventListener("toggle", () => { if (el.open) memAuxOpen.add(el.dataset.aux); else memAuxOpen.delete(el.dataset.aux); });
+  });
   $("#mem-status").value = memView === "graph" ? "all" : memStatus;
   $("#mem-type").value = memView === "graph" ? "" : memType;
   document.querySelectorAll("#page-memory [data-mem-agent]").forEach((el) => {
@@ -1028,39 +1031,11 @@ async function renderSettings() {
       </div>`)}
 
     ${panel("backup", `
-      <h2>备份与导出位置</h2>
+      <h2>自动备份</h2>
       <div class="memcard">
-        <div class="meta" style="margin-top:0">这里只存放手动生成的数据库快照、会话导出和删除档案。保存新位置时会迁移这些已有文件，不会移动软件正在使用的数据库和会话原文归档。</div>
-        <div class="searchbar">
-          <input type="text" id="backup-dir" style="flex:1" placeholder="绝对路径，如 D:\\yourmem-backup" value="${esc(bd.configured)}" />
-          <button class="btn" id="backup-dir-pick">选择文件夹</button>
-          <button class="btn primary" id="backup-dir-save">保存</button>
-        </div>
-        <div id="backup-dir-report" class="meta" style="margin-top:8px">当前：${esc(bd.effective)}</div>
-      </div>
-      <h2>存储占用</h2>
-      <div class="memcard">
-        <div class="meta" style="margin-top:0">核心数据是软件正在使用的数据；备份与导出是按需生成的文件，两者不是两份重复备份。</div>
-        <div class="searchbar" style="margin-top:0">
-          <button class="btn" id="storage-usage">查看占用</button>
-          <button class="btn" id="storage-compact">回收空闲空间</button>
-          <button class="btn" id="orphan-plan">检查无引用原件</button>
-          <button class="btn danger hidden" id="orphan-run">确认删除无引用原件</button>
-        </div>
+        <div id="auto-backup-status" class="meta" style="margin-top:0">读取中…</div>
         <div id="storage-report"></div>
       </div>
-      <h2>搜索索引范围</h2>
-      <div class="memcard">
-        <div class="meta" style="margin-top:0">默认只索引对话内容，工具输出可按短词检索，数据库体积可控。开启全文索引后，工具输出全部可搜，数据库体积明显增大，重建需数分钟。</div>
-        <div class="searchbar">
-          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-            <input type="checkbox" id="tools-index" ${idx.tool_index_full ? "checked" : ""} />
-            <span>全文索引工具输出</span>
-          </label>
-          <span id="tools-index-state" style="color:var(--faint);font-size:12px">已索引 ${idx.indexed_tool_rows} / ${idx.tool_messages} 行</span>
-        </div>
-      </div>
-      ${snapshotPanelHtml()}
       <h2>完整备份与恢复</h2>
       <div class="memcard">
         <div class="meta" style="margin-top:0">完整备份包含数据库和引用的原始记录，保存为 .tar.gz；单独的数据库快照不足以恢复原件。</div>
@@ -1077,6 +1052,40 @@ async function renderSettings() {
         </div>
         <div id="bundle-report" role="status" aria-live="polite" style="line-height:1.6;overflow-wrap:anywhere"></div>
       </div>
+      <h2>备份位置</h2>
+      <div class="memcard">
+        <div class="meta" style="margin-top:0">存放自动快照、完整备份、会话导出和删除档案。保存新位置时会迁移这些已有文件，不会移动核心数据。</div>
+        <div class="searchbar">
+          <input type="text" id="backup-dir" style="flex:1" placeholder="绝对路径，如 D:\\yourmem-backup" value="${esc(bd.configured)}" />
+          <button class="btn" id="backup-dir-pick">选择文件夹</button>
+          <button class="btn primary" id="backup-dir-save">保存</button>
+        </div>
+        <div id="backup-dir-report" class="meta" style="margin-top:8px">当前：${esc(bd.effective)}</div>
+      </div>
+      <details class="mem-aux" id="backup-advanced">
+        <summary>高级：快照列表、搜索索引范围、空间整理、离线档案</summary>
+      <h2>搜索索引范围</h2>
+      <div class="memcard">
+        <div class="meta" style="margin-top:0">默认只索引对话内容，工具输出可按短词检索，数据库体积可控。开启全文索引后，工具输出全部可搜，数据库体积明显增大，重建需数分钟。</div>
+        <div class="searchbar">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" id="tools-index" ${idx.tool_index_full ? "checked" : ""} />
+            <span>全文索引工具输出</span>
+          </label>
+          <span id="tools-index-state" style="color:var(--faint);font-size:12px">已索引 ${idx.indexed_tool_rows} / ${idx.tool_messages} 行</span>
+        </div>
+      </div>
+      ${snapshotPanelHtml()}
+      <h2>空间整理</h2>
+      <div class="memcard">
+        <div class="meta" style="margin-top:0">回收数据库删除后留下的空闲空间，或清理不再被任何对话引用的原件。</div>
+        <div class="searchbar">
+          <button class="btn" id="storage-compact">回收空闲空间</button>
+          <button class="btn" id="orphan-plan">检查无引用原件</button>
+          <button class="btn danger hidden" id="orphan-run">确认删除无引用原件</button>
+        </div>
+        <div id="tidy-report"></div>
+      </div>
       <h2>彻底删除的离线档案</h2>
       <div class="memcard">
         <div class="meta" style="margin-top:0">清空超期对话和启动时的自动清理会把原件移入这里；单条或选中彻底删除不保留原件。删除档案后，对应内容不再保存在磁盘上。</div>
@@ -1085,7 +1094,8 @@ async function renderSettings() {
           <button class="btn danger hidden" id="archives-clear">清空全部</button>
         </div>
         <div id="archives-report"></div>
-      </div>`)}
+      </div>
+      </details>`)}
 
     ${panel("setup", `
       <h2>调用状态</h2>
@@ -1503,7 +1513,26 @@ async function renderSettings() {
     toast(`已清空 ${r.removed} 项档案`);
     drawArchives();
   });
-  // 存储占用 + 搜索索引范围（1.0.1 轻量化）
+  // 自动备份状态：后台维护（每周快照、每日自检）的最近结果
+  const drawAutoBackup = async () => {
+    const el = $("#auto-backup-status");
+    let m;
+    try { m = await invoke("maintenance_status"); } catch (e) { el.textContent = `读取失败：${e}`; return; }
+    const days = m.snapshot_interval_days || 0;
+    const snap = m.snapshot;
+    const next = m.snapshot_attempt_at ? new Date((m.snapshot_attempt_at + days * 86400) * 1000).toISOString() : null;
+    const snapLine = !days ? "自动快照已关闭"
+      : !snap ? `每 ${days} 天自动创建快照，首份将在后台完成`
+      : snap.ok ? `每 ${days} 天自动创建快照 · 上次 ${fmtTime(snap.at)} · 下次约 ${fmtTime(next)}`
+      : `<span class="proof-bad">上次自动快照失败（${fmtTime(snap.at)}）：${esc(snap.error)}</span>`;
+    const doc = m.doctor;
+    const docLine = !doc ? "每日自检尚未运行"
+      : doc.problems?.length ? `<span class="proof-bad">每日自检发现 ${doc.problems.length} 个问题（${fmtTime(doc.at)}）</span>`
+      : `每日自检正常 · ${fmtTime(doc.at)}`;
+    const mig = m.migration?.remaining ? `<br>正在把早期版本的原件迁入对象库，已完成 ${m.migration.moved} 项` : "";
+    el.innerHTML = `${snapLine}<br>${docLine}${mig}`;
+  };
+  // 存储占用
   const drawStorage = async () => {
     try {
       const u = await invoke("storage_usage");
@@ -1515,25 +1544,26 @@ async function renderSettings() {
         <tr><td>会话原文归档</td><td class="c-num">${fmtBytes(u.objects_bytes)}</td></tr>
         ${st.free_bytes > 1048576 ? `<tr><td>其中空闲页可回收</td><td class="c-num">${fmtBytes(st.free_bytes)}</td></tr>` : ""}
         </table>
-        <div class="meta" style="margin:14px 14px 2px"><strong>备份与导出</strong> · 手动生成，不影响软件日常使用<br><span style="overflow-wrap:anywhere">${esc(u.backups_dir)}</span></div>
+        <div class="meta" style="margin:14px 14px 2px"><strong>备份与导出</strong> · 自动快照与手动导出，用于核心数据损坏或丢失时恢复<br><span style="overflow-wrap:anywhere">${esc(u.backups_dir)}</span></div>
         <table><tr><td>快照、导出与删除档案</td><td class="c-num">${fmtBytes(u.backups_bytes)}</td></tr></table>`;
     } catch (e) {
       $("#storage-report").innerHTML = `<div class="meta">✗ 读取失败：${esc(String(e))}</div>`;
     }
   };
-  $("#storage-usage").onclick = () => { $("#storage-report").innerHTML = '<div class="meta">统计中…</div>'; drawStorage(); };
+  drawStorage();
+  drawAutoBackup();
   let orphanToken = null;
   $("#orphan-plan").onclick = async () => {
     const btn = $("#orphan-plan"); btn.disabled = true;
-    $("#storage-report").innerHTML = '<div class="meta">正在核对对象引用…</div>';
+    $("#tidy-report").innerHTML = '<div class="meta">正在核对对象引用…</div>';
     try {
       const p = await invoke("orphan_cleanup_plan");
       orphanToken = p.token;
-      $("#storage-report").innerHTML = p.files
+      $("#tidy-report").innerHTML = p.files
         ? `<div class="meta proof-bad">发现 ${p.files} 个无引用或临时对象，可释放 ${fmtBytes(p.bytes)}。删除不影响当前会话与记忆。</div>`
         : '<div class="meta cap-yes">✓ 未发现无引用对象</div>';
       $("#orphan-run").classList.toggle("hidden", !p.files);
-    } catch (e) { orphanToken = null; $("#storage-report").innerHTML = `<div class="meta proof-bad">✗ ${esc(String(e))}</div>`; }
+    } catch (e) { orphanToken = null; $("#tidy-report").innerHTML = `<div class="meta proof-bad">✗ ${esc(String(e))}</div>`; }
     finally { btn.disabled = false; }
   };
   armButton($("#orphan-run"), "确认删除无引用原件", "再次确认删除；当前引用会在执行前复查", async () => {
@@ -1541,7 +1571,7 @@ async function renderSettings() {
     const r = await invoke("orphan_cleanup_run", { token: orphanToken });
     orphanToken = null;
     $("#orphan-run").classList.add("hidden");
-    $("#storage-report").innerHTML = `<div class="meta cap-yes">✓ 已删除 ${r.removed} 个对象，释放 ${fmtBytes(r.reclaimed_bytes)}</div>`;
+    $("#tidy-report").innerHTML = `<div class="meta cap-yes">✓ 已删除 ${r.removed} 个对象，释放 ${fmtBytes(r.reclaimed_bytes)}</div>`;
   });
   let curBackupDir = bd.effective;
   $("#backup-dir-save").onclick = async () => {
@@ -1581,13 +1611,13 @@ async function renderSettings() {
   $("#storage-compact").onclick = async () => {
     const btn = $("#storage-compact");
     btn.disabled = true;
-    $("#storage-report").innerHTML = '<div class="meta">整理中，需数分钟…</div>';
+    $("#tidy-report").innerHTML = '<div class="meta">整理中，需数分钟…</div>';
     try {
       await invoke("compact_db");
       toast("整理完成");
       await drawStorage();
     } catch (e) {
-      $("#storage-report").innerHTML = `<div class="meta">✗ 整理失败：${esc(String(e))}</div>`;
+      $("#tidy-report").innerHTML = `<div class="meta">✗ 整理失败：${esc(String(e))}</div>`;
     } finally {
       btn.disabled = false;
     }
@@ -1680,7 +1710,7 @@ async function route(name, fn) {
     if (b) b.onclick = () => route(name, fn);
   }
 }
-const pageRenderers = { today: renderToday, activity: renderActivity, projects: renderProjects, sessions: renderSessions,
+const pageRenderers = { today: renderToday, projects: renderProjects, sessions: renderSessions,
   memory: renderMemory, search: renderSearch, settings: renderSettings };
 const pages = Object.fromEntries(Object.entries(pageRenderers).map(([name, fn]) => [name, () => route(name, fn)]));
 document.querySelectorAll(".nav").forEach((btn) => {
@@ -1715,7 +1745,7 @@ $("#btn-import").onclick = async () => {
 };
 
 // 后台采集到新内容后刷新当前页。抽屉打开、正在输入、有勾选项或停在其他页时不打断。
-const AUTO_REFRESH_PAGES = new Set(["today", "activity", "projects", "sessions"]);
+const AUTO_REFRESH_PAGES = new Set(["today", "projects", "sessions"]);
 window.__TAURI__.event?.listen?.("collected", () => {
   const current = document.querySelector(".nav.active")?.dataset.page;
   const el = document.activeElement;

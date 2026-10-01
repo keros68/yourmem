@@ -52,13 +52,13 @@ async function showSession(sessionId, lineNo = null, precompact = false, offset 
         <button class="btn small" id="btn-precompact">${precompact ? "返回完整对话" : "只看压缩前"}</button>
       </div>`
     : "";
-  // 资产证明卡占位（UI-DESIGN §3，0.4.1）：统计数据异步填，不拖慢 drawer 打开
-  const proofRow = `<div class="proof" id="proof-card">
-    <div class="proof-title">资产证明 <span style="color:var(--faint);font-weight:400">备份可校验</span></div>
-    <div class="proof-body" id="proof-body">加载中…</div>
+  // 备份卡（UI-DESIGN §3）：默认收成一行摘要，展开才看明细与操作；统计异步填，不拖慢打开
+  const proofRow = `<details class="proof" id="proof-card">
+    <summary class="proof-title">备份 <span class="proof-summary" id="proof-summary">读取中…</span></summary>
+    <div class="proof-body" id="proof-body"></div>
     <div class="meta" style="margin:6px 0 0" id="proof-actions"></div>
     <div class="proof-result" id="proof-result"></div>
-  </div>`;
+  </details>`;
   const countLine = precompact
     ? `${fmtTime(s.started_at)} → ${fmtTime(s.ended_at)} · 压缩前备份 ${d.total_messages} / ${s.message_count} 条<br>`
     : `${fmtTime(s.started_at)} → ${fmtTime(s.ended_at)} · ${s.message_count} 条消息<br>`;
@@ -111,18 +111,26 @@ async function loadProofCard(sessionId, request) {
     p = await invoke("session_proof", { sessionId });
   } catch (e) {
     if (!isCurrent(request)) return;
+    const summary = $("#proof-summary");
+    if (summary) summary.textContent = "暂无备份";
     const b = $("#proof-body");
-    if (b) b.textContent = `无 vault 归档（${e}）`;
+    if (b) b.textContent = `暂无备份（${e}）`;
     return;
   }
   if (!isCurrent(request)) return;
+  const summary = $("#proof-summary");
   const body = $("#proof-body");
   const actions = $("#proof-actions");
   if (!body || !actions) return;
+  if (summary) {
+    summary.innerHTML = p.objects_missing
+      ? `<span class="proof-bad">备份不完整，缺少 ${p.objects_missing} 项</span>`
+      : `已备份 ${p.lines} 行${p.source_exists ? "" : " · 原始文件已删除，备份是唯一副本"}`;
+  }
   body.innerHTML =
-    `vault 归档 ${p.lines} 行 · ${p.distinct_objects} 个内容寻址对象（${(p.objects_bytes / 1024).toFixed(1)} KB · 本对话独占 ${p.exclusive_objects} 个）` +
-    (p.objects_missing ? ` · <span class="proof-bad">磁盘缺失 ${p.objects_missing} 个对象</span>` : "") +
-    `<br>源文件${p.source_exists ? "仍在磁盘" : "已不在磁盘——vault 备份即原件"}：<code>${esc(p.file_path)}</code>`;
+    `已备份 ${p.lines} 行（${(p.objects_bytes / 1024).toFixed(1)} KB，其中 ${p.exclusive_objects} 项仅属于本对话）` +
+    (p.objects_missing ? ` · <span class="proof-bad">缺少 ${p.objects_missing} 项</span>` : "") +
+    `<br>原始文件${p.source_exists ? "" : "（已删除）"}：<code>${esc(p.file_path)}</code>`;
   actions.innerHTML = `
     <button class="btn small" id="proof-verify">校验</button>
     <button class="btn small" id="proof-export">导出原件</button>
@@ -136,18 +144,18 @@ async function loadProofCard(sessionId, request) {
       const v = await invoke("session_verify", { sessionId });
       if (!isCurrent(request)) return;
       result.innerHTML = v.ok
-        ? `<span class="proof-ok">✓ ${v.verified}/${v.objects} 个对象与归档一致（${fmtTime(v.checked_at)}）</span>`
-        : `<span class="proof-bad">✗ ${v.failed.length}/${v.objects} 个对象与归档不符或缺失：${esc(v.failed.slice(0, 3).join(", "))}${v.failed.length > 3 ? "…" : ""}</span>`;
+        ? `<span class="proof-ok">✓ ${v.verified}/${v.objects} 项与归档一致（${fmtTime(v.checked_at)}）</span>`
+        : `<span class="proof-bad">✗ ${v.failed.length}/${v.objects} 项与归档不符或缺失</span>`;
     } catch (err) { if (!isCurrent(request)) return; result.textContent = `校验失败：${err}`; }
     e.target.disabled = false;
   };
   $("#proof-export").onclick = async () => {
     if (!isCurrent(request)) return;
-    result.textContent = "按 vault 清单重建中…";
+    result.textContent = "导出中…";
     try {
       const r = await invoke("session_export", { sessionId });
       if (!isCurrent(request)) return;
-      result.innerHTML = `<span class="proof-ok">✓ 已逐字节重建 ${r.lines} 行</span> <code>${esc(r.path)}</code> <button class="btn small" data-copy="${esc(r.path)}">复制路径</button>`;
+      result.innerHTML = `<span class="proof-ok">✓ 已导出 ${r.lines} 行，与原件一致</span> <code>${esc(r.path)}</code> <button class="btn small" data-copy="${esc(r.path)}">复制路径</button>`;
       bindCopyButtons("#proof-result");
     } catch (err) { if (!isCurrent(request)) return; result.textContent = `导出失败：${err}`; }
   };
@@ -167,7 +175,7 @@ async function writebackFlow(sessionId, result, request) {
   if (!isCurrent(request)) return;
   const exists = plan.target_exists;
   result.innerHTML = `
-    <div style="margin:6px 0">将按 vault 归档逐字节重建 <b>${plan.vault_lines}</b> 行，写入：<br><code>${esc(plan.will_write[0])}</code>
+    <div style="margin:6px 0">将用备份还原 <b>${plan.vault_lines}</b> 行，写入：<br><code>${esc(plan.will_write[0])}</code>
     ${exists ? '<br><span class="proof-bad">目标已存在——覆盖前自动做 .bak 时间戳备份</span>' : ""}
     <br><span style="color:var(--faint)">一次性写回，非同步；随后在项目目录执行：<code>${esc(plan.resume_command || "—")}</code></span></div>
     <button class="btn small danger" id="wb-confirm"></button>`;

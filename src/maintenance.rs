@@ -27,12 +27,14 @@ fn due(last: &Value, interval: u64, now: u64) -> bool {
     last.as_u64().map_or(true, |t| now.saturating_sub(t) >= interval)
 }
 
-/// Last maintenance results; empty object before the first run.
+/// Last maintenance results plus the snapshot interval in effect.
 pub fn status(home: &Path) -> Value {
-    std::fs::read_to_string(state_path(home))
+    let mut state: Value = std::fs::read_to_string(state_path(home))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}))
+        .unwrap_or_else(|| json!({}));
+    state["snapshot_interval_days"] = json!(snapshot_interval_days(home));
+    state
 }
 
 fn save(home: &Path, state: &Value) -> Result<()> {

@@ -8,7 +8,7 @@ const context = vm.createContext({ Set });
 vm.runInContext(
   fs.readFileSync(path.join(__dirname, '../ui/workbench.js'), 'utf8')
     .replace(/export function /g, 'function ') +
-    '\nglobalThis.api = { todayOverviewHtml, activityPageHtml, aiSummaryHtml };',
+    '\nglobalThis.api = { activityPageHtml, aiSummaryHtml };',
   context,
 );
 
@@ -28,22 +28,20 @@ const digest = { day: '2026-09-09', sessions: 2, messages: 20, artifacts_added: 
     latest_handoff: { title: 'handoff', created_at: '2026-09-09T10:30:00Z', next_steps: 'publish after verification' },
   }] };
 
-test('Today stays compact and sends users to the separate Activity page', () => {
-  const html = context.api.todayOverviewHtml(digest);
-  assert.match(html, /alpha/);
-  assert.match(html, /查看动态/);
+test('Today shows the day overview above the activity detail', () => {
+  const html = context.api.activityPageHtml(digest, { today: '2026-09-09' });
+  assert.match(html, /<h1>今天/);
+  assert.match(html, /today-stats/);
+  assert.match(html, /活跃项目/);
   assert.match(html, /data-work-session="s1"/);
   assert.match(html, /&lt;fix&gt;/);
   assert.match(html, /implemented feature/);
-  assert.match(html, /run acceptance test/);
-  assert.match(html, /publish after verification/);
-  assert.doesNotMatch(html, /工作账本/);
+  const earlier = context.api.activityPageHtml(digest, { today: '2026-09-10' });
+  assert.match(earlier, /<h1>当天/);
 });
 
 test('Activity supports project, Agent and detail-tab navigation', () => {
   const html = context.api.activityPageHtml(digest, { project: 'all', agent: 'codex', selected: '7', tab: 'artifacts', today: '2026-09-09' });
-  assert.match(html, />动态</);
-  assert.match(html, /Daily activity/);
   assert.match(html, /全部项目/);
   assert.match(html, /全部 Agent/);
   assert.match(html, /data-activity-project="7"/);

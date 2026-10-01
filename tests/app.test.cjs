@@ -197,7 +197,7 @@ test('storage copy distinguishes core data from backups and exports', () => {
   assert.match(source, /存储与备份/);
   assert.match(source, /会话原文归档/);
   assert.match(source, /备份与导出/);
-  assert.match(source, /两者不是两份重复备份/);
+  assert.match(source, /用于核心数据损坏或丢失时恢复/);
   assert.doesNotMatch(source, /备份对象（objects）/);
 });
 
