@@ -148,6 +148,35 @@ pub fn is_temp_path(path: &str) -> bool {
     is_under_dir(path, &std::env::temp_dir())
 }
 
+/// ai-cross 编排的运行目录（`~/.aicross/runs/...`）：每次运行一个以 UUID 命名的
+/// 工作目录，与临时目录一样是运行现场。
+pub fn is_run_site_path(path: &str) -> bool {
+    resolve_home(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
+        .is_some_and(|home| is_under_dir(path, &home.join(".aicross").join("runs")))
+}
+
+/// 运行现场（临时目录或 ai-cross 运行目录）：会话照常采集，项目归入已废弃项目。
+pub fn is_scratch_path(path: &str) -> bool {
+    is_temp_path(path) || is_run_site_path(path)
+}
+
+/// Staging directory next to `path` (same disk as the backup being written or
+/// read), so full-size copies do not land on the system drive's temp folder.
+/// Falls back to the system temp directory when `path` has no writable parent.
+pub fn staging_dir_near(path: &Path) -> std::io::Result<tempfile::TempDir> {
+    let near = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .and_then(|p| {
+            std::fs::create_dir_all(p).ok()?;
+            tempfile::Builder::new().prefix(".yourmem-staging-").tempdir_in(p).ok()
+        });
+    match near {
+        Some(dir) => Ok(dir),
+        None => tempfile::tempdir(),
+    }
+}
+
 /// Backup name next to `path`: `<name>.bak-YYYYMMDD-HHMMSS`, with `-2`, `-3`…
 /// appended when a backup from the same second already exists.
 pub fn fresh_backup_path(path: &Path) -> PathBuf {
@@ -277,6 +306,17 @@ mod tests {
         assert_eq!(resolve_home(resolver(&[])), None);
         // HOMEDRIVE/HOMEPATH 缺一半也不算
         assert_eq!(resolve_home(resolver(&[("HOMEDRIVE", "C:")])), None);
+    }
+
+    #[test]
+    fn staging_dir_sits_next_to_the_backup_file() {
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("exports").join("full.tar.gz");
+        let staging = staging_dir_near(&out).unwrap();
+        assert_eq!(staging.path().parent(), out.parent());
+        let path = staging.path().to_path_buf();
+        drop(staging);
+        assert!(!path.exists(), "用完即删");
     }
 
     #[test]

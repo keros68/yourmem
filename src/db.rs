@@ -282,7 +282,7 @@ pub fn open(home: &Path) -> Result<Connection> {
 /// Current schema version, stamped into `PRAGMA user_version` by migrate().
 /// Bump this (and add a migration step below) whenever the schema changes;
 /// bundle manifests record it (DESIGN-0.3 §5.1 `schema_version`).
-pub const SCHEMA_VERSION: i32 = 13;
+pub const SCHEMA_VERSION: i32 = 14;
 
 /// Idempotent column additions for databases created by older versions.
 /// `user_version` drives the fast path: a database already stamped with the
@@ -440,20 +440,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 13 {
         fix_imported_artifact_times(conn)?;
         // 同版本：已有的临时目录项目一次性归入已废弃项目（新项目在 upsert_project 处理）
-        let temp_projects: Vec<i64> = {
-            let mut stmt = conn.prepare("SELECT id, path FROM projects WHERE archived_at IS NULL")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
-                .into_iter()
-                .filter(|(_, path)| crate::is_temp_path(path))
-                .map(|(id, _)| id)
-                .collect()
-        };
-        let now = now_iso();
-        for id in temp_projects {
-            conn.execute("UPDATE projects SET archived_at = ?2 WHERE id = ?1", params![id, now])?;
-        }
+        archive_projects_where(conn, crate::is_temp_path)?;
         merge_duplicate_projects(conn)?;
+    }
+    if version < 14 {
+        // ai-cross 运行目录项目一次性归入已废弃项目；此前已由用户恢复的临时目录项目不受影响
+        archive_projects_where(conn, crate::is_run_site_path)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -553,6 +545,23 @@ fn path_key(path: &str) -> String {
     }
 }
 
+fn archive_projects_where(conn: &Connection, matches: fn(&str) -> bool) -> Result<()> {
+    let ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id, path FROM projects WHERE archived_at IS NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(_, path)| matches(path))
+            .map(|(id, _)| id)
+            .collect()
+    };
+    let now = now_iso();
+    for id in ids {
+        conn.execute("UPDATE projects SET archived_at = ?2 WHERE id = ?1", params![id, now])?;
+    }
+    Ok(())
+}
+
 pub fn upsert_project(conn: &Connection, path: &str, name: &str) -> Result<i64> {
     let now = now_iso();
     if cfg!(windows) {
@@ -568,9 +577,9 @@ pub fn upsert_project(conn: &Connection, path: &str, name: &str) -> Result<i64> 
             return Ok(id);
         }
     }
-    // 系统临时目录下的工作目录是 agent 的临时运行现场：新建时即归入已废弃项目，
+    // 运行现场（系统临时目录、ai-cross 运行目录）：新建时即归入已废弃项目，
     // 数据照常采集；用户恢复后不再改动（ON CONFLICT 不碰 archived_at）
-    let archived = crate::is_temp_path(path).then(|| now.clone());
+    let archived = crate::is_scratch_path(path).then(|| now.clone());
     conn.execute(
         "INSERT INTO projects(path, name, created_at, updated_at, archived_at) VALUES (?1, ?2, ?3, ?3, ?4)
          ON CONFLICT(path) DO UPDATE SET updated_at = excluded.updated_at",

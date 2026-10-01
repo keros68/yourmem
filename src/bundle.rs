@@ -35,7 +35,7 @@ impl BundleFilter {
 /// Create a bundle at `out` (a .tar.gz path). Returns the manifest.
 pub fn create(conn: &Connection, home: &Path, out: &Path, filter: &BundleFilter) -> Result<Value> {
     let _lock = crate::ingest::ImportLockTx::acquire(home, std::time::Duration::from_secs(120))?;
-    let staging = tempfile::tempdir().context("create staging dir")?;
+    let staging = crate::staging_dir_near(out).context("create staging dir")?;
     let stem = out
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -324,7 +324,7 @@ struct BundleLayout {
 }
 
 fn extract(bundle: &Path) -> Result<(tempfile::TempDir, BundleLayout)> {
-    let tmp = tempfile::tempdir().context("extract staging")?;
+    let tmp = crate::staging_dir_near(bundle).context("extract staging")?;
     let file = std::fs::File::open(bundle).with_context(|| format!("open {}", bundle.display()))?;
     let dec = flate2::read::GzDecoder::new(file);
     let mut ar = tar::Archive::new(dec);

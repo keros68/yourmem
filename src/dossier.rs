@@ -319,7 +319,9 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
                         (SELECT substr(m.content,1,1600) FROM messages m
                          WHERE m.session_id=s.id AND m.kind='assistant'
                          ORDER BY m.line_no DESC,m.ord DESC LIMIT 1),
-                        (SELECT COUNT(*) FROM session_artifacts a WHERE a.session_id=s.id)
+                        (SELECT COUNT(*) FROM session_artifacts a WHERE a.session_id=s.id),
+                        (SELECT l.parent_session_id FROM session_links l
+                         WHERE l.child_session_id=s.id AND l.link_type='subagent' LIMIT 1)
                  FROM sessions s WHERE s.project_id=?3 AND {visible} AND ({in_day})
                  ORDER BY COALESCE(s.ended_at,s.started_at) DESC,s.id"
             ))?;
@@ -332,6 +334,7 @@ pub fn daily_digest(conn: &Connection, day: &str) -> Result<Value> {
                 "title": r.get::<_, Option<String>>(5)?,
                 "tail": r.get::<_, Option<String>>(6)?,
                 "artifact_count": r.get::<_, i64>(7)?,
+                "parent_session_id": r.get::<_, Option<String>>(8)?,
             })))?.collect::<std::result::Result<Vec<_>, _>>()?;
             rows
         };

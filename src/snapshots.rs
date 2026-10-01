@@ -425,7 +425,7 @@ pub fn export(home: &Path, id: &str, out: &Path) -> Result<Value> {
     );
     let rows = manifests(&repo)?;
     let s = rows.iter().find(|s| s.id == id).context("快照不存在")?;
-    let temp = tempfile::tempdir()?;
+    let temp = crate::staging_dir_near(out)?;
     let root = temp.path().join("snapshot");
     std::fs::create_dir_all(root.join("db"))?;
     inspect_db(&repo, s, &root.join("db/snapshot.sqlite"))?;

@@ -734,3 +734,4 @@ svg.lgraph-edges text { fill: var(--faint); font-size: 10.5px; }
 .sub-toggle { padding: 1px 8px; font-size: 11px; margin-right: 4px; }
 tr.sub-row td { background: rgba(255, 255, 255, 0.02); }
 .sub-mark { color: var(--faint); }
+.activity-subs { margin-right: 6px; padding: 1px 6px; border: 1px solid var(--border); border-radius: 8px; color: var(--dim); font-size: 11px; font-style: normal; font-weight: 400; }

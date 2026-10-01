@@ -1176,6 +1176,34 @@ fn temp_dir_projects_start_archived_and_stay_restored() {
 }
 
 #[test]
+fn aicross_run_projects_are_archived_on_creation_and_by_v14() {
+    let home = tempfile::tempdir().unwrap();
+    let runs = yourmem::home_dir().join(".aicross").join("runs");
+    let run_a = runs.join("run-a").join("0fcfa01e").to_string_lossy().to_string();
+    let run_b = runs.join("run-b").to_string_lossy().to_string();
+    let temp = std::env::temp_dir().join("agent-run-9").to_string_lossy().to_string();
+    {
+        let conn = db::open(home.path()).unwrap();
+        let id = db::upsert_project(&conn, &run_a, "0fcfa01e").unwrap();
+        let archived: Option<String> = conn.query_row(
+            "SELECT archived_at FROM projects WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert!(archived.is_some(), "运行目录项目新建即归档");
+        // 模拟 1.3.1 库：运行目录项目尚未归档，临时目录项目已由用户恢复
+        conn.execute_batch("DELETE FROM projects; PRAGMA user_version = 13;").unwrap();
+        conn.execute(
+            "INSERT INTO projects(path, name, created_at, updated_at) VALUES (?1, 'b', 'x', 'x'), (?2, 't', 'x', 'x')",
+            [&run_b, &temp],
+        ).unwrap();
+    }
+    let conn = db::open(home.path()).unwrap();
+    let archived = |p: &str| -> bool {
+        conn.query_row("SELECT archived_at IS NOT NULL FROM projects WHERE path = ?1", [p], |r| r.get(0)).unwrap()
+    };
+    assert!(archived(&run_b), "v14 归档已有运行目录项目");
+    assert!(!archived(&temp), "已恢复的临时目录项目保持恢复");
+}
+
+#[test]
 fn path_under_dir_ignores_separator_style() {
     let root = std::path::Path::new("D:/scratch/Temp");
     assert!(yourmem::is_under_dir(r"D:\scratch\Temp\run1", root));

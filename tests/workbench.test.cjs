@@ -72,3 +72,17 @@ test('AI suggestions show source links and require an explicit save', () => {
   assert.match(saved, /已保存/);
   assert.match(saved, /disabled/);
 });
+
+test('Today folds subtask conversations under their main conversation', () => {
+  const withSubs = { ...digest, project_activity: [{ ...digest.project_activity[0], activities: [
+    { session_id: 'main', agent: 'claude', title: 'main task', tail: 'done' },
+    { session_id: 'sub1', agent: 'claude', title: 'sub one', parent_session_id: 'main' },
+    { session_id: 'sub2', agent: 'claude', title: 'sub two', parent_session_id: 'main' },
+    { session_id: 'orphan', agent: 'claude', title: 'orphan sub', parent_session_id: 'elsewhere' },
+  ] }] };
+  const html = context.api.activityPageHtml(withSubs, { today: '2026-09-09' });
+  assert.match(html, /子任务 ×2/);
+  assert.doesNotMatch(html, /data-work-session="sub1"/);
+  assert.match(html, /data-work-session="orphan"/, '主对话不在列表里时单独显示');
+  assert.match(html, /活动<span>2<\/span>/);
+});

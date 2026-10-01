@@ -36,8 +36,17 @@ function dayStatsHtml(digest) {
   </article>`).join("")}</div>`;
 }
 
+// 子任务对话（subagent）并入同一列表里的主对话，主对话不在列表里时照常单独显示
+export function foldActivities(rows) {
+  const ids = new Set(rows.map((a) => a.session_id));
+  const isSub = (a) => a.parent_session_id && ids.has(a.parent_session_id);
+  const subs = new Map();
+  for (const a of rows) if (isSub(a)) subs.set(a.parent_session_id, (subs.get(a.parent_session_id) || 0) + 1);
+  return rows.filter((a) => !isSub(a)).map((a) => (subs.has(a.session_id) ? { ...a, _subs: subs.get(a.session_id) } : a));
+}
+
 const activityTabs = (project, active) => [
-  ["activities", "活动", project?.activities?.length || 0],
+  ["activities", "活动", foldActivities(project?.activities || []).length],
   ["tasks", "任务", project?.open_tasks?.length || 0],
   ["artifacts", "产物", project?.artifacts?.length || 0],
   ["handoff", "交接", project?.handoffs?.length || (project?.latest_handoff ? 1 : 0)],
@@ -48,9 +57,9 @@ function activityDetailHtml(project, agent, tab) {
   const agents = (project.agents || []).map((a) => agentDot(a.agent)).join("");
   let body = "";
   if (tab === "activities") {
-    const rows = (project.activities || []).filter((a) => agent === "all" || a.agent === agent);
+    const rows = foldActivities((project.activities || []).filter((a) => agent === "all" || a.agent === agent));
     body = rows.length ? rows.map((a) => `<button class="activity-row" data-work-session="${esc(a.session_id)}"><time>${fmtTime(activityStamp(a))}</time>
-      <span><strong>${esc(clipped(a.title, 100) || "未命名对话")}</strong><small>${esc(clipped(a.tail, 190) || "尚无 Agent 回复")}</small></span>${agentDot(a.agent)}</button>`).join("")
+      <span><strong>${a._subs ? `<em class="activity-subs">子任务 ×${a._subs}</em>` : ""}${esc(clipped(a.title, 100) || "未命名对话")}</strong><small>${esc(clipped(a.tail, 190) || "尚无 Agent 回复")}</small></span>${agentDot(a.agent)}</button>`).join("")
       : '<div class="activity-no-project">当前 Agent 没有活动</div>';
   } else if (tab === "tasks") {
     body = (project.open_tasks || []).length ? project.open_tasks.map((t) => `<article class="activity-card"><span class="activity-state">进行中</span><div><strong>${esc(clipped(t.content, 150))}</strong><small>${esc(t.project || project.project)}</small></div></article>`).join("")
