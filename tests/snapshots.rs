@@ -170,3 +170,22 @@ fn retention_unions_recent_snapshots_with_latest_in_each_month() {
     assert!(p["remove_ids"].as_array().unwrap().contains(&json!(ids[0])));
     assert!(p["remove_ids"].as_array().unwrap().contains(&json!(ids[3])));
 }
+
+#[test]
+fn a_corrupt_repository_object_is_repaired_by_the_next_snapshot() {
+    let home = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    append(home.path(), source.path(), 1);
+    snapshots::create(home.path()).unwrap();
+    let hash: String = db::open(home.path()).unwrap()
+        .query_row("SELECT hash FROM vault_lines LIMIT 1", [], |r| r.get(0)).unwrap();
+    let repo_store = snapshots::root(home.path()).join("objects.db");
+    rusqlite::Connection::open(&repo_store).unwrap()
+        .execute("UPDATE objects SET data = CAST('damaged' AS BLOB) WHERE hash = ?1", [&hash])
+        .unwrap();
+    let second = snapshots::create(home.path()).unwrap();
+    assert_eq!(second["repaired_objects"], 1, "{second}");
+    let out = tempfile::tempdir().unwrap();
+    let path = out.path().join("full.tar.gz");
+    snapshots::export(home.path(), id(&second), &path).unwrap();
+}

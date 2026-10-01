@@ -307,11 +307,30 @@ pub fn create_within(home: &Path, wait: std::time::Duration) -> Result<Value> {
         batch.clear();
         Ok(added)
     };
+    let mut repaired = 0u64;
     for hash in &hashes {
         ensure!(hash_ok(hash), "原件地址无效");
-        let raw = store.get(hash, true)?;
+        let live = store.raw(hash)?;
+        let raw = vault::verified(hash, &live)?;
         objects_bytes += raw.len() as u64;
-        if legacy.contains_key(hash) || rstore.contains(hash)? {
+        // 仓库里已有的对象也要可用：与活库存储形态一致即可，否则解码校验，
+        // 损坏的用活库原件修复（不能让新快照引用坏对象）
+        if rstore.contains(hash)? {
+            let kept = rstore.raw(hash)?;
+            if kept == live || vault::verified(hash, &kept).is_ok() {
+                continue;
+            }
+            rstore.put_raw(hash, &live)?;
+            repaired += 1;
+            continue;
+        }
+        if legacy.contains_key(hash) {
+            let path = tmp.path().join("legacy-check");
+            if decode(&repo, hash, &path).is_ok() {
+                continue;
+            }
+            rstore.put_raw(hash, &live)?;
+            repaired += 1;
             continue;
         }
         new_objects += 1;
@@ -352,7 +371,7 @@ pub fn create_within(home: &Path, wait: std::time::Duration) -> Result<Value> {
     } else {
         json!({"removed":0,"reclaimed_bytes":0})
     };
-    Ok(json!({"id":s.id,"new_objects":new_objects,"new_bytes":new_bytes,
+    Ok(json!({"id":s.id,"new_objects":new_objects,"new_bytes":new_bytes,"repaired_objects":repaired,
         "auto_removed":cleaned["removed"],"auto_reclaimed_bytes":cleaned["reclaimed_bytes"]}))
 }
 fn inspect_db(repo: &Path, s: &Snapshot, tmp: &Path) -> Result<()> {

@@ -110,14 +110,10 @@ impl Store {
     /// `backup export` ("恢复出来的文件与原件逐字节一致" must be checked, not assumed).
     pub fn get(&self, hash: &str, verify: bool) -> Result<Vec<u8>> {
         let stored = self.raw(hash)?;
-        let bytes = decode_object(&stored).with_context(|| format!("decode vault object {hash}"))?;
         if verify {
-            anyhow::ensure!(
-                hex_sha256(&bytes) == hash,
-                "vault object {hash} failed hash verification (corrupted on disk)"
-            );
+            return verified(hash, &stored);
         }
-        Ok(bytes)
+        decode_object(&stored).with_context(|| format!("decode vault object {hash}"))
     }
 
     /// Store several objects in one synced transaction; returns their hashes
@@ -142,11 +138,24 @@ impl Store {
     }
 
     /// Insert stored-form bytes whose content address the caller has checked.
+    /// An existing row that no longer matches its address is replaced.
     pub fn put_raw(&self, hash: &str, stored: &[u8]) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO objects(hash, data) VALUES (?1, ?2)",
-            rusqlite::params![hash, stored],
-        )?;
+        let existing: Option<Vec<u8>> = self
+            .conn
+            .query_row("SELECT data FROM objects WHERE hash = ?1", [hash], |r| r.get(0))
+            .optional()?;
+        match existing {
+            Some(data) if verified(hash, &data).is_ok() => {}
+            Some(_) => {
+                self.conn.execute("UPDATE objects SET data = ?2 WHERE hash = ?1", rusqlite::params![hash, stored])?;
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO objects(hash, data) VALUES (?1, ?2)",
+                    rusqlite::params![hash, stored],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -173,6 +182,16 @@ impl Store {
         rows.extend(legacy_files(&self.home));
         Ok(rows)
     }
+}
+
+/// Decode stored-form bytes and check them against their content address.
+pub fn verified(hash: &str, stored: &[u8]) -> Result<Vec<u8>> {
+    let bytes = decode_object(stored).with_context(|| format!("decode vault object {hash}"))?;
+    anyhow::ensure!(
+        hex_sha256(&bytes) == hash,
+        "vault object {hash} failed hash verification (corrupted on disk)"
+    );
+    Ok(bytes)
 }
 
 /// Disk used by the object store file and any legacy object files.
@@ -232,8 +251,8 @@ pub fn migrate_legacy(home: &Path, limit: usize) -> Result<Value> {
     let tx = store.transaction()?;
     for (hash, path) in &batch {
         let stored = std::fs::read(path)?;
-        let intact = decode_object(&stored).map(|b| hex_sha256(&b) == *hash).unwrap_or(false);
-        if intact {
+        if verified(hash, &stored).is_ok() {
+            // put_raw 会替换库里已损坏的同名记录：删旧文件前库内必须是完好副本
             store.put_raw(hash, &stored)?;
             moved.push(path);
         } else {
@@ -667,5 +686,21 @@ mod tests {
         assert!(!a_path.exists(), "moved files are removed");
         assert!(bad_path.exists(), "a damaged file stays for the self-check");
         assert!(store.get(&bad, true).is_err());
+    }
+
+    #[test]
+    fn migration_replaces_a_corrupt_store_row_instead_of_dropping_the_good_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let bytes = b"only intact copy lives in the legacy file";
+        let hash = hash_bytes(bytes);
+        let path = object_path(home, &hash);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, encode_object(bytes).unwrap()).unwrap();
+        Store::open(home).unwrap();
+        Connection::open(store_db_path(home)).unwrap()
+            .execute("INSERT INTO objects(hash, data) VALUES (?1, x'00')", [&hash]).unwrap();
+        migrate_legacy(home, 10).unwrap();
+        assert_eq!(Store::open(home).unwrap().get(&hash, true).unwrap(), bytes);
     }
 }

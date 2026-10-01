@@ -61,22 +61,31 @@ pub fn plan(home: &Path, include_backups: bool) -> Result<Value> {
     Ok(json!({"token":token,"cleanup":payload}))
 }
 
-/// 删除 `dir` 下除 `keep`（及其上级目录链）以外的全部内容。
-fn remove_all_except(dir: &Path, keep: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path == keep {
-            continue;
-        }
-        if keep.starts_with(&path) {
-            remove_all_except(&path, keep)?;
-        } else if path.is_dir() {
-            std::fs::remove_dir_all(&path)?;
-        } else {
-            std::fs::remove_file(&path)?;
+/// 先把整个数据目录改名移开，再删除。Windows 上目录里有文件被打开时改名会
+/// 直接失败，这样要么一个文件都不删，要么删掉的是已无人使用的完整目录，
+/// 不会留下"有索引、无原件"的残缺资料库。备份位于数据目录内且要保留时，
+/// 改名后先把备份移回原位置。
+fn remove_data_dir(data: &Path, keep_backup: Option<&Path>) -> Result<()> {
+    if !data.exists() {
+        return Ok(());
+    }
+    let name = data.file_name().context("数据目录没有名称")?.to_string_lossy().to_string();
+    let moved = data.with_file_name(format!("{name}.removing-{}", std::process::id()));
+    std::fs::rename(data, &moved).with_context(|| {
+        format!("资料库正在被使用（采集或其他操作），请稍后重试；未删除任何文件：{}", data.display())
+    })?;
+    if let Some(backup) = keep_backup {
+        let rel = backup.strip_prefix(data).context("备份目录不在数据目录内")?;
+        let inside = moved.join(rel);
+        if inside.exists() {
+            if let Some(parent) = backup.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&inside, backup)
+                .with_context(|| format!("移回备份目录 {}", backup.display()))?;
         }
     }
-    Ok(())
+    std::fs::remove_dir_all(&moved).with_context(|| format!("删除核心数据目录 {}", moved.display()))
 }
 
 pub fn execute(home: &Path, include_backups: bool, token: &str) -> Result<Value> {
@@ -90,13 +99,7 @@ pub fn execute(home: &Path, include_backups: bool, token: &str) -> Result<Value>
     let backup_separate = current["cleanup"]["backup_separate"].as_bool().unwrap_or(false);
     let backups_kept_inside = current["cleanup"]["backups_kept_inside"].as_bool().unwrap_or(false);
     let active_home = safe_directory(&crate::data_home()).ok();
-    if backups_kept_inside {
-        remove_all_except(&data, &backup)
-            .with_context(|| format!("删除核心数据目录 {}", data.display()))?;
-    } else if data.exists() {
-        std::fs::remove_dir_all(&data)
-            .with_context(|| format!("删除核心数据目录 {}", data.display()))?;
-    }
+    remove_data_dir(&data, backups_kept_inside.then_some(backup.as_path()))?;
     if active_home.as_ref() == Some(&data) {
         crate::clear_data_home_pointer()?;
     }
@@ -147,6 +150,26 @@ mod tests {
 
         let p = plan(&home, true).unwrap();
         execute(&home, true, p["token"].as_str().unwrap()).unwrap();
+        assert!(!home.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_open_database_stops_cleanup_before_anything_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("yourmem-data");
+        let backup = dir.path().join("yourmem-backup");
+        std::fs::create_dir_all(&backup).unwrap();
+        let conn = crate::db::open(&home).unwrap();
+        crate::vault::store_line(&home, b"line").unwrap();
+        crate::ingest::write_config(&home, &json!({"backup_dir": backup})).unwrap();
+        let p = plan(&home, false).unwrap();
+        assert!(execute(&home, false, p["token"].as_str().unwrap()).is_err());
+        assert!(home.join("yourmem.db").exists() && home.join("objects.db").exists() && home.join("config.json").exists(),
+            "被占用时一个文件都不删");
+        drop(conn);
+        let p = plan(&home, false).unwrap();
+        execute(&home, false, p["token"].as_str().unwrap()).unwrap();
         assert!(!home.exists());
     }
 }
