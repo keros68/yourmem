@@ -240,3 +240,22 @@ test('update controls install in app and retain GitHub only as a failure fallbac
   assert.match(source, /update-progress/);
   assert.match(source, /更新失败：[\s\S]*前往 GitHub 下载/);
 });
+
+test('armed batch button shows the current count when it resets', async () => {
+  const f = app(), button = f.get('#bulk');
+  let count = 3;
+  f.armButton(button, () => `删除选中（${count}）`, 'confirm', async () => { count = 0; });
+  assert.equal(button.textContent, '删除选中（3）');
+  await button.onclick(); await button.onclick();
+  count = 5; await button.onclick(); await button.onclick();
+  assert.equal(button.textContent, '删除选中（5）');
+});
+
+test('search says when results reach the display cap', async () => {
+  const f = app(); await f.renderSearch();
+  f.get('#q').value = 'keyword'; const run = f.get('#q-go').onclick();
+  f.requests.at(-1).resolve({ results: Array.from({ length: 50 }, (_, i) => ({ snippet: `hit ${i}`, session_id: `s${i}` })) });
+  await run;
+  assert.match(f.get('#q-results').innerHTML, /仅显示前 50 条/);
+  assert.doesNotMatch(f.get('#q-results').innerHTML, /已展示全部/);
+});

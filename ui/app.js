@@ -443,21 +443,31 @@ let sessShown = 200; // 列表分批渲染：已显示条数（数据全量持�
 let sessGroup = "project"; // 可在项目视图与按月清理视图之间切换
 
 // 二次确认按钮（借鉴本页 bundle 恢复的 armed 模式）：点第一次武装，
-// 4 秒内点第二次才执行。
+// 4 秒内点第二次才执行。label 可为函数，复原时取当前数量。
 function armButton(btn, label, armedLabel, fn) {
+  const text = () => (typeof label === "function" ? label() : label);
   btn.dataset.armed = "";
-  btn.textContent = label;
+  btn.textContent = text();
   btn.onclick = async () => {
     if (!btn.dataset.armed) {
       btn.dataset.armed = "1";
       btn.textContent = armedLabel;
-      setTimeout(() => { if (btn.dataset.armed) { btn.dataset.armed = ""; btn.textContent = label; } }, 4000);
+      setTimeout(() => { if (btn.dataset.armed) { btn.dataset.armed = ""; btn.textContent = text(); } }, 4000);
       return;
     }
     btn.dataset.armed = "";
-    btn.textContent = label;
+    btn.textContent = text();
     try { await fn(); } catch (e) { toast(String(e)); }
   };
+}
+
+// 逐个执行批量操作：单个失败不中断，结束后由调用方统一刷新
+async function eachSession(ids, command) {
+  let done = 0;
+  for (const sessionId of ids) {
+    try { await invoke(command, { sessionId }); done += 1; } catch { /* 计入失败 */ }
+  }
+  return { done, failed: ids.length - done };
 }
 
 async function renderSessions() {
@@ -584,9 +594,10 @@ function drawSessionsPage() {
     };
   }
   syncBulk();
-  armButton(bulk, `删除选中（${sessChecked.size}）`, "确认删除？进回收站，可恢复", async () => {
-    for (const sid of sessChecked) await invoke("session_delete", { sessionId: sid });
-    toast(`已删除 ${sessChecked.size} 个对话（回收站可恢复）`);
+  armButton(bulk, () => `删除选中（${sessChecked.size}）`, "确认删除？进回收站，可恢复", async () => {
+    const r = await eachSession([...sessChecked], "session_delete");
+    toast(r.failed ? `已删除 ${r.done} 个对话，${r.failed} 个失败` : `已删除 ${r.done} 个对话（回收站可恢复）`);
+    sessChecked = new Set();
     renderSessions();
   });
   document.querySelectorAll("#page-sessions [data-del]").forEach((btn) => {
@@ -614,7 +625,7 @@ async function drawTrash() {
       <button class="chip danger hidden" id="trash-bulk-purge"></button>
       <button class="chip danger ${overdueCount ? "" : "hidden"}" id="trash-empty">清空超期（${overdueCount}）</button>
     </div>
-    <div class="sess-meta" style="color:var(--dim);margin-bottom:12px">软删对话 ${d.trash.length} 个 · 数据完整保留，恢复后可检索 · 彻底删除 = 对话原件一并移除，不可恢复（保留期 30 天，期内删除需确认）</div>
+    <div class="sess-meta" style="color:var(--dim);margin-bottom:12px">软删对话 ${d.trash.length} 个 · 数据完整保留，恢复后可检索 · 彻底删除后不可恢复：单条或选中删除不保留原件，清空超期会把原件移入离线档案（保留期 30 天，期内删除需确认）</div>
     <div id="trash-table"></div>`;
   $("#trash-back").onclick = () => { sessTrash = false; renderSessions(); };
   $("#trash-table").innerHTML = d.trash.length
@@ -645,9 +656,9 @@ async function drawTrash() {
     };
   }
   syncBulk();
-  armButton(bulk, `恢复选中（${sessChecked.size}）`, "确认恢复？", async () => {
-    for (const sid of sessChecked) await invoke("session_restore", { sessionId: sid });
-    toast(`已恢复 ${sessChecked.size} 个对话`);
+  armButton(bulk, () => `恢复选中（${sessChecked.size}）`, "确认恢复？", async () => {
+    const r = await eachSession([...sessChecked], "session_restore");
+    toast(r.failed ? `已恢复 ${r.done} 个对话，${r.failed} 个失败` : `已恢复 ${r.done} 个对话`);
     sessChecked = new Set();
     drawTrash();
   });
@@ -658,7 +669,7 @@ async function drawTrash() {
     if (!bulkPurge.dataset.armed) bulkPurge.textContent = `彻底删除选中（${sessChecked.size}）`;
   };
   syncBulkPurge();
-  armButton(bulkPurge, `彻底删除选中（${sessChecked.size}）`, "确认彻底删除？不可恢复", async () => {
+  armButton(bulkPurge, () => `彻底删除选中（${sessChecked.size}）`, "确认彻底删除？不可恢复", async () => {
     const ids = [...sessChecked];
     const inRetention = d.trash.filter((s) => ids.includes(s.session_id) && !s.overdue).length;
     if (inRetention > 0 && !confirm(`选中有 ${inRetention} 个还在 30 天保留期内，将强制彻底删除。继续？`)) return;
@@ -684,7 +695,7 @@ async function drawTrash() {
   if (emptyBtn) {
     armButton(emptyBtn, `清空超期（${overdueCount}）`, `确认彻底删除 ${overdueCount} 个超期对话？不可恢复`, async () => {
       const r = await invoke("trash_empty_overdue");
-      toast(`已彻底删除 ${r.purged_sessions} 个超期对话（对象已归档备份）`);
+      toast(`已彻底删除 ${r.purged_sessions} 个超期对话，原件已移入离线档案`);
       sessChecked = new Set();
       drawTrash();
     });
@@ -754,7 +765,7 @@ async function renderMemory() {
     <div class="pillrow" style="margin-bottom:10px">
       ${AGENT_LIST.map((a) => `<button class="chip ${(memView === "graph" ? "" : memAgent) === a ? "on" : ""}" data-mem-agent="${a}">${a || "全部来源"}</button>`).join("")}
     </div>
-    <div style="color:var(--dim);margin-bottom:10px">${counts} 条${memView === "graph" ? " · 显示全部来源与类型，点节点高亮演变链" : ""}</div>
+    <div style="color:var(--dim);margin-bottom:10px">${memView !== "graph" && counts >= 200 ? "最近 200 条" : `${counts} 条`}${memView === "graph" ? " · 显示全部来源与类型，点节点高亮演变链" : ""}</div>
     ${suggestedCount >= 21 ? `<div class="digest digest-error">待确认记忆积压 20+ 条（容量纪律：先处理积压，再新增）</div>` : ""}
     ${memView === "graph" ? memoryGraphHtml(d.memories) : `<div class="scrollbox">${d.memories.map(memCard).join("") || '<div class="empty">暂无记忆</div>'}</div>`}
     <h2 style="margin-top:24px">原生 memory 备份</h2>
@@ -780,7 +791,9 @@ async function renderMemory() {
   $("#mem-type").onchange = (e) => { memType = e.target.value; renderMemory(); };
   document.querySelectorAll("#page-memory [data-act]").forEach((btn) => {
     btn.onclick = async () => {
-      await invoke("update_memory", { id: btn.dataset.id, action: btn.dataset.act, supersededBy: null });
+      try {
+        await invoke("update_memory", { id: btn.dataset.id, action: btn.dataset.act, supersededBy: null });
+      } catch (e) { toast(`操作失败：${e}`); return; }
       toast(btn.dataset.act === "confirm" ? "已确认" : "已归档");
       renderMemory();
     };
@@ -1066,7 +1079,7 @@ async function renderSettings() {
       </div>
       <h2>彻底删除的离线档案</h2>
       <div class="memcard">
-        <div class="meta" style="margin-top:0">「彻底删除」已不再保留原件；此处管理的是历史版本或 CLI --keep-archive 产生的档案，删除后对应字节不再存在于磁盘。</div>
+        <div class="meta" style="margin-top:0">清空超期对话和启动时的自动清理会把原件移入这里；单条或选中彻底删除不保留原件。删除档案后，对应内容不再保存在磁盘上。</div>
         <div class="searchbar">
           <button class="btn" id="archives-list">查看占用</button>
           <button class="btn danger hidden" id="archives-clear">清空全部</button>
@@ -1640,7 +1653,7 @@ async function renderSearch() {  $("#page-search").innerHTML = `
       </div>`).join("");
     $("#q-results").innerHTML = `<div class="search-results-head"><span>搜索结果</span><span class="search-results-count">${d.results.length} 条</span></div>
       <div class="scrollbox search-results">${resultCards || '<div class="empty">暂无结果</div>'}
-        ${resultCards ? `<div class="search-results-tail">已展示全部 ${d.results.length} 条 · 点击结果查看完整对话</div>` : ""}
+        ${resultCards ? `<div class="search-results-tail">${d.results.length >= 50 ? "仅显示前 50 条，可增加关键词缩小范围" : `已展示全部 ${d.results.length} 条`} · 点击结果查看完整对话</div>` : ""}
       </div>`;
     document.querySelectorAll("#q-results .hit").forEach((el) => {
       el.onclick = () => showSession(el.dataset.sid, Number(el.dataset.line), false, null, Number(el.dataset.message));
