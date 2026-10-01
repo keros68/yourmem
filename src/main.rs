@@ -448,8 +448,21 @@ enum BackupCmd {
     Migrate,
 }
 
+/// 写到标准输出；读取方提前关闭管道（如 `| head`）时安静退出，不报错。
+fn write_stdout(text: &str) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    if let Err(e) = stdout.write_all(text.as_bytes()).and_then(|_| stdout.flush()) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe || e.raw_os_error() == Some(232) {
+            std::process::exit(0);
+        }
+        eprintln!("yourmem: 写入标准输出失败: {e}");
+        std::process::exit(1);
+    }
+}
+
 fn print_json(v: &Value) {
-    println!("{}", serde_json::to_string_pretty(v).expect("json"));
+    write_stdout(&format!("{}\n", serde_json::to_string_pretty(v).expect("json")));
 }
 
 fn run_import(
@@ -626,7 +639,7 @@ fn main() -> Result<()> {
             let mut d = db::project_context(&conn, pid)?;
             d["source_review"] = yourmem::project_review::status(&conn, &home, pid)?;
             if markdown {
-                print!("{}", yourmem::dossier::render_context_markdown(&d));
+                write_stdout(&yourmem::dossier::render_context_markdown(&d));
             } else {
                 print_json(&d);
             }
@@ -642,7 +655,7 @@ fn main() -> Result<()> {
                 let md = yourmem::dossier::render_markdown(&d);
                 match out {
                     Some(path) => std::fs::write(&path, md)?,
-                    None => print!("{md}"),
+                    None => write_stdout(&md),
                 }
             } else {
                 print_json(&d);
@@ -654,7 +667,7 @@ fn main() -> Result<()> {
             let day = day.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
             let d = yourmem::dossier::daily_digest(&conn, &day)?;
             if markdown {
-                print!("{}", yourmem::dossier::render_digest_markdown(&d));
+                write_stdout(&yourmem::dossier::render_digest_markdown(&d));
             } else {
                 print_json(&d);
             }
@@ -672,7 +685,7 @@ fn main() -> Result<()> {
                         let md = yourmem::dossier::render_session_markdown(&d);
                         match out {
                             Some(path) => std::fs::write(&path, md)?,
-                            None => print!("{md}"),
+                            None => write_stdout(&md),
                         }
                     } else {
                         print_json(&d);

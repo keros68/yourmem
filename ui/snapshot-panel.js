@@ -36,7 +36,13 @@ export function bindSnapshotPanel({ invoke, root, bundleInput, esc = (s) => Stri
       : n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB`
       : `${(n / 1024).toFixed(1)} KB`;
   };
-  const time = (t) => t ? String(t).replace("T", " ").slice(0, 16) : "—";
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const time = (t) => {
+    if (!t) return "—";
+    const d = new Date(t);
+    if (Number.isNaN(d.getTime())) return String(t).replace("T", " ").slice(0, 16);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  };
   const reportError = (el, error) => { el.textContent = `操作失败：${String(error)}`; };
   const setBusy = (value) => {
     busy = value;

@@ -2,7 +2,13 @@ const esc = (s) => String(s ?? "").replace(/[&<>\"]/g, (c) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
 }[c]));
 
-const fmtTime = (t) => (t ? String(t).replace("T", " ").slice(11, 16) : "—");
+// 后端时间是 UTC 的 ISO 串，按本地时区显示时刻
+const fmtTime = (t) => {
+  if (!t) return "—";
+  const d = new Date(t);
+  if (Number.isNaN(d.getTime())) return String(t).replace("T", " ").slice(11, 16);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
 const clipped = (s, max = 180) => {
   const text = String(s ?? "").replace(/\s+/g, " ").trim();
   return text.length > max ? `${text.slice(0, max)}…` : text;

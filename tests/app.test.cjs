@@ -22,7 +22,7 @@ function app() {
   vm.runInContext(ui('project-recall.js').replace('export async function', 'async function'), context);
   vm.runInContext(ui('graph-layout.js').replace('export function', 'function'), context);
   const bundleCode = ui('app.js').slice(ui('app.js').indexOf('  let bundleBusy = false'), ui('app.js').indexOf('  $("#auto-purge").onchange'));
-  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
+  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
   return { ...context.testApp, get, lists, requests, notices };
 }
 
@@ -258,4 +258,17 @@ test('search says when results reach the display cap', async () => {
   await run;
   assert.match(f.get('#q-results').innerHTML, /仅显示前 50 条/);
   assert.doesNotMatch(f.get('#q-results').innerHTML, /已展示全部/);
+});
+
+test('times are shown in the local time zone', () => {
+  const saved = process.env.TZ;
+  process.env.TZ = 'Asia/Shanghai';
+  try {
+    const f = app();
+    assert.equal(f.fmtTime('2026-10-01T01:45:00Z'), '2026-10-01 09:45');
+    assert.equal(f.fmtTime('2026-09-30T23:10:00.000Z'), '2026-10-01 07:10');
+    assert.equal(f.fmtTime(null), '—');
+  } finally {
+    if (saved === undefined) delete process.env.TZ; else process.env.TZ = saved;
+  }
 });

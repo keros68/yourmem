@@ -8,12 +8,19 @@ const { invoke } = window.__TAURI__.core;
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-const fmtTime = (t) => (t ? String(t).replace("T", " ").slice(0, 16) : "—");
+// 后端时间是 UTC 的 ISO 串，界面按本地时区显示；解析不了的原样截取
+const pad2 = (n) => String(n).padStart(2, "0");
+const fmtTime = (t) => {
+  if (!t) return "—";
+  const d = new Date(t);
+  if (Number.isNaN(d.getTime())) return String(t).replace("T", " ").slice(0, 16);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+};
 // 表格时间列双格式：窄窗口（媒体查询 ≤1239px）切 "MM-DD HH:MM" 省 ~30px/列，
 // 完整时间在悬停 title 里，信息不丢
 const fmtTimeCell = (t) => {
   if (!t) return "—";
-  const full = String(t).replace("T", " ").slice(0, 16);
+  const full = fmtTime(t);
   return `<span title="${full}"><span class="t-full">${full}</span><span class="t-short">${full.slice(5)}</span></span>`;
 };
 const toast = (msg) => {
