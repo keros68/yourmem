@@ -1290,3 +1290,26 @@ fn schema_v13_merges_existing_windows_path_duplicates() {
         "SELECT project_id FROM sessions WHERE id = 'claude:aaaa-1111'", [], |r| r.get(0)).unwrap();
     assert_eq!(pid, rows[0].0, "会话改挂到保留的项目");
 }
+
+#[test]
+fn claude_subagent_sessions_link_to_their_main_session() {
+    let home = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let proj = src.path().join("claude").join("D--work-sub");
+    let main_id = "11111111-2222-3333-4444-555555555555";
+    std::fs::create_dir_all(proj.join(main_id).join("subagents")).unwrap();
+    let line = |uuid: &str, text: &str| format!(
+        r#"{{"type":"user","cwd":"/work/sub","uuid":"{uuid}","sessionId":"{main_id}","timestamp":"2026-09-01T10:00:00Z","message":{{"role":"user","content":"{text}"}}}}"#);
+    std::fs::write(proj.join(format!("{main_id}.jsonl")), line("m1", "主对话") + "\n").unwrap();
+    std::fs::write(proj.join(main_id).join("subagents").join("agent-abc123.jsonl"), line("s1", "子任务") + "\n").unwrap();
+
+    let mut conn = db::open(home.path()).unwrap();
+    ingest::import_all(&mut conn, home.path(), &[(adapters::AGENT_CLAUDE, src.path().join("claude"))], None, None).unwrap();
+    let parent: String = conn.query_row(
+        "SELECT parent_session_id FROM session_links WHERE child_session_id = 'claude:agent-abc123' AND link_type = 'subagent'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(parent, format!("claude:{main_id}"));
+    let list = db::recent_sessions(&conn, None, 10).unwrap();
+    let sub = list.iter().find(|s| s["session_id"] == "claude:agent-abc123").unwrap();
+    assert_eq!(sub["parent_session_id"], format!("claude:{main_id}"));
+}

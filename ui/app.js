@@ -260,7 +260,8 @@ function sessTable(sessions, opts = {}) {
   const projHead = showProject ? "<th>项目</th>" : "";
   const projCell = (s) => (showProject ? `<td>${esc(s.project || "—")}</td>` : "");
   const prevHead = showPreview ? '<th class="c-prev">摘要</th>' : "";
-  const prevCell = (s) => (showPreview ? `<td class="prev" title="${esc(s.preview || "")}">${esc(s.preview || "—")}</td>` : "");
+  const subBadge = (s) => (s._subs ? `<button class="chip sub-toggle ${sessExpanded.has(s.session_id) ? "on" : ""}" data-subs="${esc(s.session_id)}">子任务 ×${s._subs}</button> ` : "");
+  const prevCell = (s) => (showPreview ? `<td class="prev" title="${esc(s.preview || "")}">${s._child ? '<span class="sub-mark">↳</span> ' : ""}${subBadge(s)}${esc(s.preview || "—")}</td>` : "");
   const delHead = deleted ? '<th class="c-time">删除于</th>' : "";
   const delCell = (s) => (deleted ? `<td class="c-time">${fmtTimeCell(s.deleted_at)}</td>` : "");
   const actHead = action ? '<th class="c-act"></th>' : "";
@@ -272,7 +273,7 @@ function sessTable(sessions, opts = {}) {
     return "";
   };
   return `<table${fixed ? ` class="fixed${deleted ? " trash" : ""}"` : ""}><tr>${selHead}${prevHead}${projHead}<th class="c-agent">agent</th><th class="c-time">开始</th><th class="c-time">结束</th>${delHead}<th class="c-num">消息</th>${actHead}</tr>
-    ${sessions.map((s) => `<tr class="clickable" data-sid="${esc(s.session_id)}">
+    ${sessions.map((s) => `<tr class="clickable${s._child ? " sub-row" : ""}" data-sid="${esc(s.session_id)}">
       ${selCell(s)}${prevCell(s)}${projCell(s)}<td class="c-agent"><span class="pill ${esc(s.agent)}">${esc(s.agent)}</span></td>
       <td class="c-time">${fmtTimeCell(s.started_at)}</td><td class="c-time">${fmtTimeCell(s.ended_at)}</td>${delCell(s)}<td class="c-num">${s.messages}</td>${actCell(s)}</tr>`).join("")}
   </table>`;
@@ -528,6 +529,25 @@ async function renderSessions() {
   drawSessionsPage();
 }
 
+// 子任务对话（subagent）折叠到同一列表里的主对话下；主对话不在列表里时照常单独显示
+const sessExpanded = new Set();
+function foldSubtasks(list) {
+  const ids = new Set(list.map((s) => s.session_id));
+  const children = new Map();
+  for (const s of list) {
+    if (s.parent_session_id && ids.has(s.parent_session_id)) {
+      if (!children.has(s.parent_session_id)) children.set(s.parent_session_id, []);
+      children.get(s.parent_session_id).push({ ...s, _child: true });
+    }
+  }
+  return list
+    .filter((s) => !(s.parent_session_id && ids.has(s.parent_session_id)))
+    .map((s) => {
+      const kids = children.get(s.session_id) || [];
+      return kids.length ? { ...s, _subs: kids.length, _children: kids } : s;
+    });
+}
+
 function drawSessionsPage() {
   const agents = AGENT_LIST;
   $("#page-sessions").innerHTML = `
@@ -586,12 +606,27 @@ function drawSessionsPage() {
   $("#sess-by-month").onclick = () => switchGroup("month");
   $("#sess-trash-btn").onclick = () => { sessTrash = true; sessChecked = new Set(); drawTrash(); };
   const all = (sessData.find(([n]) => n === sessSel)?.[1] || []).filter((s) => !sessAgent || s.agent === sessAgent);
-  // 全量数据分批渲染：首屏 200，「显示更多」续排——资产不封顶，DOM 不拖垮
-  const shown = all.slice(0, sessShown);
+  // 子任务对话折叠到主对话下；分页按主对话计。全量数据分批渲染：首屏 200，
+  // 「显示更多」续排——资产不封顶，DOM 不拖垮
+  const tops = foldSubtasks(all);
+  const shownTops = tops.slice(0, sessShown);
+  const shown = shownTops.flatMap((t) => [t, ...(sessExpanded.has(t.session_id) ? t._children : [])]);
   $("#sess-table").innerHTML = sessTable(shown, { project: sessGroup === "month", preview: true, fixed: true, select: true, action: "delete" })
-    + (all.length > shown.length
-      ? `<div style="padding:10px 0;text-align:center"><button class="chip" id="sess-more">显示更多（还有 ${all.length - shown.length} 个）</button></div>`
+    + (tops.length > shownTops.length
+      ? `<div style="padding:10px 0;text-align:center"><button class="chip" id="sess-more">显示更多（还有 ${tops.length - shownTops.length} 个）</button></div>`
       : "");
+  document.querySelectorAll("#page-sessions [data-subs]").forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      const id = b.dataset.subs;
+      if (sessExpanded.has(id)) sessExpanded.delete(id); else sessExpanded.add(id);
+      const side = document.querySelector(".sess-projs")?.scrollTop || 0;
+      const tbl = document.querySelector("#sess-table")?.scrollTop || 0;
+      drawSessionsPage();
+      const pj = document.querySelector(".sess-projs"); if (pj) pj.scrollTop = side;
+      const tb = document.querySelector("#sess-table"); if (tb) tb.scrollTop = tbl;
+    };
+  });
   $("#sess-more")?.addEventListener("click", () => {
     const side = document.querySelector(".sess-projs")?.scrollTop || 0;
     const tbl = document.querySelector("#sess-table")?.scrollTop || 0;

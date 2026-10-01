@@ -22,7 +22,7 @@ function app() {
   vm.runInContext(ui('project-recall.js').replace('export async function', 'async function'), context);
   vm.runInContext(ui('graph-layout.js').replace('export function', 'function'), context);
   const bundleCode = ui('app.js').slice(ui('app.js').indexOf('  let bundleBusy = false'), ui('app.js').indexOf('  $("#auto-purge").onchange'));
-  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, renderToday, bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
+  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, renderToday, foldSubtasks, bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
   return { ...context.testApp, context, get, lists, requests, notices };
 }
 
@@ -341,4 +341,18 @@ test('saving a memory twice quickly submits once', async () => {
 test('an unparseable time is shown as a placeholder, never as raw text', () => {
   const f = app();
   assert.equal(f.fmtTime('<b>badtime</b>'), '—');
+});
+
+test('subtask conversations fold under their main conversation', () => {
+  const f = app();
+  const tops = f.foldSubtasks([
+    { session_id: 'claude:main' },
+    { session_id: 'claude:agent-1', parent_session_id: 'claude:main' },
+    { session_id: 'claude:agent-2', parent_session_id: 'claude:main' },
+    { session_id: 'claude:agent-x', parent_session_id: 'claude:not-listed' },
+  ]);
+  assert.deepEqual(tops.map((t) => t.session_id), ['claude:main', 'claude:agent-x']);
+  assert.equal(tops[0]._subs, 2);
+  assert.ok(tops[0]._children.every((c) => c._child));
+  assert.equal(tops[1]._subs, undefined, 'a subtask without a listed main conversation stands alone');
 });

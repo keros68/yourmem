@@ -1369,7 +1369,9 @@ pub fn recent_sessions(conn: &Connection, project_id: Option<i64>, limit: u32) -
                 (SELECT replace(substr(m.content, 1, 160), char(10), ' ')
                  FROM messages m WHERE m.session_id = s.id AND m.kind = 'user'
                    AND substr(ltrim(m.content), 1, 1) NOT IN ('<', '#')
-                 ORDER BY m.line_no, m.ord LIMIT 1)
+                 ORDER BY m.line_no, m.ord LIMIT 1),
+                (SELECT l.parent_session_id FROM session_links l
+                 WHERE l.child_session_id = s.id AND l.link_type = 'subagent' LIMIT 1)
          FROM sessions s LEFT JOIN projects p ON p.id = s.project_id
          WHERE s.deleted_at IS NULL AND s.message_count > 0 AND p.archived_at IS NULL
            AND (?1 IS NULL OR s.project_id = ?1)
@@ -1384,6 +1386,8 @@ pub fn recent_sessions(conn: &Connection, project_id: Option<i64>, limit: u32) -
             "ended_at": r.get::<_, Option<String>>(4)?,
             "messages": r.get::<_, i64>(5)?,
             "preview": r.get::<_, Option<String>>(6)?,
+            // 子任务对话的主对话（subagent 关系），列表据此折叠
+            "parent_session_id": r.get::<_, Option<String>>(7)?,
         }))
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -2095,6 +2099,43 @@ pub fn detect_lineage(conn: &Connection) -> Result<u64> {
         }
     }
     added += detect_codex_lineage(conn)?;
+    added += detect_subagent_lineage(conn)?;
+    Ok(added)
+}
+
+/// Claude 子代理对话存于 `<主对话 uuid>/subagents/agent-*.jsonl`；Kimi 子 agent 的
+/// 会话 id 是 `<主会话>#<名字>`。两者都记为 subagent 关系（主对话尚未采集时同样
+/// 记录，谱系图里显示为外部节点）。
+fn detect_subagent_lineage(conn: &Connection) -> Result<u64> {
+    let rows: Vec<(String, String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, agent, native_id, file_path FROM sessions
+             WHERE ((agent = 'claude' AND native_id LIKE 'agent-%')
+                    OR (agent = 'kimi' AND instr(native_id, '#') > 0))
+               AND NOT EXISTS (SELECT 1 FROM session_links l
+                               WHERE l.child_session_id = sessions.id AND l.link_type = 'subagent')",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut added = 0u64;
+    for (child_id, agent, native_id, file_path) in rows {
+        let parent_id = if agent == "kimi" {
+            native_id.split('#').next().map(|main| format!("kimi:{main}"))
+        } else {
+            let dir = Path::new(&file_path).parent();
+            dir.filter(|d| d.file_name().is_some_and(|n| n == "subagents"))
+                .and_then(|d| d.parent())
+                .and_then(|d| d.file_name())
+                .map(|n| format!("claude:{}", n.to_string_lossy()))
+        };
+        let Some(parent_id) = parent_id else { continue };
+        added += conn.execute(
+            "INSERT OR IGNORE INTO session_links(child_session_id, parent_session_id, link_type, created_at)
+             VALUES (?1, ?2, 'subagent', ?3)",
+            params![child_id, parent_id, now_iso()],
+        )? as u64;
+    }
     Ok(added)
 }
 

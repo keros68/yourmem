@@ -731,3 +731,6 @@ svg.lgraph-edges text { fill: var(--faint); font-size: 10.5px; }
 .getting-started li span { color: var(--dim); font-size: 13px; }
 .getting-started li .btn { margin-top: 10px; display: block; }
 .mem-add textarea { width: 100%; box-sizing: border-box; margin: 8px 0; padding: 10px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: var(--radius); font: inherit; font-size: 13px; resize: vertical; }
+.sub-toggle { padding: 1px 8px; font-size: 11px; margin-right: 4px; }
+tr.sub-row td { background: rgba(255, 255, 255, 0.02); }
+.sub-mark { color: var(--faint); }

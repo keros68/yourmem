@@ -268,3 +268,25 @@ fn backfill_is_atomic_and_retryable() {
     ).unwrap();
     assert!(cwd.is_some() && pid.is_some(), "失败后可重试自愈");
 }
+
+#[test]
+fn sub_agent_sessions_link_to_the_main_session() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let kdir = root.path().join("wd_s").join("session_00000000-0000-0000-0000-0000000000aa");
+    for agent in ["main", "reviewer"] {
+        std::fs::create_dir_all(kdir.join("agents").join(agent)).unwrap();
+        let wire = serde_json::json!({
+            "type": "context.append_loop_event", "agentId": agent, "time": 1787470000000i64,
+            "event": {"type": "tool.call", "name": "Write", "args": {"path": format!("src/{agent}.md"), "content": "x"}}
+        });
+        std::fs::write(kdir.join("agents").join(agent).join("wire.jsonl"), wire.to_string() + "\n").unwrap();
+    }
+    let mut conn = db::open(home.path()).unwrap();
+    ingest::import_all(&mut conn, home.path(), &[(adapters::AGENT_KIMI, root.path().to_path_buf())], None, None).unwrap();
+    let (child, parent): (String, String) = conn.query_row(
+        "SELECT child_session_id, parent_session_id FROM session_links WHERE link_type = 'subagent'",
+        [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert!(child.ends_with("#reviewer"), "{child}");
+    assert_eq!(parent, child.split('#').next().unwrap());
+}
