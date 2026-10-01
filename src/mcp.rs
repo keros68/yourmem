@@ -337,7 +337,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "get_project_context",
-                "description": "Compact project recall: confirmed memories (decisions/rules/facts), per-agent session counts, recent sessions and the latest handoff. Call this when starting or resuming work in a project instead of asking the user to re-explain context.",
+                "description": "Compact project recall: confirmed memories, unconfirmed suggestions, per-agent session counts, recent sessions and the latest handoff. Call this when starting or resuming work in a project instead of asking the user to re-explain context.",
                 "inputSchema": { "type": "object", "properties": { "project": project_prop } }
             },
             {

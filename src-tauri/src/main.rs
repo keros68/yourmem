@@ -831,6 +831,29 @@ fn agent_remove_root(agent: String, path: String) -> Result<Value, String> {
     yourmem::ingest::remove_extra_root(&data_home(), &agent, std::path::Path::new(&path)).map_err(|e| e.to_string())
 }
 
+/// 手动新增记忆：与 CLI memory add 同一写入规则（决策/规则默认待确认，保存前查重提示）。
+#[tauri::command]
+fn memory_add(project_id: Option<i64>, r#type: String, content: String) -> Result<Value, String> {
+    let conn = open()?;
+    let scope = if project_id.is_some() { "project" } else { "global" };
+    let (id, similar) = db::save_memory_with_similar(&conn, &db::MemoryInput {
+        project_id,
+        scope,
+        r#type: &r#type,
+        content: &content,
+        status: None,
+        source_session_id: None,
+        source_message_id: None,
+    })
+    .map_err(|e| e.to_string())?;
+    let _ = db::log_usage(&conn, "app", "memory_add");
+    Ok(json!({
+        "memory_id": id,
+        "similar_count": similar.len(),
+        "promote_hint": db::promotion_hint(&r#type, &similar),
+    }))
+}
+
 #[tauri::command]
 fn update_memory(id: String, action: String, superseded_by: Option<String>) -> Result<Value, String> {
     db::update_memory_status(&open()?, &id, &action, superseded_by.as_deref()).map_err(|e| e.to_string())?;
@@ -1229,7 +1252,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            session_window, message_content, maintenance_status, collect_progress, stats, today, projects, context, project_dossier, daily_digest, daily_digest_export, sessions,
+            session_window, message_content, maintenance_status, collect_progress, memory_add, stats, today, projects, context, project_dossier, daily_digest, daily_digest_export, sessions,
             ai_settings_get, ai_settings_save, ai_organize_day, ai_summary_save,
             project_add, project_archive, project_restore, open_in_finder,
             session_proof, session_verify, session_export, session_writeback_plan,

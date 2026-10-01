@@ -1772,12 +1772,22 @@ pub fn memories_for_context(conn: &Connection, project_id: i64) -> Result<Value>
         include_global: true,
         limit: 20,
     })?;
-    let suggested: i64 = conn.query_row(
+    let suggested_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM memories WHERE status = 'suggested' AND (project_id = ?1 OR project_id IS NULL)",
         params![project_id],
         |r| r.get(0),
     )?;
-    Ok(json!({ "confirmed": confirmed, "suggested_pending": suggested }))
+    // 待确认的建议也交给 agent（带 status 字段区分），否则 agent 看不到自己刚存的决定
+    let suggested = list_memories(conn, &MemoryFilter {
+        project_id: Some(project_id),
+        scope: None,
+        r#type: None,
+        status: Some("suggested".into()),
+        agent: None,
+        include_global: true,
+        limit: 10,
+    })?;
+    Ok(json!({ "confirmed": confirmed, "suggested": suggested, "suggested_pending": suggested_count }))
 }
 
 pub fn open_tasks(conn: &Connection, project_id: Option<i64>) -> Result<Vec<Value>> {

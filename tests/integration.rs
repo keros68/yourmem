@@ -1207,3 +1207,21 @@ fn trash_rows_carry_the_first_user_message() {
     let row = trash.iter().find(|s| s["session_id"] == "claude:aaaa-1111").unwrap();
     assert!(row["preview"].as_str().is_some_and(|p| !p.is_empty()), "{row}");
 }
+
+#[test]
+fn project_context_lists_unconfirmed_suggestions() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let pid = db::upsert_project(&conn, "/work/ctx-proj", "ctx-proj").unwrap();
+    db::save_memory(&conn, &db::MemoryInput {
+        project_id: Some(pid), scope: "project", r#type: "decision",
+        content: "发布前先在真机上核对时间显示", status: None,
+        source_session_id: None, source_message_id: None,
+    }).unwrap();
+    let ctx = db::memories_for_context(&conn, pid).unwrap();
+    assert_eq!(ctx["suggested_pending"], 1);
+    let suggested = ctx["suggested"].as_array().unwrap();
+    assert_eq!(suggested.len(), 1);
+    assert_eq!(suggested[0]["status"], "suggested");
+    assert!(ctx["confirmed"].as_array().unwrap().is_empty());
+}

@@ -291,3 +291,21 @@ test('collection refresh leaves search results and pending confirmations alone',
   f.refreshAfterCollect().catch(() => {});
   assert.equal(f.requests.at(-1).command, 'sessions', 'otherwise the overview page refreshes');
 });
+
+test('the memory page saves a new memory through memory_add', async () => {
+  const f = app();
+  const pending = f.renderMemory();
+  const calls = f.requests.slice(-3);
+  calls[0].resolve({ memories: [] }); calls[1].resolve({ memories: [] }); calls[2].resolve({ memory_files: [] });
+  await pending;
+  f.get('#mem-add-content').value = '  决定：对象集中存放在一个库文件里  ';
+  f.get('#mem-add-type').value = 'decision';
+  f.get('#mem-add-project').value = '';
+  const saving = f.get('#mem-add-save').onclick();
+  const req = f.requests.at(-1);
+  assert.equal(req.command, 'memory_add');
+  assert.deepEqual({ ...req.args }, { projectId: null, type: 'decision', content: '决定：对象集中存放在一个库文件里' });
+  req.resolve({ memory_id: 'mem_1', similar_count: 0, promote_hint: null });
+  await saving;
+  assert.equal(f.notices.at(-1).textContent, '已保存');
+});

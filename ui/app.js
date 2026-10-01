@@ -797,10 +797,35 @@ async function renderMemory() {
             <span>${esc(f.scope)}</span><span>${f.revisions} 个修订</span><span>${fmtTime(f.last_captured)}</span></div>
         </div>`).join("") || '<div class="empty">暂无</div>'}
     </details>
-    <details class="mem-aux" data-aux="template" ${memAuxOpen.has("template") ? "open" : ""}>
-      <summary>新增记忆模板</summary>
-      <div class="memcard"><div class="content">用于把可复用的经验、决策或偏好保存为一条记忆；它不会从对话中自动生成。按实际证据填写，未验证内容标为待验证，再通过 agent 的 save_memory 或 CLI memory add 保存。</div><pre>${esc(EXPERIENCE_TEMPLATE)}</pre><button class="btn small" data-copy="${esc(EXPERIENCE_TEMPLATE)}">复制模板</button></div>
+    <details class="mem-aux" data-aux="add" ${memAuxOpen.has("add") ? "open" : ""}>
+      <summary>新增记忆</summary>
+      <div class="memcard mem-add">
+        <div class="searchbar" style="margin-top:0">
+          <select id="mem-add-type">
+            <option value="decision">决策</option><option value="rule">规则</option><option value="lesson">经验</option>
+            <option value="preference">偏好</option><option value="fact">事实</option><option value="context">上下文</option><option value="task">任务</option>
+          </select>
+          <select id="mem-add-project"><option value="">全局</option></select>
+        </div>
+        <textarea id="mem-add-content" rows="7" placeholder="${esc(EXPERIENCE_TEMPLATE)}"></textarea>
+        <div class="meta">按实际证据填写，未验证的内容注明待验证。决策和规则保存后为待确认，可在列表中确认。</div>
+        <button class="btn small primary" id="mem-add-save">保存</button>
+      </div>
     </details>`;
+  invoke("projects").then((pd) => {
+    const sel = $("#mem-add-project");
+    if (sel) sel.insertAdjacentHTML("beforeend", (pd.projects || []).map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join(""));
+  }).catch(() => {});
+  $("#mem-add-save").onclick = async () => {
+    const content = $("#mem-add-content").value.trim();
+    if (!content) { toast("请填写记忆内容"); return; }
+    const projectId = $("#mem-add-project").value ? Number($("#mem-add-project").value) : null;
+    try {
+      const r = await invoke("memory_add", { projectId, type: $("#mem-add-type").value, content });
+      toast(r.promote_hint || (r.similar_count ? `已保存；有 ${r.similar_count} 条相似记忆，可考虑合并或取代` : "已保存"));
+      renderMemory();
+    } catch (e) { toast(`保存失败：${e}`); }
+  };
   document.querySelectorAll("#page-memory .mem-aux").forEach((el) => {
     el.addEventListener("toggle", () => { if (el.open) memAuxOpen.add(el.dataset.aux); else memAuxOpen.delete(el.dataset.aux); });
   });
