@@ -722,6 +722,7 @@ svg.lgraph-edges text { fill: var(--faint); font-size: 10.5px; }
 #wizard-overlay { position: fixed; inset: 0; z-index: 90; background: rgba(0, 0, 0, 0.55); display: flex; align-items: center; justify-content: center; }
 #wizard-overlay .wiz-card { width: 520px; max-width: calc(100vw - 48px); background: var(--bg, #0b0e14); border: 1px solid var(--border-strong); border-radius: 10px; padding: 22px 24px; }
 #wizard-overlay h3 { margin: 14px 0 4px; }
+#wiz-agents label.chip { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .mem-aux { margin-top: 12px; }
 .mem-aux > summary { cursor: pointer; color: var(--dim); font-size: 13px; }
 .getting-started { display: grid; gap: 12px; max-width: 720px; padding-left: 22px; margin-top: 8px; }

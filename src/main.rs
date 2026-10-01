@@ -74,7 +74,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
-    /// Project dossier (§7.2): deterministic aggregate view with source pointers.
+    /// Project dossier: decisions, timeline, artifacts and handoffs, each linked to its source.
     /// Default JSON; --markdown / -o for wiki-style export.
     Dossier {
         /// Project name or path fragment (default: current directory's project).
@@ -84,7 +84,7 @@ enum Cmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
-    /// Daily digest (§7.3): today's sessions/projects/memories/artifacts card.
+    /// Daily digest: a day's sessions, projects, memories and artifacts.
     Digest {
         /// Day as YYYY-MM-DD (default: today, local time).
         day: Option<String>,
@@ -115,7 +115,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: HandoffCmd,
     },
-    /// Bundle: one-shot migration backup/restore (.tar.gz). 搬家，不是同步。
+    /// Bundle: full backup and restore as a .tar.gz file, for moving to another machine.
     Bundle {
         #[command(subcommand)]
         cmd: BundleCmd,
@@ -159,12 +159,12 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
-    /// Agent 数据源：检测五源 + 管理自定义采集根（config.json）。
+    /// Agent 数据源：检测各 agent 的对话目录，管理额外添加的目录。
     Agents {
         #[command(subcommand)]
         cmd: AgentsCmd,
     },
-    /// 搜索索引范围（1.0.1 轻量化）：工具输出默认不索引，status/enable-tools/
+    /// 搜索索引范围：工具输出默认不索引，status/enable-tools/
     /// disable-tools/compact 管理模式与磁盘占用。
     Index {
         #[command(subcommand)]
@@ -294,7 +294,7 @@ enum IndexCmd {
 
 #[derive(Subcommand)]
 enum AgentsCmd {
-    /// 检测五源 + 主流 agent 观察名单：默认根是否存在、各 agent 会话数、
+    /// 检测各 agent 与其他主流 agent：默认目录是否存在、各 agent 对话数、
     /// 已登记的自定义根、停用状态。
     List,
     /// 登记一个自定义采集根（仅文件型 agent：claude/codex/zcode/kimi）。

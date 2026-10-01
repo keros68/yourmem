@@ -174,43 +174,43 @@ pub fn capability_matrix() -> serde_json::Value {
           // fork/compact 谱系边（session_uuids 目击表）
           "lineage": "yes", "resume": "yes",
           "writeback": "yes", "encrypted": "no",
-          "notes": "压缩=新文件+compact 谱系边；写回限文件型（restore-agents）" },
+          "notes": "上下文压缩后的新对话与原对话相连；可写回原目录" },
         { "agent": AGENT_CODEX, "transcript": "yes", "search": "yes",
           "lineage": "yes", "resume": "yes",
           "writeback": "yes", "encrypted": "no",
-          "notes": "读取 session_meta 的 fork、续接与子 agent 父会话；压缩点留接口；写回限文件型" },
+          "notes": "识别分叉、续聊和子任务对话；可写回原目录" },
         { "agent": opencode::AGENT_OPENCODE, "transcript": "yes", "search": "yes",
           "lineage": "no", "resume": "yes",
           // SQLite 单库源：只读原则，不向别人的库插行（restore.rs 注释）
           "writeback": "no", "encrypted": "no",
-          "notes": "SQLite 单库源，写回不做；恢复走 bundle restore 进 yourmem" },
+          "notes": "数据保存在单个数据库中，不支持写回；可通过完整备份迁移" },
         { "agent": AGENT_ZCODE, "transcript": "yes", "search": "yes",
           "lineage": "no", "resume": "no",
           "writeback": "no", "encrypted": "no",
-          "notes": "0.3.8 压缩点备份首发源；无原生 resume 入口；cwd 从元库补查" },
+          "notes": "支持取回上下文压缩前的原文；没有续聊命令" },
         { "agent": AGENT_KIMI, "transcript": "yes", "search": "yes",
           // 子 agent 以 #名字 独立成会话，是拆分不是谱系边
           "lineage": "no", "resume": "partial",
           "writeback": "no", "encrypted": "no",
-          "notes": "resume 仅 main 会话（kimi -S）；子 agent 无独立恢复入口" },
+          "notes": "主对话可续聊；子任务没有独立的续聊命令" },
         { "agent": AGENT_HERMES, "transcript": "yes", "search": "yes",
           "lineage": "yes", "resume": "yes",
           "writeback": "no", "encrypted": "no",
-          "notes": "SQLite 单库源；cron 来源按本人裁定不采；压缩点检测内置待首例校准" },
+          "notes": "数据保存在单个数据库中；不采集定时任务日志" },
         { "agent": AGENT_PI, "transcript": "yes", "search": "yes",
           "lineage": "no", "resume": "yes",
           "writeback": "no", "encrypted": "no",
-          "notes": "v3 树状 JSONL；cwd 在会话头行；行内 parentId 是文件内重试分支非跨会话谱系；写回待真机验证后开放" },
+          "notes": "暂不识别对话之间的继承关系；暂不支持写回" },
     ])
 }
 
 /// 观察名单里的加密源（DESIGN-0.3 §3.2 硬阻断）：能力矩阵如实标注，不做。
 pub fn encrypted_watchlist() -> serde_json::Value {
     serde_json::json!([
-        { "agent": "trae", "encrypted": "yes", "notes": "ModularData 加密，硬阻断不做" },
+        { "agent": "trae", "encrypted": "yes", "notes": "数据已加密，暂不支持" },
         // antigravity 的"加密"出自 Swob 对 IDE 主存储（protobuf）的观察；resume-skills
         // 报道存在明文转录 lane（brain/<id>/.system_generated/logs/transcript.jsonl）。
         // 两条 lane 可能并存——按样本门禁：本机拿到真实样本核验后才改判，现维持硬阻断。
-        { "agent": "antigravity", "encrypted": "yes", "notes": "加密 protobuf，硬阻断不做（另有明文转录 lane 的报道，待真实样本核验）" },
+        { "agent": "antigravity", "encrypted": "yes", "notes": "数据已加密，暂不支持" },
     ])
 }

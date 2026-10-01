@@ -89,13 +89,20 @@ function bindCopyButtons(scope) {
 }
 
 // ---------------------------------------------------------------- today
+// 自检项的显示名
+const DOCTOR_NAMES = {
+  schema: "数据库结构", fts: "搜索索引", db_free: "空闲空间", vault_sample: "原件抽验",
+  vault_missing: "原件完整性", tmp_residue: "临时文件", orphan_objects: "未引用原件",
+  memory_files: "记忆文件", db_snapshot: "快照", doctor: "自检",
+};
+
 // 后台维护（快照、自检）只在出问题时提示
 function maintenanceNoticeHtml(st) {
   const items = [];
-  if (st?.snapshot?.ok === false && !st.snapshot.retry) items.push("上次自动快照失败，可在设置 → 存储与备份中重试");
-  for (const p of st?.doctor?.problems || []) items.push(p.detail);
+  if (st?.snapshot?.ok === false && !st.snapshot.retry) items.push("自动快照失败");
+  for (const p of st?.doctor?.problems || []) items.push(DOCTOR_NAMES[p.name] || p.name);
   if (!items.length) return "";
-  return `<div class="notice"><span>后台自检发现 ${items.length} 个问题：${items.map(esc).join("；")}</span><button class="btn small" id="maint-open">打开设置</button></div>`;
+  return `<div class="notice"><span>后台自检发现 ${items.length} 个问题：${items.map(esc).join("、")}，详情见设置。</span><button class="btn small" id="maint-open">打开设置</button></div>`;
 }
 
 const localDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -762,7 +769,7 @@ async function renderMemory() {
     <div class="searchbar">
       <select id="mem-status">
         ${memView === "graph" ? '<option value="all">全部状态（关系图）</option>' : ""}
-        <option value="">活跃（suggested + confirmed）</option>
+        <option value="">活跃（建议 + 已确认）</option>
         <option value="suggested">待确认 suggested</option>
         <option value="confirmed">已确认 confirmed</option>
         <option value="superseded">已取代 superseded</option>
@@ -1030,7 +1037,7 @@ async function renderSettings() {
     ${panel("sources", `
       <h2>Agent 数据源</h2>
       <div class="memcard">
-        <div class="meta" style="margin-top:0">文件型 agent 可登记额外采集根（import 时自动合并；opencode 是单库源，不支持）。卸载 agent 后在此停用：不再采集，历史数据仍可检索。</div>
+        <div class="meta" style="margin-top:0">可为文件型 agent 添加额外的对话目录；opencode 只有单一数据库，不支持添加。卸载 agent 后可在此停用：不再采集，历史数据仍可检索。</div>
         <div class="scrollbox"><table class="wrap"><tr><th>agent</th><th>默认根</th><th>检测</th><th class="c-num">对话</th><th>最后采集</th><th>额外根</th><th>采集</th></tr>
         ${agentsInfo.agents.filter((a) => showDisabledSources || !a.disabled).map((a) => `<tr style="${a.disabled ? "opacity:.5" : ""}">
           <td><span class="pill ${esc(a.agent)}">${esc(a.agent)}</span></td>
@@ -1066,8 +1073,8 @@ async function renderSettings() {
     ${panel("cap", `
       <h2>能力矩阵</h2>
       <div class="memcard">
-        <div class="meta" style="margin-top:0">✓ 支持 · ◐ 部分 · — 不支持。写回仅限文件型 agent（SQLite 型不写他人库）；源加密为硬阻断。</div>
-        <table><tr><th>agent</th><th>采集</th><th>搜索</th><th>谱系</th><th>resume</th><th>写回</th><th>源加密</th><th>备注</th></tr>
+        <div class="meta" style="margin-top:0">✓ 支持 · ◐ 部分 · — 不支持。写回仅支持按文件保存对话的 agent；数据加密的 agent 暂不支持。</div>
+        <table><tr><th>agent</th><th>采集</th><th>搜索</th><th>谱系</th><th>续聊</th><th>写回</th><th>数据加密</th><th>备注</th></tr>
         ${cap.adapters.map((a) => `<tr>
           <td><span class="pill ${esc(a.agent)}">${esc(a.agent)}</span></td>
           <td>${capCell(a.transcript)}</td><td>${capCell(a.search)}</td><td>${capCell(a.lineage)}</td>
@@ -1189,7 +1196,7 @@ async function renderSettings() {
     ${panel("ai", `
       <h2>AI 整理</h2>
       <div class="memcard">
-        <div class="content">连接兼容 OpenAI Chat Completions 的 API，为动态生成带来源的项目摘要。未配置时，动态、搜索和归档仍可使用。</div>
+        <div class="content">连接兼容 OpenAI Chat Completions 的 API，为今天页生成带来源的项目摘要。未配置时，今天页、搜索和归档仍可使用。</div>
         <div class="ai-settings-note">单次仅发送对话标题、末条 Agent 回复、任务、产物路径和交接摘要，不发送完整对话、文件内容或 API Key。模型输出先作为建议显示，点击保存后才写入项目记忆。</div>
         ${aiSettingsError ? `<div class="digest digest-error">系统凭据库不可用：${esc(aiSettingsError)}</div>` : ""}
         <div class="form-grid ai-settings-form">
@@ -1229,7 +1236,7 @@ async function renderSettings() {
       </div>
       <div class="searchbar" style="margin-top:8px">
         <button class="btn" id="doctor-run">运行自检（doctor）</button>
-        <span style="color:var(--faint);font-size:12px">schema / FTS / vault 抽验 / 对象缺失 / 快照新鲜度——只读，不改数据</span>
+        <span style="color:var(--faint);font-size:12px">检查数据库、搜索索引、归档原件和快照，不修改数据</span>
       </div>
       <div id="doctor-report"></div>
       <div class="content" style="margin-top:8px">近 7 天使用（本地统计，不外传）：</div>
@@ -1443,7 +1450,7 @@ async function renderSettings() {
       const icon = (s) => s === "ok" ? '<span class="cap-yes">✓</span>' : s === "warn" ? '<span class="cap-partial">⚠</span>' : '<span class="proof-bad">✗</span>';
       $("#doctor-report").innerHTML = `
         <div class="meta" style="margin-top:6px">${r.ok ? '<span class="cap-yes">✓ 全部通过</span>' : '<span class="proof-bad">✗ 有失败项</span>'} · ${fmtTime(r.checked_at)}</div>
-        <table>${r.checks.map((c) => `<tr><td>${icon(c.status)}</td><td style="white-space:nowrap">${esc(c.name)}</td><td style="color:var(--dim)">${esc(c.detail)}</td></tr>`).join("")}</table>`;
+        <table>${r.checks.map((c) => `<tr><td>${icon(c.status)}</td><td style="white-space:nowrap">${esc(DOCTOR_NAMES[c.name] || c.name)}</td><td style="color:var(--dim)">${esc(c.detail)}</td></tr>`).join("")}</table>`;
     } catch (e) { $("#doctor-report").innerHTML = `<div class="meta">✗ 自检失败：${esc(e)}</div>`; }
   };
   let plannedSetupAgents = [];
