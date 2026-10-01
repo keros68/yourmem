@@ -22,7 +22,7 @@ function app() {
   vm.runInContext(ui('project-recall.js').replace('export async function', 'async function'), context);
   vm.runInContext(ui('graph-layout.js').replace('export function', 'function'), context);
   const bundleCode = ui('app.js').slice(ui('app.js').indexOf('  let bundleBusy = false'), ui('app.js').indexOf('  $("#auto-purge").onchange'));
-  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
+  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
   return { ...context.testApp, get, lists, requests, notices };
 }
 
@@ -271,4 +271,23 @@ test('times are shown in the local time zone', () => {
   } finally {
     if (saved === undefined) delete process.env.TZ; else process.env.TZ = saved;
   }
+});
+
+test('collection refresh leaves search results and pending confirmations alone', async () => {
+  const f = app();
+  f.get('.nav.active').dataset.page = 'search';
+  f.get('#page-search').innerHTML = 'query results';
+  const before = f.requests.length;
+  await f.refreshAfterCollect();
+  assert.equal(f.requests.length, before, 'search page is not re-rendered');
+  assert.equal(f.get('#page-search').innerHTML, 'query results');
+
+  f.get('.nav.active').dataset.page = 'sessions';
+  f.lists.set('[data-armed="1"]', [{}]);
+  await f.refreshAfterCollect();
+  assert.equal(f.requests.length, before, 'an armed confirmation blocks the refresh');
+
+  f.lists.delete('[data-armed="1"]');
+  f.refreshAfterCollect().catch(() => {});
+  assert.equal(f.requests.at(-1).command, 'sessions', 'otherwise the overview page refreshes');
 });

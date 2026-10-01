@@ -92,7 +92,7 @@ function bindCopyButtons(scope) {
 // 后台维护（快照、自检）只在出问题时提示
 function maintenanceNoticeHtml(st) {
   const items = [];
-  if (st?.snapshot?.ok === false) items.push(`自动快照失败：${st.snapshot.error}`);
+  if (st?.snapshot?.ok === false && !st.snapshot.retry) items.push("上次自动快照失败，可在设置 → 存储与备份中重试");
   for (const p of st?.doctor?.problems || []) items.push(p.detail);
   if (!items.length) return "";
   return `<div class="notice"><span>后台自检发现 ${items.length} 个问题：${items.map(esc).join("；")}</span><button class="btn small" id="maint-open">打开设置</button></div>`;
@@ -1532,13 +1532,24 @@ async function renderSettings() {
     const snapLine = !days ? "自动快照已关闭"
       : !snap ? `每 ${days} 天自动创建快照，首份将在后台完成`
       : snap.ok ? `每 ${days} 天自动创建快照 · 上次 ${fmtTime(snap.at)} · 下次约 ${fmtTime(next)}`
-      : `<span class="proof-bad">上次自动快照失败（${fmtTime(snap.at)}）：${esc(snap.error)}</span>`;
+      : snap.retry ? "首份自动快照因采集进行中延后，将自动重试"
+      : `<span class="proof-bad" title="${esc(snap.error)}">上次自动快照失败（${fmtTime(snap.at)}）</span> <button class="btn small" id="auto-snapshot-now">立即创建快照</button>`;
     const doc = m.doctor;
     const docLine = !doc ? "每日自检尚未运行"
       : doc.problems?.length ? `<span class="proof-bad">每日自检发现 ${doc.problems.length} 个问题（${fmtTime(doc.at)}）</span>`
       : `每日自检正常 · ${fmtTime(doc.at)}`;
     const mig = m.migration?.remaining ? `<br>正在把早期版本的原件迁入对象库，已完成 ${m.migration.moved} 项` : "";
     el.innerHTML = `${snapLine}<br>${docLine}${mig}`;
+    const now = $("#auto-snapshot-now");
+    if (now) {
+      now.onclick = async () => {
+        now.disabled = true;
+        now.textContent = "创建中…";
+        try { await invoke("snapshot_create"); toast("快照已创建"); }
+        catch (e) { toast(`创建快照失败：${e}`); }
+        drawAutoBackup();
+      };
+    }
   };
   // 存储占用
   const drawStorage = async () => {
@@ -1740,8 +1751,7 @@ $("#btn-import").onclick = async () => {
   try {
     const r = await invoke("import_now");
     toast(`完成：新增 ${r.messages_added} 条消息 / ${r.lines_archived} 行归档`);
-    const current = document.querySelector(".nav.active").dataset.page;
-    try { await pageRenderers[current](); }
+    try { await refreshAfterCollect(); }
     catch (e) { toast(`采集完成，页面更新失败：${e}`); }
   } catch (e) {
     toast(`采集失败：${e}`);
@@ -1752,16 +1762,23 @@ $("#btn-import").onclick = async () => {
   }
 };
 
-// 后台采集到新内容后刷新当前页。抽屉打开、正在输入、有勾选项或停在其他页时不打断。
+// 采集后只刷新概览类页面，并且不打断进行中的操作：输入、详情抽屉、勾选、
+// 待二次确认的按钮、键盘选中行。搜索、记忆、设置页保留当前内容。
 const AUTO_REFRESH_PAGES = new Set(["today", "projects", "sessions"]);
-window.__TAURI__.event?.listen?.("collected", () => {
-  const current = document.querySelector(".nav.active")?.dataset.page;
+function busyWithPage(current) {
   const el = document.activeElement;
   const typing = el && (["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) || el.isContentEditable);
-  if (!AUTO_REFRESH_PAGES.has(current) || typing || !$("#drawer").classList.contains("hidden")) return;
-  if (current === "sessions" && sessChecked.size) return;
-  pageRenderers[current]().catch(() => {});
-});
+  const drawerOpen = document.querySelector("#drawer")?.classList?.contains?.("hidden") === false;
+  const armed = document.querySelectorAll('[data-armed="1"]').length > 0 || Date.now() - kbDelArmedAt < 4000;
+  const kbSelected = !!kbSel?.isConnected && !!kbSel.closest?.(".page.active");
+  return typing || drawerOpen || armed || kbSelected || (current === "sessions" && sessChecked.size > 0);
+}
+async function refreshAfterCollect() {
+  const current = document.querySelector(".nav.active")?.dataset.page;
+  if (!AUTO_REFRESH_PAGES.has(current) || busyWithPage(current)) return;
+  await pageRenderers[current]();
+}
+window.__TAURI__.event?.listen?.("collected", () => { refreshAfterCollect().catch(() => {}); });
 window.__TAURI__.event?.listen?.("maintenance", () => {
   if (document.querySelector(".nav.active")?.dataset.page === "today") pageRenderers.today().catch(() => {});
 });

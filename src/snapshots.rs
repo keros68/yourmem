@@ -59,11 +59,16 @@ fn safe_dirs(repo: &Path) -> Result<()> {
     }
     Ok(())
 }
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn lock(repo: &Path) -> Result<ImportLockTx> {
+    lock_within(repo, LOCK_WAIT)
+}
+fn lock_within(repo: &Path, wait: std::time::Duration) -> Result<ImportLockTx> {
     safe_dirs(repo)?;
     std::fs::create_dir_all(repo.join("blobs"))?;
     std::fs::create_dir_all(repo.join("snapshots"))?;
-    let lock = ImportLockTx::acquire(repo, std::time::Duration::from_secs(120))?;
+    let lock = ImportLockTx::acquire(repo, wait)?;
     let marker = repo.join("repository.json");
     if marker.exists() {
         regular(&marker)?;
@@ -268,9 +273,14 @@ pub fn list(home: &Path) -> Result<Value> {
     )
 }
 pub fn create(home: &Path) -> Result<Value> {
+    create_within(home, LOCK_WAIT)
+}
+
+/// Create a snapshot, waiting at most `wait` for the repository and import locks.
+pub fn create_within(home: &Path, wait: std::time::Duration) -> Result<Value> {
     let repo = root(home);
-    let _repo_lock = lock(&repo)?;
-    let _import_lock = ImportLockTx::acquire(home, std::time::Duration::from_secs(120))?;
+    let _repo_lock = lock_within(&repo, wait)?;
+    let _import_lock = ImportLockTx::acquire(home, wait)?;
     let tmp = work_dir(&repo)?;
     let path = tmp.path().join("snapshot.sqlite");
     let conn = db::open(home)?;

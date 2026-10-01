@@ -14,6 +14,19 @@ const DOCTOR_INTERVAL_SECS: u64 = 86_400;
 const DEFAULT_SNAPSHOT_INTERVAL_DAYS: u64 = 7;
 const STALE_TMP: Duration = Duration::from_secs(86_400);
 const MIGRATE_BATCH: usize = 20_000;
+/// The worker never waits long for a lock: someone is collecting or editing.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+/// A snapshot deferred by a held lock is retried after this many seconds.
+const BUSY_RETRY_SECS: u64 = 600;
+
+/// The database or repository was locked by another writer: not a failure.
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<rusqlite::Error>().and_then(|e| e.sqlite_error_code()).is_some_and(|code| {
+            matches!(code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        })
+    })
+}
 
 fn state_path(home: &Path) -> PathBuf {
     home.join("maintenance.json")
@@ -74,6 +87,18 @@ fn remove_stale_tmp(home: &Path) -> usize {
     removed
 }
 
+/// Create a snapshot on request and record it as the latest automatic one,
+/// so a previous failure stops being reported.
+pub fn snapshot_now(home: &Path) -> Result<Value> {
+    let r = crate::snapshots::create(home)?;
+    let mut state = status(home);
+    state["snapshot_attempt_at"] = json!(now_secs());
+    state["snapshot_retry_at"] = Value::Null;
+    state["snapshot"] = json!({"ok": true, "at": crate::now_iso(), "id": r["id"]});
+    save(home, &state)?;
+    Ok(r)
+}
+
 /// Run whatever is due. Each task records its attempt time, so a failing task
 /// is retried on its next interval rather than on every collection pass.
 pub fn run_due(home: &Path) -> Result<Value> {
@@ -103,12 +128,32 @@ pub fn run_due(home: &Path) -> Result<Value> {
 
     let interval_days = snapshot_interval_days(home);
     // 迁移未完成时快照要逐个读旧文件，等迁完再做
-    if interval_days > 0 && !migrating && due(&state["snapshot_attempt_at"], interval_days * 86_400, now) {
-        state["snapshot_attempt_at"] = json!(now);
-        state["snapshot"] = match crate::snapshots::create(home) {
-            Ok(r) => json!({"ok": true, "at": crate::now_iso(), "id": r["id"]}),
-            Err(e) => json!({"ok": false, "at": crate::now_iso(), "error": format!("{e:#}")}),
-        };
+    let retry_wait = state["snapshot_retry_at"].as_u64().is_some_and(|t| now < t);
+    if interval_days > 0
+        && !migrating
+        && !retry_wait
+        && due(&state["snapshot_attempt_at"], interval_days * 86_400, now)
+    {
+        match crate::snapshots::create_within(home, LOCK_WAIT) {
+            Ok(r) => {
+                state["snapshot_attempt_at"] = json!(now);
+                state["snapshot_retry_at"] = Value::Null;
+                state["snapshot"] = json!({"ok": true, "at": crate::now_iso(), "id": r["id"]});
+            }
+            // 被采集或其他操作占着锁：不算失败，不推迟到下个周期，过一会儿再试
+            Err(e) if is_busy(&e) => {
+                state["snapshot_retry_at"] = json!(now + BUSY_RETRY_SECS);
+                let last_ok = state["snapshot"]["ok"] == true;
+                if !last_ok {
+                    state["snapshot"] = json!({"ok": false, "retry": true, "at": crate::now_iso()});
+                }
+            }
+            Err(e) => {
+                state["snapshot_attempt_at"] = json!(now);
+                state["snapshot_retry_at"] = Value::Null;
+                state["snapshot"] = json!({"ok": false, "at": crate::now_iso(), "error": format!("{e:#}")});
+            }
+        }
         save(home, &state)?;
         ran.push("snapshot");
     }
@@ -124,8 +169,9 @@ pub fn run_due(home: &Path) -> Result<Value> {
                     .into_iter()
                     .flatten()
                     .filter(|c| c["status"] != "ok")
-                    // 关闭自动快照时，"快照过旧"不是需要处理的问题
-                    .filter(|c| interval_days > 0 || c["name"] != "db_snapshot")
+                    // "快照过旧"只在曾成功创建过快照时才算问题：关闭自动快照或首份
+                    // 尚未完成时不提示，失败另有快照状态说明
+                    .filter(|c| c["name"] != "db_snapshot" || (interval_days > 0 && state["snapshot"]["ok"] == true))
                     .cloned()
                     .collect();
                 json!({"ok": r["ok"], "at": r["checked_at"], "problems": problems, "tmp_removed": tmp_removed})
@@ -202,5 +248,31 @@ mod tests {
         assert_eq!(first["ran"], json!(["migration", "doctor"]), "snapshot waits while files remain");
         let second = run_due(home).unwrap();
         assert_eq!(second["ran"], json!(["migration", "snapshot"]));
+    }
+
+    #[test]
+    fn a_held_lock_defers_the_snapshot_instead_of_failing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::db::open(home).unwrap();
+        let lock = crate::ingest::ImportLockTx::acquire(home, Duration::from_secs(1)).unwrap();
+        let r = run_due(home).unwrap();
+        assert!(r["ran"].as_array().unwrap().contains(&json!("snapshot")));
+        let st = status(home);
+        assert_eq!(st["snapshot"]["retry"], true, "{st}");
+        assert!(st["snapshot_attempt_at"].is_null(), "未记为一次尝试，不等整个周期");
+        assert!(st["snapshot_retry_at"].as_u64().unwrap() > now_secs());
+        assert!(st["doctor"]["problems"].as_array().unwrap().iter().all(|p| p["name"] != "db_snapshot"),
+            "首份快照未完成时不提示快照过旧：{st}");
+        drop(lock);
+
+        // 等待时间到后自动补做
+        let mut state = status(home);
+        state["snapshot_retry_at"] = json!(now_secs() - 1);
+        save(home, &state).unwrap();
+        run_due(home).unwrap();
+        let st = status(home);
+        assert_eq!(st["snapshot"]["ok"], true, "{st}");
+        assert!(st["snapshot_retry_at"].is_null());
     }
 }

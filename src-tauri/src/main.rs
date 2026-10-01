@@ -1148,7 +1148,7 @@ async fn snapshot_list() -> Result<Value, String> {
 }
 #[tauri::command]
 async fn snapshot_create() -> Result<Value, String> {
-    run_blocking(|| yourmem::snapshots::create(&data_home()).map_err(|e| format!("{e:#}"))).await
+    run_blocking(|| yourmem::maintenance::snapshot_now(&data_home()).map_err(|e| format!("{e:#}"))).await
 }
 #[tauri::command]
 async fn snapshot_export(id: String) -> Result<Value, String> {

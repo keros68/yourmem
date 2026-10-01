@@ -58,7 +58,11 @@ pub fn setup(app: &mut App) -> tauri::Result<()> {
                 let _ = handle.emit("collected", yourmem::ingest::outcome_json(&o));
             }
             Ok(_) => {}
-            Err(e) => eprintln!("yourmem background import: {e:#}"),
+            // 导入锁被占说明有人正在写库，维护留到下一轮
+            Err(e) => {
+                eprintln!("yourmem background import: {e:#}");
+                continue;
+            }
         }
         match yourmem::maintenance::run_due(&home) {
             Ok(r) if r["ran"].as_array().is_some_and(|a| !a.is_empty()) => {
