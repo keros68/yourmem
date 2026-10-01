@@ -6,7 +6,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>\"]/g, (c) => ({
 const fmtTime = (t) => {
   if (!t) return "—";
   const d = new Date(t);
-  if (Number.isNaN(d.getTime())) return String(t).replace("T", " ").slice(11, 16);
+  if (Number.isNaN(d.getTime())) return "—";
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 };
 const clipped = (s, max = 180) => {

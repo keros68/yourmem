@@ -560,5 +560,6 @@ fn apply_plan(repo: &Path, p: &Value) -> Result<Value> {
             rstore.remove(hash)?;
         }
     }
+    rstore.release_space()?;
     Ok(json!({"removed":p["remove_count"],"reclaimed_bytes":p["reclaim_bytes"]}))
 }

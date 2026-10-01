@@ -673,6 +673,9 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
             let _ = store.remove(&hash);
         }
     }
+    if resync {
+        let _ = store.release_space();
+    }
 
     let net = (total - old_count).max(0) as u64;
     // resync 分支的 lines 就是全量重读的 full——两种情况下"本轮归档了多少行"

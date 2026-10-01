@@ -8,12 +8,12 @@ const { invoke } = window.__TAURI__.core;
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-// 后端时间是 UTC 的 ISO 串，界面按本地时区显示；解析不了的原样截取
+// 后端时间是 UTC 的 ISO 串，界面按本地时区显示；解析不了的显示占位符（结果会直接拼进页面）
 const pad2 = (n) => String(n).padStart(2, "0");
 const fmtTime = (t) => {
   if (!t) return "—";
   const d = new Date(t);
-  if (Number.isNaN(d.getTime())) return String(t).replace("T", " ").slice(0, 16);
+  if (Number.isNaN(d.getTime())) return "—";
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 };
 // 表格时间列双格式：窄窗口（媒体查询 ≤1239px）切 "MM-DD HH:MM" 省 ~30px/列，
@@ -216,15 +216,22 @@ function paintActivity() {
 }
 
 // 今天页：当天概况 + 按项目和 Agent 的动态明细；停留在今天时跟随日期
+// 连续切换日期时，只采用最后一次请求的结果
+let todayRequest = 0;
 async function renderToday() {
+  const request = ++todayRequest;
   if (activityFollowsToday) activityDay = localDay(new Date());
-  [activityDigest, maintState] = await Promise.all([
+  const [digest, maint] = await Promise.all([
     invoke("daily_digest", { day: activityDay }),
     invoke("maintenance_status").catch(() => ({})),
   ]);
+  if (request !== todayRequest) return;
+  activityDigest = digest;
+  maintState = maint;
   // 资料库还是空的：显示上手步骤，而不是一片空白的动态
   if (!(activityDigest.project_activity || []).length) {
     const st = await invoke("stats").catch(() => null);
+    if (request !== todayRequest) return;
     if (st && !st.sessions) { paintGettingStarted(); return; }
   }
   paintActivity();
@@ -509,9 +516,9 @@ async function renderSessions() {
   }
   const groups = new Map();
   for (const s of d.sessions) {
-    const date = s.ended_at || s.started_at || "";
+    const local = fmtTime(s.ended_at || s.started_at); // 与行内显示一致，按本地时区分月
     const key = sessGroup === "month"
-      ? (date.slice(0, 7) || "（未记录时间）")
+      ? (local !== "—" ? local.slice(0, 7) : "（未记录时间）")
       : (s.project || "（无项目）");
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(s);
@@ -824,14 +831,18 @@ async function renderMemory() {
     if (sel) sel.insertAdjacentHTML("beforeend", (pd.projects || []).map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join(""));
   }).catch(() => {});
   $("#mem-add-save").onclick = async () => {
+    const btn = $("#mem-add-save");
+    if (btn.disabled) return; // 保存完成前不重复提交
     const content = $("#mem-add-content").value.trim();
     if (!content) { toast("请填写记忆内容"); return; }
     const projectId = $("#mem-add-project").value ? Number($("#mem-add-project").value) : null;
+    btn.disabled = true;
     try {
       const r = await invoke("memory_add", { projectId, type: $("#mem-add-type").value, content });
       toast(r.promote_hint || (r.similar_count ? `已保存；有 ${r.similar_count} 条相似记忆，可考虑合并或取代` : "已保存"));
       renderMemory();
     } catch (e) { toast(`保存失败：${e}`); }
+    finally { btn.disabled = false; }
   };
   document.querySelectorAll("#page-memory .mem-aux").forEach((el) => {
     el.addEventListener("toggle", () => { if (el.open) memAuxOpen.add(el.dataset.aux); else memAuxOpen.delete(el.dataset.aux); });
@@ -1640,7 +1651,8 @@ async function renderSettings() {
     const r = await invoke("orphan_cleanup_run", { token: orphanToken });
     orphanToken = null;
     $("#orphan-run").classList.add("hidden");
-    $("#tidy-report").innerHTML = `<div class="meta cap-yes">✓ 已删除 ${r.removed} 个对象，释放 ${fmtBytes(r.reclaimed_bytes)}</div>`;
+    const freed = r.disk_freed_bytes || 0;
+    $("#tidy-report").innerHTML = `<div class="meta cap-yes">✓ 已删除 ${r.removed} 个对象（${fmtBytes(r.reclaimed_bytes)}），磁盘释放 ${fmtBytes(freed)}${freed < r.reclaimed_bytes / 2 ? "；运行「回收空闲空间」可释放其余空间" : ""}</div>`;
   });
   let curBackupDir = bd.effective;
   $("#backup-dir-save").onclick = async () => {

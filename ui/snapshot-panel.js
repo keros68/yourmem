@@ -40,7 +40,7 @@ export function bindSnapshotPanel({ invoke, root, bundleInput, esc = (s) => Stri
   const time = (t) => {
     if (!t) return "—";
     const d = new Date(t);
-    if (Number.isNaN(d.getTime())) return String(t).replace("T", " ").slice(0, 16);
+    if (Number.isNaN(d.getTime())) return "—";
     return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   };
   const reportError = (el, error) => { el.textContent = `操作失败：${String(error)}`; };

@@ -57,8 +57,11 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(db)?;
+        // auto_vacuum 只对新建的空库生效（老库在 compact 时转换）：删除对象后
+        // 由 release_space 把空闲页还给磁盘，不必整库复制
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=30000; PRAGMA journal_size_limit=67108864;
+            "PRAGMA auto_vacuum=INCREMENTAL;
+             PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=30000; PRAGMA journal_size_limit=67108864;
              CREATE TABLE IF NOT EXISTS objects(hash TEXT PRIMARY KEY, data BLOB NOT NULL);",
         )?;
         Ok(Store { conn, home: home.to_path_buf() })
@@ -162,6 +165,27 @@ impl Store {
     /// Group writes into one synced transaction.
     pub fn transaction(&self) -> Result<rusqlite::Transaction<'_>> {
         Ok(self.conn.unchecked_transaction()?)
+    }
+
+    /// Return pages freed by deletions to the disk. Effective once the store
+    /// uses incremental auto-vacuum (new stores, or after `compact`).
+    pub fn release_space(&self) -> Result<()> {
+        // 检查点把截短后的页写回主文件，文件大小才会真正变小
+        // incremental_vacuum 每步释放一页，必须执行到底
+        {
+            let mut stmt = self.conn.prepare("PRAGMA incremental_vacuum")?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+        }
+        self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(())
+    }
+
+    /// Rewrite the store compactly and switch it to incremental auto-vacuum,
+    /// so later deletions free disk space right away.
+    pub fn compact(&self) -> Result<()> {
+        self.conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+        Ok(())
     }
 
     /// Remove an object from the store and any legacy file.
@@ -488,6 +512,7 @@ pub fn orphan_cleanup(conn: &Connection, home: &Path, token: &str) -> Result<Val
     let rows = orphan_inventory(conn, home)?;
     anyhow::ensure!(hash_bytes(&serde_json::to_vec(&rows)?) == token, "对象库已变化，请重新预览");
     let store = Store::open(home)?;
+    let disk_before = store_disk_bytes(home);
     let mut removed = 0u64;
     let mut reclaimed = 0u64;
     for (key, size) in rows {
@@ -505,7 +530,11 @@ pub fn orphan_cleanup(conn: &Connection, home: &Path, token: &str) -> Result<Val
         removed += 1;
         reclaimed += size;
     }
-    Ok(json!({"removed":removed,"reclaimed_bytes":reclaimed}))
+    store.release_space()?;
+    let freed = disk_before.saturating_sub(store_disk_bytes(home));
+    // reclaimed_bytes 是删除的内容大小；disk_freed_bytes 是磁盘实际减少的字节，
+    // 老库在"回收空闲空间"之前为 0
+    Ok(json!({"removed":removed,"reclaimed_bytes":reclaimed,"disk_freed_bytes":freed}))
 }
 
 // ------------------------------------------------------------ db snapshots
@@ -702,5 +731,20 @@ mod tests {
             .execute("INSERT INTO objects(hash, data) VALUES (?1, x'00')", [&hash]).unwrap();
         migrate_legacy(home, 10).unwrap();
         assert_eq!(Store::open(home).unwrap().get(&hash, true).unwrap(), bytes);
+    }
+
+    #[test]
+    fn deleting_objects_frees_disk_space_in_new_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let conn = crate::db::open(home).unwrap();
+        let big: Vec<u8> = (0..2_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        store_line(home, &big).unwrap();
+        Store::open(home).unwrap().release_space().unwrap();
+        let p = orphan_cleanup_plan(&conn, home).unwrap();
+        let r = orphan_cleanup(&conn, home, p["token"].as_str().unwrap()).unwrap();
+        assert_eq!(r["removed"], 1);
+        let deleted = r["reclaimed_bytes"].as_u64().unwrap();
+        assert!(r["disk_freed_bytes"].as_u64().unwrap() * 10 >= deleted * 9, "磁盘实际释放约等于删除的内容：{r}");
     }
 }

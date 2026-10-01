@@ -1031,6 +1031,7 @@ fn main() -> Result<()> {
                 let before = db::index_status(&conn)?;
                 let _ = db::log_usage(&conn, "cli", "index compact");
                 conn.execute_batch("VACUUM")?;
+                vault::Store::open(&home)?.compact()?;
                 let mut after = db::index_status(&conn)?;
                 after["before_bytes"] = before["db_bytes"].clone();
                 print_json(&after);

@@ -269,6 +269,7 @@ fn archive_objects(conn: &Connection, home: &Path, backup_dir: &Path) -> Result<
         conn.execute("DELETE FROM gc_pending WHERE hash = ?1", params![hash])?;
         removed += 1;
     }
+    store.release_space()?;
     Ok((removed, kept))
 }
 

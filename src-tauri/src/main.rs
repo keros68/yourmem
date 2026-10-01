@@ -833,25 +833,28 @@ fn agent_remove_root(agent: String, path: String) -> Result<Value, String> {
 
 /// 手动新增记忆：与 CLI memory add 同一写入规则（决策/规则默认待确认，保存前查重提示）。
 #[tauri::command]
-fn memory_add(project_id: Option<i64>, r#type: String, content: String) -> Result<Value, String> {
-    let conn = open()?;
-    let scope = if project_id.is_some() { "project" } else { "global" };
-    let (id, similar) = db::save_memory_with_similar(&conn, &db::MemoryInput {
-        project_id,
-        scope,
-        r#type: &r#type,
-        content: &content,
-        status: None,
-        source_session_id: None,
-        source_message_id: None,
+async fn memory_add(project_id: Option<i64>, r#type: String, content: String) -> Result<Value, String> {
+    run_blocking(move || {
+        let conn = open()?;
+        let scope = if project_id.is_some() { "project" } else { "global" };
+        let (id, similar) = db::save_memory_with_similar(&conn, &db::MemoryInput {
+            project_id,
+            scope,
+            r#type: &r#type,
+            content: &content,
+            status: None,
+            source_session_id: None,
+            source_message_id: None,
+        })
+        .map_err(|e| e.to_string())?;
+        let _ = db::log_usage(&conn, "app", "memory_add");
+        Ok(json!({
+            "memory_id": id,
+            "similar_count": similar.len(),
+            "promote_hint": db::promotion_hint(&r#type, &similar),
+        }))
     })
-    .map_err(|e| e.to_string())?;
-    let _ = db::log_usage(&conn, "app", "memory_add");
-    Ok(json!({
-        "memory_id": id,
-        "similar_count": similar.len(),
-        "promote_hint": db::promotion_hint(&r#type, &similar),
-    }))
+    .await
 }
 
 #[tauri::command]
@@ -951,6 +954,9 @@ async fn compact_db() -> Result<Value, String> {
         let conn = open()?;
         let _ = db::log_usage(&conn, "app", "index compact");
         conn.execute_batch("VACUUM").map_err(|e| e.to_string())?;
+        yourmem::vault::Store::open(&data_home())
+            .and_then(|s| s.compact())
+            .map_err(|e| e.to_string())?;
         db::index_status(&conn).map_err(|e| e.to_string())
     })
     .await

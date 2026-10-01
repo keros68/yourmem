@@ -22,8 +22,8 @@ function app() {
   vm.runInContext(ui('project-recall.js').replace('export async function', 'async function'), context);
   vm.runInContext(ui('graph-layout.js').replace('export function', 'function'), context);
   const bundleCode = ui('app.js').slice(ui('app.js').indexOf('  let bundleBusy = false'), ui('app.js').indexOf('  $("#auto-purge").onchange'));
-  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
-  return { ...context.testApp, get, lists, requests, notices };
+  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, renderToday, bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
+  return { ...context.testApp, context, get, lists, requests, notices };
 }
 
 test('app initializes with the extracted drawer and searches using the shared agent list', async () => {
@@ -308,4 +308,37 @@ test('the memory page saves a new memory through memory_add', async () => {
   req.resolve({ memory_id: 'mem_1', similar_count: 0, promote_hint: null });
   await saving;
   assert.equal(f.notices.at(-1).textContent, '已保存');
+});
+
+test('a late response for an earlier day does not replace the current Today page', async () => {
+  const f = app();
+  f.context.activityPageHtml = (dg) => `day:${dg.day}`;
+  const first = f.renderToday();
+  const [digestA, maintA] = f.requests.slice(-2);
+  const second = f.renderToday();
+  const [digestB, maintB] = f.requests.slice(-2);
+  digestB.resolve({ day: '2026-10-01', project_activity: [{ project: 'x' }] }); maintB.resolve({});
+  await second;
+  digestA.resolve({ day: '2026-09-30', project_activity: [{ project: 'x' }] }); maintA.resolve({});
+  await first;
+  assert.match(f.get('#page-today').innerHTML, /day:2026-10-01/);
+});
+
+test('saving a memory twice quickly submits once', async () => {
+  const f = app();
+  const pending = f.renderMemory();
+  const calls = f.requests.slice(-3);
+  calls[0].resolve({ memories: [] }); calls[1].resolve({ memories: [] }); calls[2].resolve({ memory_files: [] });
+  await pending;
+  f.get('#mem-add-content').value = '内容';
+  f.get('#mem-add-type').value = 'fact';
+  f.get('#mem-add-project').value = '';
+  f.get('#mem-add-save').onclick();
+  f.get('#mem-add-save').onclick();
+  assert.equal(f.requests.filter((r) => r.command === 'memory_add').length, 1);
+});
+
+test('an unparseable time is shown as a placeholder, never as raw text', () => {
+  const f = app();
+  assert.equal(f.fmtTime('<b>badtime</b>'), '—');
 });
