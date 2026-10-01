@@ -13,8 +13,8 @@ function app() {
     document: { querySelector: get, querySelectorAll: (sel) => lists.get(sel) || [], getElementById: (id) => nodes.get(`#${id}`) || null, addEventListener() {},
       createElement: make, body: { appendChild: (node) => notices.push(node) } },
     window: { addEventListener() {}, __TAURI__: { core: { invoke: (command, args) => new Promise((resolve, reject) => requests.push({ command, args, resolve, reject })) } } },
-    todayOverviewHtml: () => '', activityPageHtml: () => '', aiSummaryHtml: () => '',
-    setTimeout() {},
+    activityPageHtml: () => '', aiSummaryHtml: () => '',
+    setTimeout() {}, setInterval: () => 0, clearInterval() {},
   };
   vm.createContext(context);
   const ui = (name) => fs.readFileSync(path.join(__dirname, '../ui', name), 'utf8');

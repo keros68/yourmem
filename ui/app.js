@@ -215,7 +215,24 @@ async function renderToday() {
     invoke("daily_digest", { day: activityDay }),
     invoke("maintenance_status").catch(() => ({})),
   ]);
+  // 资料库还是空的：显示上手步骤，而不是一片空白的动态
+  if (!(activityDigest.project_activity || []).length) {
+    const st = await invoke("stats").catch(() => null);
+    if (st && !st.sessions) { paintGettingStarted(); return; }
+  }
   paintActivity();
+}
+
+function paintGettingStarted() {
+  $("#page-today").innerHTML = maintenanceNoticeHtml(maintState) + `
+    <div class="activity-heading"><h1>开始使用</h1><p>资料库还没有对话，完成下面三步即可使用。</p></div>
+    <ol class="getting-started">
+      <li><strong>采集对话</strong><span>点击左下角「采集新对话」，导入本机各 agent 的历史对话；之后每分钟自动采集。</span></li>
+      <li><strong>连接 agent</strong><span>在「设置 → 接入」中为常用的 agent 配置 yourmem，agent 即可检索历史对话和记忆。</span>
+        <button class="btn small" id="gs-setup">打开接入设置</button></li>
+      <li><strong>试一次搜索</strong><span>采集完成后，在「搜索」中输入一个关键词，查看跨 agent 的结果。</span></li>
+    </ol>`;
+  $("#gs-setup").onclick = () => { settingsTab = "setup"; document.querySelector('.nav[data-page="settings"]').click(); };
 }
 
 function sessTable(sessions, opts = {}) {
@@ -1107,9 +1124,6 @@ async function renderSettings() {
       </details>`)}
 
     ${panel("setup", `
-      <h2>调用状态</h2>
-      <div class="memcard"><div class="meta">配置登记请点击下方检测。这里显示本机最近完成的调用；成功表示工具返回成功，不代表答案已被采用。MCP 记录不区分客户端。</div>
-      <table><tr><th>入口 / 操作</th><th>最近结果</th><th>完成时间</th><th>上次成功</th></tr>${(info.recall_status || []).map(r => `<tr><td>${esc(r.source)} / ${esc(r.name)}</td><td>${r.ok === true ? `成功${r.result_count != null ? `（${r.result_count} 条）` : ""}` : r.ok === false ? "失败" : "暂无结果记录"}</td><td>${fmtTime(r.completed_at)}</td><td>${fmtTime(r.last_success)}</td></tr>`).join("")}</table></div>
       <h2>一键接入 agent</h2>
       <div class="memcard">
         <div class="meta" style="margin-top:0">一键接入表示自动修改 agent 的 MCP 配置；它与会话采集是两项不同能力。是否正在运行不影响检测结果，新配置在新会话中生效；覆盖前自动 .bak 备份。</div>
@@ -1128,6 +1142,9 @@ async function renderSettings() {
         </div>
         <div id="setup-report"></div>
       </div>
+      <h2>调用状态</h2>
+      <div class="memcard"><div class="meta">配置登记请点击下方检测。这里显示本机最近完成的调用；成功表示工具返回成功，不代表答案已被采用。MCP 记录不区分客户端。</div>
+      <table><tr><th>入口 / 操作</th><th>最近结果</th><th>完成时间</th><th>上次成功</th></tr>${(info.recall_status || []).map(r => `<tr><td>${esc(r.source)} / ${esc(r.name)}</td><td>${r.ok === true ? `成功${r.result_count != null ? `（${r.result_count} 条）` : ""}` : r.ok === false ? "失败" : "暂无结果记录"}</td><td>${fmtTime(r.completed_at)}</td><td>${fmtTime(r.last_success)}</td></tr>`).join("")}</table></div>
       <h2>解除接入与卸载</h2>
       <div class="memcard">
         <div class="meta" style="margin-top:0">解除接入会检查所有支持的 agent，只删除 yourmem 的 MCP 项和指令块，其他配置保持不变。彻底清理会再删除 yourmem 资料库；各 agent 自己的原始会话不受影响。</div>
@@ -1749,6 +1766,12 @@ $("#btn-import").onclick = async () => {
   btn.disabled = true;
   btn.classList.add("busy");
   label.textContent = "采集中…";
+  const poll = setInterval(async () => {
+    try {
+      const p = await invoke("collect_progress");
+      if (p.total) label.textContent = `采集中 · ${p.done}/${p.total} 个文件`;
+    } catch { /* 下次再取 */ }
+  }, 1500);
   try {
     const r = await invoke("import_now");
     toast(`完成：新增 ${r.messages_added} 条消息 / ${r.lines_archived} 行归档`);
@@ -1757,6 +1780,7 @@ $("#btn-import").onclick = async () => {
   } catch (e) {
     toast(`采集失败：${e}`);
   } finally {
+    clearInterval(poll);
     btn.disabled = false;
     btn.classList.remove("busy");
     label.textContent = "采集新对话";

@@ -180,6 +180,8 @@ table.fixed th.c-agents, table.fixed td.c-agents { width: 230px; }
 /* Projects 页行内单按钮操作列：回收站的双按钮 150px 在这里会把 fixed 表挤爆 */
 #projects-table th.c-act, #projects-table td.c-act { width: 56px; }
 table.fixed td { overflow: hidden; text-overflow: ellipsis; }
+/* 摘要列不定宽，吃掉其余列之外的全部宽度；数字列完整显示，不加省略号 */
+table.fixed td.c-num { text-overflow: clip; white-space: nowrap; }
 /* agent pill 等短列永远完整显示，不允许被压缩或裁剪 */
 .pill { white-space: nowrap; flex: none; }
 td .pill { display: inline-flex; }
@@ -204,17 +206,14 @@ td .pill { display: inline-flex; }
      920pt 最小窗口下弹性列仍有 ~100px 可读（其余列合计 398/552） */
   table.fixed th.c-time, table.fixed td.c-time { width: 96px; padding-left: 4px; padding-right: 4px; }
   table.fixed th.c-agent, table.fixed td.c-agent { width: 88px; padding-left: 4px; padding-right: 4px; }
-  table.fixed th.c-num, table.fixed td.c-num { width: 44px; padding-left: 4px; padding-right: 4px; }
+  table.fixed th.c-num, table.fixed td.c-num { width: 56px; padding-left: 4px; padding-right: 4px; }
   table.fixed th.c-act, table.fixed td.c-act { width: 84px; padding-left: 4px; padding-right: 4px; }
   table.fixed.trash th.c-act, table.fixed.trash td.c-act { width: 110px; }
   /* 垃圾箱双按钮在 78px 内竖排（行高换来的列宽，次要页面可接受） */
   table.fixed.trash .action-buttons { flex-direction: column; align-items: flex-start; gap: 4px; }
   table.fixed th.c-sel, table.fixed td.c-sel { width: 26px; padding-left: 4px; padding-right: 0; }
-  /* 摘要 78：会话主区真实预算 = 920-216-68(#main 左右 padding)-140-14 = 482，
-     其余列地板 404（操作列要装下 46px 的删除按钮）+ 摘要 78 正好贴满 */
-  table.fixed th.c-prev, table.fixed td.c-prev { width: 78px; }
   #projects-table th.c-agents, #projects-table td.c-agents { width: 124px; padding-left: 8px; padding-right: 8px; }
-  #projects-table th.c-name, #projects-table td.c-name { width: 100px; }
+  #projects-table th.c-name, #projects-table td.c-name { width: 150px; }
   /* 覆盖点在基础规则之后不够——同优先级后出现者胜，必须抬优先级 */
   .sess-layout .sess-projs { width: 140px; }
   #page-sessions .sess-layout { gap: 14px; }
@@ -725,3 +724,8 @@ svg.lgraph-edges text { fill: var(--faint); font-size: 10.5px; }
 #wizard-overlay h3 { margin: 14px 0 4px; }
 .mem-aux { margin-top: 12px; }
 .mem-aux > summary { cursor: pointer; color: var(--dim); font-size: 13px; }
+.getting-started { display: grid; gap: 12px; max-width: 720px; padding-left: 22px; margin-top: 8px; }
+.getting-started li { padding: 14px 16px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); }
+.getting-started li strong { display: block; margin-bottom: 4px; }
+.getting-started li span { color: var(--dim); font-size: 13px; }
+.getting-started li .btn { margin-top: 10px; display: block; }

@@ -40,12 +40,37 @@ fn due(last: &Value, interval: u64, now: u64) -> bool {
     last.as_u64().map_or(true, |t| now.saturating_sub(t) >= interval)
 }
 
-/// Last maintenance results plus the snapshot interval in effect.
-pub fn status(home: &Path) -> Value {
+fn load(home: &Path) -> Value {
     let mut state: Value = std::fs::read_to_string(state_path(home))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({}));
+    normalize(&mut state);
+    state
+}
+
+/// Bring state written by 1.3.0 in line with current rules: a snapshot that
+/// failed only because a lock was held counts as deferred and is retried at
+/// once, and "no snapshot yet" is not a problem before the first success.
+fn normalize(state: &mut Value) {
+    let snap = &state["snapshot"];
+    let lock_failure = snap["ok"] == false
+        && snap["retry"].is_null()
+        && snap["error"].as_str().is_some_and(|e| e.contains("locked") || e.contains("busy"));
+    if lock_failure {
+        state["snapshot"] = json!({"ok": false, "retry": true, "at": snap["at"].clone()});
+        state["snapshot_attempt_at"] = Value::Null;
+    }
+    if state["snapshot"]["ok"] != true {
+        if let Some(problems) = state["doctor"]["problems"].as_array_mut() {
+            problems.retain(|p| p["name"] != "db_snapshot");
+        }
+    }
+}
+
+/// Last maintenance results plus the snapshot interval in effect.
+pub fn status(home: &Path) -> Value {
+    let mut state = load(home);
     state["snapshot_interval_days"] = json!(snapshot_interval_days(home));
     state
 }
@@ -91,7 +116,7 @@ fn remove_stale_tmp(home: &Path) -> usize {
 /// so a previous failure stops being reported.
 pub fn snapshot_now(home: &Path) -> Result<Value> {
     let r = crate::snapshots::create(home)?;
-    let mut state = status(home);
+    let mut state = load(home);
     state["snapshot_attempt_at"] = json!(now_secs());
     state["snapshot_retry_at"] = Value::Null;
     state["snapshot"] = json!({"ok": true, "at": crate::now_iso(), "id": r["id"]});
@@ -102,7 +127,7 @@ pub fn snapshot_now(home: &Path) -> Result<Value> {
 /// Run whatever is due. Each task records its attempt time, so a failing task
 /// is retried on its next interval rather than on every collection pass.
 pub fn run_due(home: &Path) -> Result<Value> {
-    let mut state = status(home);
+    let mut state = load(home);
     let now = now_secs();
     let mut ran = Vec::new();
 
@@ -274,5 +299,24 @@ mod tests {
         let st = status(home);
         assert_eq!(st["snapshot"]["ok"], true, "{st}");
         assert!(st["snapshot_retry_at"].is_null());
+    }
+
+    #[test]
+    fn state_from_1_3_0_lock_failures_is_retried_and_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::db::open(home).unwrap();
+        save(home, &json!({
+            "snapshot_attempt_at": now_secs(),
+            "snapshot": {"ok": false, "at": "2026-10-01T01:00:00Z", "error": "database is locked"},
+            "doctor_attempt_at": now_secs(),
+            "doctor": {"ok": true, "problems": [{"name": "db_snapshot", "status": "warn", "detail": "尚无快照"}]},
+        })).unwrap();
+        let st = status(home);
+        assert_eq!(st["snapshot"]["retry"], true);
+        assert!(st["doctor"]["problems"].as_array().unwrap().is_empty(), "{st}");
+        let r = run_due(home).unwrap();
+        assert!(r["ran"].as_array().unwrap().contains(&json!("snapshot")), "立即重试：{r}");
+        assert_eq!(status(home)["snapshot"]["ok"], true);
     }
 }

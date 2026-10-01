@@ -22,8 +22,8 @@ fn open() -> Result<rusqlite::Connection, String> {
 }
 
 #[tauri::command]
-fn stats() -> Result<Value, String> {
-    db::stats(&open()?).map_err(|e| e.to_string())
+async fn stats() -> Result<Value, String> {
+    run_blocking(|| db::stats(&open()?).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command]
@@ -1036,6 +1036,13 @@ fn app_uninstall() -> Result<(), String> {
     std::process::exit(0);
 }
 
+/// 当前或上一次采集的进度：已处理文件数 / 文件总数。
+#[tauri::command]
+fn collect_progress() -> Value {
+    let (done, total) = yourmem::ingest::progress();
+    json!({"done": done, "total": total})
+}
+
 /// 后台维护（快照、自检）的最近结果。
 #[tauri::command]
 fn maintenance_status() -> Value {
@@ -1222,7 +1229,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            session_window, message_content, maintenance_status, stats, today, projects, context, project_dossier, daily_digest, daily_digest_export, sessions,
+            session_window, message_content, maintenance_status, collect_progress, stats, today, projects, context, project_dossier, daily_digest, daily_digest_export, sessions,
             ai_settings_get, ai_settings_save, ai_organize_day, ai_summary_save,
             project_add, project_archive, project_restore, open_in_finder,
             session_proof, session_verify, session_export, session_writeback_plan,

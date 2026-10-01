@@ -7,6 +7,16 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static PROGRESS_DONE: AtomicUsize = AtomicUsize::new(0);
+static PROGRESS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// Files handled so far and files listed in the current (or last) import of
+/// this process.
+pub fn progress() -> (usize, usize) {
+    (PROGRESS_DONE.load(Ordering::Relaxed), PROGRESS_TOTAL.load(Ordering::Relaxed))
+}
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -335,13 +345,22 @@ pub fn import_all(
         memory_files_monitored: 0,
         memory_revisions_added: 0,
     };
+    // 先列出全部文件得到总数，再逐个导入：界面据此显示进度
+    let mut listed = Vec::new();
     for (agent, root) in roots {
         let mut files = adapters::discover(root);
         if *agent == adapters::AGENT_PI {
             // 临时现场（scratchpad）整桶不采，见 adapters/pi.rs exclude_temp_buckets
             files = adapters::pi::exclude_temp_buckets(files);
         }
+        listed.push((*agent, files));
+    }
+    PROGRESS_DONE.store(0, Ordering::Relaxed);
+    PROGRESS_TOTAL.store(listed.iter().map(|(_, f)| f.len()).sum(), Ordering::Relaxed);
+    for (agent, files) in listed {
+        let agent = &agent;
         for path in files {
+            PROGRESS_DONE.fetch_add(1, Ordering::Relaxed);
             out.files_seen += 1;
             let (msgs, lines) = match import_file(conn, home, agent, &path) {
                 Ok(r) => r,
