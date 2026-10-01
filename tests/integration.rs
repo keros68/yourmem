@@ -1204,6 +1204,32 @@ fn aicross_run_projects_are_archived_on_creation_and_by_v14() {
 }
 
 #[test]
+fn dispatch_runs_and_worktrees_are_archived_on_creation_and_by_v15() {
+    let home = tempfile::tempdir().unwrap();
+    let worktree = "/work/poket/.claude/worktrees/agent-a065";
+    let dispatch = "/work/p5b/.dispatch/runtime/runs/task-1/arb-kimi";
+    {
+        let conn = db::open(home.path()).unwrap();
+        let id = db::upsert_project(&conn, worktree, "agent-a065").unwrap();
+        let archived: Option<String> = conn.query_row(
+            "SELECT archived_at FROM projects WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert!(archived.is_some(), "子代理工作树项目新建即归档");
+        // 模拟 1.3.2 库：派工运行目录项目尚未归档
+        conn.execute_batch("DELETE FROM projects; PRAGMA user_version = 14;").unwrap();
+        conn.execute(
+            "INSERT INTO projects(path, name, created_at, updated_at) VALUES (?1, 'arb', 'x', 'x'), ('/work/p5b', 'p5b', 'x', 'x')",
+            [dispatch],
+        ).unwrap();
+    }
+    let conn = db::open(home.path()).unwrap();
+    let archived = |p: &str| -> bool {
+        conn.query_row("SELECT archived_at IS NOT NULL FROM projects WHERE path = ?1", [p], |r| r.get(0)).unwrap()
+    };
+    assert!(archived(dispatch), "v15 归档已有派工运行目录项目");
+    assert!(!archived("/work/p5b"), "所在项目本身不受影响");
+}
+
+#[test]
 fn path_under_dir_ignores_separator_style() {
     let root = std::path::Path::new("D:/scratch/Temp");
     assert!(yourmem::is_under_dir(r"D:\scratch\Temp\run1", root));

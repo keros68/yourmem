@@ -282,7 +282,7 @@ pub fn open(home: &Path) -> Result<Connection> {
 /// Current schema version, stamped into `PRAGMA user_version` by migrate().
 /// Bump this (and add a migration step below) whenever the schema changes;
 /// bundle manifests record it (DESIGN-0.3 §5.1 `schema_version`).
-pub const SCHEMA_VERSION: i32 = 14;
+pub const SCHEMA_VERSION: i32 = 15;
 
 /// Idempotent column additions for databases created by older versions.
 /// `user_version` drives the fast path: a database already stamped with the
@@ -447,6 +447,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         // ai-cross 运行目录项目一次性归入已废弃项目；此前已由用户恢复的临时目录项目不受影响
         archive_projects_where(conn, crate::is_run_site_path)?;
     }
+    if version < 15 {
+        // 项目内派工运行目录与子代理工作树一次性归入已废弃项目
+        archive_projects_where(conn, crate::is_dispatch_site_path)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -577,7 +581,7 @@ pub fn upsert_project(conn: &Connection, path: &str, name: &str) -> Result<i64> 
             return Ok(id);
         }
     }
-    // 运行现场（系统临时目录、ai-cross 运行目录）：新建时即归入已废弃项目，
+    // 运行现场（见 is_scratch_path）：新建时即归入已废弃项目，
     // 数据照常采集；用户恢复后不再改动（ON CONFLICT 不碰 archived_at）
     let archived = crate::is_scratch_path(path).then(|| now.clone());
     conn.execute(

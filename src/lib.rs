@@ -155,9 +155,27 @@ pub fn is_run_site_path(path: &str) -> bool {
         .is_some_and(|home| is_under_dir(path, &home.join(".aicross").join("runs")))
 }
 
-/// 运行现场（临时目录或 ai-cross 运行目录）：会话照常采集，项目归入已废弃项目。
+/// 项目内的派工运行目录（`<项目>/.dispatch/runtime/runs/...`）与 Claude Code 为子代理
+/// 建的工作树（`<项目>/.claude/worktrees/...`）：同属运行现场，只认这两段之下的目录。
+pub fn is_dispatch_site_path(path: &str) -> bool {
+    const MARKERS: [&[&str]; 2] = [&[".dispatch", "runtime", "runs"], &[".claude", "worktrees"]];
+    let path = path.replace('\\', "/");
+    let parts: Vec<String> = path
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .map(|p| if cfg!(windows) { p.to_lowercase() } else { p.to_string() })
+        .collect();
+    MARKERS.iter().any(|m| {
+        parts
+            .windows(m.len() + 1)
+            .any(|w| w[..m.len()].iter().zip(m.iter()).all(|(a, b)| a == b))
+    })
+}
+
+/// 运行现场（临时目录、ai-cross 运行目录、项目内派工运行目录与子代理工作树）：
+/// 会话照常采集，项目归入已废弃项目。
 pub fn is_scratch_path(path: &str) -> bool {
-    is_temp_path(path) || is_run_site_path(path)
+    is_temp_path(path) || is_run_site_path(path) || is_dispatch_site_path(path)
 }
 
 /// Staging directory next to `path` (same disk as the backup being written or
@@ -306,6 +324,16 @@ mod tests {
         assert_eq!(resolve_home(resolver(&[])), None);
         // HOMEDRIVE/HOMEPATH 缺一半也不算
         assert_eq!(resolve_home(resolver(&[("HOMEDRIVE", "C:")])), None);
+    }
+
+    #[test]
+    fn dispatch_runs_and_worktrees_are_run_sites() {
+        assert!(is_dispatch_site_path(r"D:\work\p5b\.dispatch\runtime\runs\task-1\arb-kimi"));
+        assert!(is_dispatch_site_path("/work/poket/.claude/worktrees/agent-a065"));
+        assert!(!is_dispatch_site_path("/work/poket/.claude/worktrees"), "目录本身不算");
+        assert!(!is_dispatch_site_path("/work/poket/.claude"));
+        assert!(!is_dispatch_site_path("/work/runtime/runs/x"));
+        assert!(!is_dispatch_site_path("/work/real-project"));
     }
 
     #[test]
