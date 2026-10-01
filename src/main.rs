@@ -297,7 +297,7 @@ enum AgentsCmd {
     /// 检测各 agent 与其他主流 agent：默认目录是否存在、各 agent 对话数、
     /// 已登记的自定义根、停用状态。
     List,
-    /// 登记一个自定义采集根（仅文件型 agent：claude/codex/zcode/kimi）。
+    /// 登记一个自定义采集根（仅文件型 agent：claude/codex/zcode/kimi/pi）。
     Add {
         #[arg(long)]
         agent: String,

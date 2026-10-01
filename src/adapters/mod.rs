@@ -180,10 +180,10 @@ pub fn capability_matrix() -> serde_json::Value {
           "writeback": "yes", "encrypted": "no",
           "notes": "识别分叉、续聊和子任务对话；可写回原目录" },
         { "agent": opencode::AGENT_OPENCODE, "transcript": "yes", "search": "yes",
-          "lineage": "no", "resume": "yes",
+          "lineage": "partial", "resume": "yes",
           // SQLite 单库源：只读原则，不向别人的库插行（restore.rs 注释）
           "writeback": "no", "encrypted": "no",
-          "notes": "数据保存在单个数据库中，不支持写回；可通过完整备份迁移" },
+          "notes": "识别子任务对话；数据保存在单个数据库中，不支持写回" },
         { "agent": AGENT_ZCODE, "transcript": "yes", "search": "yes",
           "lineage": "no", "resume": "no",
           "writeback": "no", "encrypted": "no",
