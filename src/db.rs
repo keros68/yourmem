@@ -437,17 +437,8 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
     conn.execute_batch(TRIGGERS_SQL)?;
-    // v13：产物时间原先记的是导入时刻，首次导入会把全部历史产物算成"当天新增"。
-    // 晚于所属会话结束时间的记录即事后导入，改为会话结束时间（幂等）。
     if version < 13 {
-        conn.execute_batch(
-            "UPDATE session_artifacts SET created_at = (
-                 SELECT s.ended_at FROM sessions s WHERE s.id = session_artifacts.session_id)
-             WHERE EXISTS (
-                 SELECT 1 FROM sessions s WHERE s.id = session_artifacts.session_id
-                   AND s.ended_at IS NOT NULL
-                   AND julianday(s.ended_at) < julianday(session_artifacts.created_at));",
-        )?;
+        fix_imported_artifact_times(conn)?;
         // 同版本：已有的临时目录项目一次性归入已废弃项目（新项目在 upsert_project 处理）
         let temp_projects: Vec<i64> = {
             let mut stmt = conn.prepare("SELECT id, path FROM projects WHERE archived_at IS NULL")?;
@@ -462,12 +453,64 @@ fn migrate(conn: &Connection) -> Result<()> {
         for id in temp_projects {
             conn.execute("UPDATE projects SET archived_at = ?2 WHERE id = ?1", params![id, now])?;
         }
+        merge_duplicate_projects(conn)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
 // ---------------------------------------------------------------- projects
+
+/// Merge projects whose paths name the same directory (Windows: case and
+/// separators differ) into the oldest row. Any active member keeps the result active.
+fn merge_duplicate_projects(conn: &Connection) -> Result<()> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let groups: Vec<(String, i64)> = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PATH_KEY_SQL} AS k, MIN(id) FROM projects GROUP BY k HAVING COUNT(*) > 1"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (key, keep) in groups {
+        let dups: Vec<i64> = {
+            let mut stmt = conn.prepare(&format!("SELECT id FROM projects WHERE {PATH_KEY_SQL} = ?1 AND id <> ?2"))?;
+            let rows = stmt.query_map(params![key, keep], |r| r.get(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let any_active: bool = conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM projects WHERE {PATH_KEY_SQL} = ?1 AND archived_at IS NULL)"),
+            params![key],
+            |r| r.get(0),
+        )?;
+        for dup in dups {
+            for table in ["sessions", "handoffs", "memories", "session_artifacts"] {
+                conn.execute(&format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"), params![keep, dup])?;
+            }
+            conn.execute("DELETE FROM projects WHERE id = ?1", params![dup])?;
+        }
+        if any_active {
+            conn.execute("UPDATE projects SET archived_at = NULL WHERE id = ?1", params![keep])?;
+        }
+    }
+    Ok(())
+}
+
+/// v13 的数据修正，合并旧版本备份后也要再跑一次：产物时间原先记的是导入
+/// 时刻，晚于所属会话结束时间的记录即事后导入，改为会话结束时间（幂等）。
+pub fn fix_imported_artifact_times(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "UPDATE session_artifacts SET created_at = (
+             SELECT s.ended_at FROM sessions s WHERE s.id = session_artifacts.session_id)
+         WHERE EXISTS (
+             SELECT 1 FROM sessions s WHERE s.id = session_artifacts.session_id
+               AND s.ended_at IS NOT NULL
+               AND julianday(s.ended_at) < julianday(session_artifacts.created_at));",
+    )?;
+    Ok(())
+}
 
 /// Resolve a cwd to its project root (nearest ancestor containing `.git`,
 /// or the cwd itself when no repository is found).
@@ -493,8 +536,38 @@ pub fn project_root_for(cwd: &str) -> (String, String) {
     (path, name)
 }
 
+/// SQL expression giving a project path's identity key. On Windows the same
+/// directory may arrive with different case or separators from different agents.
+const PATH_KEY_SQL: &str = if cfg!(windows) {
+    "lower(replace(rtrim(path, '/' || char(92)), '/', char(92)))"
+} else {
+    "path"
+};
+
+fn path_key(path: &str) -> String {
+    if cfg!(windows) {
+        // 与 SQLite lower() 一致：只转 ASCII 字母
+        path.trim_end_matches(['/', '\\']).replace('/', "\\").to_ascii_lowercase()
+    } else {
+        path.to_string()
+    }
+}
+
 pub fn upsert_project(conn: &Connection, path: &str, name: &str) -> Result<i64> {
     let now = now_iso();
+    if cfg!(windows) {
+        let existing: Option<i64> = conn
+            .query_row(
+                &format!("SELECT id FROM projects WHERE {PATH_KEY_SQL} = ?1 ORDER BY id LIMIT 1"),
+                params![path_key(path)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            conn.execute("UPDATE projects SET updated_at = ?2 WHERE id = ?1", params![id, now])?;
+            return Ok(id);
+        }
+    }
     // 系统临时目录下的工作目录是 agent 的临时运行现场：新建时即归入已废弃项目，
     // 数据照常采集；用户恢复后不再改动（ON CONFLICT 不碰 archived_at）
     let archived = crate::is_temp_path(path).then(|| now.clone());

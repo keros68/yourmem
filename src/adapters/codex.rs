@@ -22,8 +22,14 @@ pub fn parse_lines(lines: &[(u64, String)], prior_saw_response_items: bool) -> P
     // event_msg user/agent_message lines are duplicates and must be suppressed.
     // 只看当前 chunk 会在增量边界漏判：response_item 行与它的 event_msg 副本
     // 恰好被两次导入切开时，副本会被当老格式再收一遍。
+    // 只认顶层 type：消息正文里恰好出现 "response_item" 不算（字符串预筛避免逐行重复解析）
+    let is_response_item = |raw: &str| {
+        raw.contains("\"response_item\"")
+            && serde_json::from_str::<Value>(raw)
+                .is_ok_and(|v| v.get("type").and_then(Value::as_str) == Some("response_item"))
+    };
     let has_response_items =
-        prior_saw_response_items || lines.iter().any(|(_, raw)| raw.contains("\"response_item\""));
+        prior_saw_response_items || lines.iter().any(|(_, raw)| is_response_item(raw));
     output.saw_response_items = has_response_items;
 
     for (line_no, raw) in lines {

@@ -1183,6 +1183,9 @@ fn path_under_dir_ignores_separator_style() {
     assert!(!yourmem::is_under_dir("D:/scratch/Temporary", root));
     #[cfg(windows)]
     assert!(yourmem::is_under_dir(r"d:\SCRATCH\temp\x", root));
+    assert!(yourmem::is_under_dir(r"\\?\D:\scratch\Temp\run2", root), "扩展长度前缀");
+    assert!(!yourmem::is_under_dir(r"D:\scratch\Temp\..\real-project", root), "上跳出临时目录");
+    assert!(yourmem::is_under_dir(r"D:\scratch\.\Temp\run3", root));
 }
 
 #[test]
@@ -1224,4 +1227,66 @@ fn project_context_lists_unconfirmed_suggestions() {
     assert_eq!(suggested.len(), 1);
     assert_eq!(suggested[0]["status"], "suggested");
     assert!(ctx["confirmed"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn disabled_agents_lose_extra_roots_and_memory_files_too() {
+    let home = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    ingest::add_extra_root(home.path(), "claude", extra.path()).unwrap();
+    ingest::set_agent_disabled(home.path(), "claude", true).unwrap();
+    let mut roots = Vec::new();
+    ingest::apply_extra_roots_and_gates(home.path(), &mut roots);
+    assert!(roots.is_empty(), "停用 agent 的额外目录不再采集：{roots:?}");
+
+    let claude_home = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    std::fs::write(claude_home.path().join("CLAUDE.md"), "全局记忆").unwrap();
+    std::fs::write(codex_home.path().join("AGENTS.md"), "全局记忆").unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let dirs = yourmem::memfiles::SourceDirs {
+        claude: claude_home.path().to_path_buf(),
+        codex: codex_home.path().to_path_buf(),
+    };
+    let out = yourmem::memfiles::collect(&conn, home.path(), &dirs).unwrap();
+    assert_eq!(out.files_monitored, 1, "只剩 codex 的记忆文件");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_path_variants_share_one_project() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let a = db::upsert_project(&conn, r"D:\work\Shared", "Shared").unwrap();
+    let b = db::upsert_project(&conn, "d:/work/shared/", "shared").unwrap();
+    assert_eq!(a, b);
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn schema_v13_merges_existing_windows_path_duplicates() {
+    let (home, src) = setup();
+    {
+        let mut conn = db::open(home.path()).unwrap();
+        ingest::import_all(&mut conn, home.path(), &roots(src.path()), None, None).unwrap();
+        conn.execute_batch(
+            r"INSERT INTO projects(path, name, created_at, updated_at, archived_at)
+                VALUES ('D:\work\Dup', 'Dup', 'x', 'x', 'x'), ('d:/work/dup', 'dup', 'x', 'x', NULL);
+              UPDATE sessions SET project_id = (SELECT id FROM projects WHERE path = 'd:/work/dup')
+                WHERE id = 'claude:aaaa-1111';
+              PRAGMA user_version = 12;",
+        ).unwrap();
+    }
+    let conn = db::open(home.path()).unwrap();
+    let rows: Vec<(i64, Option<String>)> = conn
+        .prepare("SELECT id, archived_at FROM projects WHERE lower(path) LIKE '%work%dup'").unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+        .collect::<Result<_, _>>().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].1.is_none(), "任一成员活跃则合并后活跃");
+    let pid: i64 = conn.query_row(
+        "SELECT project_id FROM sessions WHERE id = 'claude:aaaa-1111'", [], |r| r.get(0)).unwrap();
+    assert_eq!(pid, rows[0].0, "会话改挂到保留的项目");
 }

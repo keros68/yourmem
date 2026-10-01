@@ -1156,3 +1156,61 @@ fn merge_replacement_keeps_local_links_and_trash_state() {
     let mc: i64 = tc.query_row("SELECT message_count FROM sessions WHERE id = 'claude:aaaa'", [], |r| r.get(0)).unwrap();
     assert_eq!(mc, 3, "内容已更新为包里的新版本");
 }
+
+#[test]
+fn merging_missing_history_keeps_the_current_memory_text_searchable() {
+    // 目标已有当前内容；bundle 一侧更新、还带着目标缺的旧修订。合并补进来的
+    // 旧修订行号更大，索引仍必须指向当前内容
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let (current, old) = ("决策：当前版本的内容", "决策：早期版本的内容");
+    let sc = db::open(src.path()).unwrap();
+    let dc = db::open(dst.path()).unwrap();
+    let a = vault::store_bytes(src.path(), current.as_bytes()).unwrap();
+    let b = vault::store_bytes(src.path(), old.as_bytes()).unwrap();
+    vault::store_bytes(dst.path(), current.as_bytes()).unwrap();
+    for (c, t) in [(&sc, "2026-09-30T00:00:00Z"), (&dc, "2026-09-25T00:00:00Z")] {
+        c.execute(
+            "INSERT INTO memory_files(id, agent, scope, path, current_hash, updated_at)
+             VALUES (1, 'claude', 'global', '/proj/MEMORY.md', ?1, ?2)",
+            rusqlite::params![a, t],
+        ).unwrap();
+    }
+    for (c, h, at) in [(&sc, &b, "2026-09-20T00:00:00Z"), (&sc, &a, "2026-09-30T00:00:00Z"), (&dc, &a, "2026-09-25T00:00:00Z")] {
+        c.execute(
+            "INSERT INTO memory_revisions(file_id, hash, size, captured_at) VALUES (1, ?1, 10, ?2)",
+            rusqlite::params![h, at],
+        ).unwrap();
+    }
+    db::set_memory_fts(&dc, 1, current).unwrap();
+    let pack = src.path().join("memory.tar.gz");
+    bundle::create(&sc, src.path(), &pack, &bundle::BundleFilter::default()).unwrap();
+    bundle::restore(&pack, dst.path(), true).unwrap();
+
+    let conn = db::open(dst.path()).unwrap();
+    assert!(!db::search_memory_files_fts(&conn, "当前版本的内容", 10).unwrap().is_empty());
+    assert!(db::search_memory_files_fts(&conn, "早期版本的内容", 10).unwrap().is_empty(), "索引不能退回旧修订");
+}
+
+#[test]
+fn merging_an_old_schema_bundle_corrects_artifact_times() {
+    let (home, _src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    // 模拟 v12 库：产物时间是导入时刻，晚于会话结束
+    conn.execute_batch(
+        "UPDATE session_artifacts SET created_at = '2026-10-01T04:00:00Z';
+         INSERT INTO session_artifacts(session_id, path, tool, created_at)
+         SELECT id, 'late.rs', 'Write', '2026-10-01T04:00:00Z' FROM sessions LIMIT 1;
+         PRAGMA user_version = 12;",
+    ).unwrap();
+    let pack = home.path().join("v12.tar.gz");
+    bundle::create(&conn, home.path(), &pack, &bundle::BundleFilter::default()).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    db::open(target.path()).unwrap();
+    bundle::restore(&pack, target.path(), true).unwrap();
+    let tc = db::open(target.path()).unwrap();
+    let late: i64 = tc.query_row(
+        "SELECT COUNT(*) FROM session_artifacts a JOIN sessions s ON s.id = a.session_id
+         WHERE julianday(a.created_at) > julianday(s.ended_at)", [], |r| r.get(0)).unwrap();
+    assert_eq!(late, 0, "合并后的产物时间不晚于会话结束");
+}

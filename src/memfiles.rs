@@ -122,7 +122,12 @@ fn discover_targets(conn: &Connection, dirs: &SourceDirs) -> Result<Vec<(String,
 /// maintaining mtime/size state — simpler and immune to mtime games.
 pub fn collect(conn: &Connection, home: &Path, dirs: &SourceDirs) -> Result<MemfilesOutcome> {
     let mut out = MemfilesOutcome::default();
+    // 停用的 agent 不再采集任何内容，包括它的原生记忆文件
+    let off = crate::ingest::disabled_agents(home);
     for (agent, scope, path) in discover_targets(conn, dirs)? {
+        if off.iter().any(|a| *a == agent) {
+            continue;
+        }
         out.files_monitored += 1;
         // 单文件读失败只跳过该文件不连坐整轮采集（与 UTF-8 不完整"留到下一轮"
         // 同口径，自检 C1）——权限/占位锁这类瞬时问题下轮自愈

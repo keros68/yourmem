@@ -119,9 +119,7 @@ pub fn import_defaults(home: &Path) -> Result<ImportOutcome> {
     .into_iter()
     .filter_map(|(a, v, d)| off_root(a, v, d).map(|p| (a.to_string(), p)))
     .collect();
-    for (agent, path) in extra_roots(home) {
-        push_extra_root(&mut roots, agent, path);
-    }
+    apply_extra_roots_and_gates(home, &mut roots);
     let refs: Vec<(&str, PathBuf)> = roots.iter().map(|(a, p)| (a.as_str(), p.clone())).collect();
     let oc = pick("YOUMEM_OPENCODE_DB", adapters::opencode::default_db_path());
     let oc = if off.iter().any(|a| a == adapters::opencode::AGENT_OPENCODE) { None } else { Some(oc) };

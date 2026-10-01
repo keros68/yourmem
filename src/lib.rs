@@ -117,14 +117,25 @@ fn resolve_home(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     }
 }
 
-/// 首次启动判定：数据目录里既无 config.json 也无 yourmem.db 才算新装——
-/// 升级用户/已有数据的目录不受向导打扰。桌面端须在首个页面打开数据库
-/// 之前调用（页面渲染即建库，之后此判定恒为 false）。
-/// Whether `path` lies in `root` or below it. Separators are normalized and,
-/// on Windows, case is ignored.
+/// Whether `path` lies in `root` or below it. Separators are normalized, the
+/// Windows extended-length prefix (`\\?\`) is dropped, `.` and `..` segments
+/// are resolved lexically and, on Windows, case is ignored.
 pub fn is_under_dir(path: &str, root: &Path) -> bool {
     let norm = |s: &str| {
-        let s = s.replace('\\', "/").trim_end_matches('/').to_string();
+        let s = s.replace('\\', "/");
+        let s = s.strip_prefix("//?/").unwrap_or(&s);
+        let mut parts: Vec<&str> = Vec::new();
+        for (i, part) in s.split('/').enumerate() {
+            match part {
+                "" if i > 0 => {}
+                "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                p => parts.push(p),
+            }
+        }
+        let s = parts.join("/");
         if cfg!(windows) { s.to_lowercase() } else { s }
     };
     let (p, r) = (norm(path), norm(&root.to_string_lossy()));
@@ -153,6 +164,9 @@ pub fn fresh_backup_path(path: &Path) -> PathBuf {
     }
 }
 
+/// 首次启动判定：数据目录里既无 config.json 也无 yourmem.db 才算新装——
+/// 升级用户/已有数据的目录不受向导打扰。桌面端须在首个页面打开数据库
+/// 之前调用（页面渲染即建库，之后此判定恒为 false）。
 pub fn is_first_run(home: &Path) -> bool {
     !home.join("config.json").exists() && !home.join("yourmem.db").exists()
 }

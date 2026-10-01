@@ -589,8 +589,8 @@ fn backfill_memory_fts(conn: &Connection, home: &Path, force: &[i64]) -> Result<
     let mut targets: Vec<(i64, Option<String>)> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT f.id, (SELECT r.hash FROM memory_revisions r
-                           WHERE r.file_id = f.id ORDER BY r.id DESC LIMIT 1)
+            "SELECT f.id, COALESCE(f.current_hash, (SELECT r.hash FROM memory_revisions r
+                           WHERE r.file_id = f.id ORDER BY r.id DESC LIMIT 1))
              FROM memory_files f
              WHERE NOT EXISTS (SELECT 1 FROM memory_fts WHERE rowid = f.id)",
         )?;
@@ -602,11 +602,15 @@ fn backfill_memory_fts(conn: &Connection, home: &Path, force: &[i64]) -> Result<
     for &fid in force {
         let hash: Option<String> = conn
             .query_row(
-                "SELECT hash FROM memory_revisions WHERE file_id = ?1 ORDER BY id DESC LIMIT 1",
+                // 索引以文件的当前修订为准：合并补进来的历史修订行 id 更大，但不是当前内容
+                "SELECT COALESCE(f.current_hash, (SELECT r.hash FROM memory_revisions r
+                     WHERE r.file_id = f.id ORDER BY r.id DESC LIMIT 1))
+                 FROM memory_files f WHERE f.id = ?1",
                 params![fid],
                 |r| r.get(0),
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         targets.push((fid, hash));
     }
     let mut done = 0u64;
@@ -1084,6 +1088,8 @@ fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
         )?;
 
         let fts_backfilled = backfill_memory_fts(&tx, home, &fts_stale)?;
+        // 旧版本备份带进来的产物时间未经 v13 修正，并入后补做（幂等）
+        db::fix_imported_artifact_times(&tx)?;
         tx.commit()?;
         Ok(json!({
             "sessions_added": sessions_added,
