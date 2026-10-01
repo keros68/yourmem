@@ -210,8 +210,7 @@ fn ai_key_from_store() -> Result<Option<(String, &'static str)>, String> {
     }
 }
 
-#[tauri::command]
-fn ai_settings_get() -> Result<Value, String> {
+fn ai_settings_value() -> Result<Value, String> {
     let mut out = yourmem::organizer::settings_json(&data_home());
     let key = ai_key_from_store()?;
     out["key_configured"] = json!(key.is_some());
@@ -219,6 +218,12 @@ fn ai_settings_get() -> Result<Value, String> {
     let s = yourmem::organizer::load_settings(&data_home());
     out["configured"] = json!(!s.model.trim().is_empty() && out["key_configured"] == true);
     Ok(out)
+}
+
+/// 读取系统凭据库可能较慢，放到后台线程，不占界面线程。
+#[tauri::command]
+async fn ai_settings_get() -> Result<Value, String> {
+    run_blocking(ai_settings_value).await
 }
 
 #[tauri::command]
@@ -241,7 +246,7 @@ fn ai_settings_save(
             .map_err(|e| format!("保存 API Key 失败：{e}"))?;
     }
     yourmem::organizer::save_settings(&data_home(), &settings).map_err(|e| e.to_string())?;
-    ai_settings_get()
+    ai_settings_value()
 }
 
 #[tauri::command]
@@ -808,8 +813,8 @@ fn memories(project: Option<String>, status: Option<String>, r#type: Option<Stri
 // -------------------------------------------------- agent 数据源（设置页）
 
 #[tauri::command]
-fn agents_detect() -> Result<Value, String> {
-    yourmem::ingest::agent_sources(&data_home(), &open()?).map_err(|e| e.to_string())
+async fn agents_detect() -> Result<Value, String> {
+    run_blocking(|| yourmem::ingest::agent_sources(&data_home(), &open()?).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command]
@@ -1050,19 +1055,22 @@ async fn doctor() -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn app_info() -> Result<Value, String> {
-    let home = data_home();
-    let conn = open()?;
-    let schema_version: i32 = conn
-        .pragma_query_value(None, "user_version", |r| r.get(0))
-        .map_err(|e| e.to_string())?;
-    Ok(json!({
-        "app_version": env!("CARGO_PKG_VERSION"),
-        "schema_version": schema_version,
-        "home": home,
-        "recall_status": yourmem::recall_status::read(&home),
-        "usage_last_7d": db::usage_summary(&conn, 7).map_err(|e| e.to_string())?,
-    }))
+async fn app_info() -> Result<Value, String> {
+    run_blocking(|| {
+        let home = data_home();
+        let conn = open()?;
+        let schema_version: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "app_version": env!("CARGO_PKG_VERSION"),
+            "schema_version": schema_version,
+            "home": home,
+            "recall_status": yourmem::recall_status::read(&home),
+            "usage_last_7d": db::usage_summary(&conn, 7).map_err(|e| e.to_string())?,
+        }))
+    })
+    .await
 }
 
 /// 停用/启用一个内置 agent（停用后不采集其源；已入库历史保留可搜）。

@@ -937,15 +937,16 @@ How to apply（做法）：
 复查条件：`;
 
 async function renderSettings() {
-  const info = await invoke("app_info");
-  const agentsInfo = await invoke("agents_detect");
-  const autoPurge = (await invoke("auto_purge_get")).auto_purge_trash;
-  const cap = await invoke("capability_matrix");
-  const idx = await invoke("index_status");
-  const bd = await invoke("backup_dir_get");
-  let ai = { base_url: "https://api.openai.com/v1", model: "", max_input_chars: 40000, key_configured: false, key_source: null };
   let aiSettingsError = "";
-  try { ai = await invoke("ai_settings_get"); } catch (e) { aiSettingsError = String(e); }
+  const [info, agentsInfo, purge, cap, idx, bd, ai] = await Promise.all([
+    invoke("app_info"), invoke("agents_detect"), invoke("auto_purge_get"), invoke("capability_matrix"),
+    invoke("index_status"), invoke("backup_dir_get"),
+    invoke("ai_settings_get").catch((e) => {
+      aiSettingsError = String(e);
+      return { base_url: "https://api.openai.com/v1", model: "", max_input_chars: 40000, key_configured: false, key_source: null };
+    }),
+  ]);
+  const autoPurge = purge.auto_purge_trash;
   // 能力矩阵格子：✓ 支持 / ◐ 部分 / — 不支持（诚实自报，证据写在 adapter 注释里）
   const capCell = (v) => v === "yes" ? '<span class="cap-yes">✓</span>'
     : v === "partial" ? '<span class="cap-partial">◐</span>'

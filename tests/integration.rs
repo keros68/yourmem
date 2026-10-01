@@ -673,10 +673,13 @@ fn mcp_initialize_imports_and_stays_healthy() {
     std::env::set_var("YOUMEM_OPENCODE_DB", src.path().join("nope.db"));
     std::env::set_var("YOUMEM_HERMES_DB", src.path().join("nope-hermes.db"));
 
+    // 握手立即回复，不等导入
     let r = yourmem::mcp::handle(home.path(), &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap();
     assert_eq!(r["result"]["serverInfo"]["name"], "yourmem");
+    assert!(!home.path().join(".last_import").exists(), "initialize 本身不做导入");
 
-    // initialize 顺带导入：新会话立即可搜
+    // serve 在 initialize 时于后台调用的导入：完成后新会话可搜
+    yourmem::mcp::init_import(home.path());
     let conn = db::open(home.path()).unwrap();
     let hits = db::search(&conn, &db::SearchOpts {
         query: "内涝".into(), project: None, agent: None, kind: None, limit: 10,
@@ -691,9 +694,9 @@ fn mcp_initialize_imports_and_stays_healthy() {
     );
     assert!(home.path().join(".last_import").exists());
 
-    // 单飞：60 秒内第二次 initialize 不再导入（mtime 不变、usage 不增）
+    // 单飞：60 秒内再次触发不再导入（mtime 不变、usage 不增）
     let mtime = std::fs::metadata(home.path().join(".last_import")).unwrap().modified().unwrap();
-    yourmem::mcp::handle(home.path(), &serde_json::json!({"jsonrpc":"2.0","id":2,"method":"initialize"})).unwrap();
+    yourmem::mcp::init_import(home.path());
     let mtime2 = std::fs::metadata(home.path().join(".last_import")).unwrap().modified().unwrap();
     assert_eq!(mtime, mtime2);
     let log2 = db::usage_summary(&conn, 7).unwrap();
@@ -705,6 +708,7 @@ fn mcp_initialize_imports_and_stays_healthy() {
     // import 失败不传导：库文件损坏时 initialize / tools/list 照常响应
     let bad = tempfile::tempdir().unwrap();
     std::fs::write(bad.path().join("yourmem.db"), b"not sqlite").unwrap();
+    yourmem::mcp::init_import(bad.path());
     let r = yourmem::mcp::handle(bad.path(), &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap();
     assert_eq!(r["result"]["serverInfo"]["name"], "yourmem");
     let l = yourmem::mcp::handle(bad.path(), &serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
@@ -1111,4 +1115,41 @@ fn memory_freshness_and_rule_promotion() {
     let (_, similar) = save("lesson", lesson);
     assert!(db::promotion_hint("lesson", &similar).is_some(), "第三次出现提示升级为规则");
     assert!(db::promotion_hint("fact", &similar).is_none());
+}
+
+#[test]
+fn a_broken_source_does_not_stop_the_others() {
+    let (home, src) = setup();
+    let mut conn = db::open(home.path()).unwrap();
+    let broken = src.path().join("broken-hermes.db");
+    std::fs::write(&broken, b"not a sqlite database").unwrap();
+    let out = ingest::import_all(&mut conn, home.path(), &roots(src.path()), None, Some(&broken)).unwrap();
+    assert_eq!(out.files_failed, 1);
+    assert_eq!(out.errors.len(), 1);
+    assert!(out.messages_added > 0, "其他来源照常采集");
+}
+
+#[test]
+fn backups_in_the_same_second_get_distinct_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("config.json");
+    std::fs::write(&f, "{}").unwrap();
+    let first = yourmem::fresh_backup_path(&f);
+    std::fs::write(&first, "a").unwrap();
+    let second = yourmem::fresh_backup_path(&f);
+    assert_ne!(first, second);
+    assert!(second.to_string_lossy().contains("config.json.bak-"));
+}
+
+#[test]
+fn stats_leave_out_sessions_in_trash() {
+    let (home, src) = setup();
+    let mut conn = db::open(home.path()).unwrap();
+    ingest::import_all(&mut conn, home.path(), &roots(src.path()), None, None).unwrap();
+    let before = db::stats(&conn).unwrap();
+    db::set_session_deleted(&conn, "claude:aaaa-1111", true).unwrap();
+    let after = db::stats(&conn).unwrap();
+    assert_eq!(after["sessions"].as_i64().unwrap(), before["sessions"].as_i64().unwrap() - 1);
+    assert_eq!(after["messages"].as_i64().unwrap(), before["messages"].as_i64().unwrap() - 5);
+    assert_eq!(after["sessions_trash"], 1);
 }

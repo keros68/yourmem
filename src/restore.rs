@@ -94,8 +94,7 @@ pub fn execute(conn: &Connection, home: &Path, agent: &str, session: &str, force
             "目标已存在：{}。默认拒绝覆盖；确认要覆盖请加 --force（会先自动备份 .bak）",
             target.display()
         );
-        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let bak = with_suffix(&target, &format!("bak-{ts}"));
+        let bak = crate::fresh_backup_path(&target);
         std::fs::copy(&target, &bak)
             .with_context(|| format!("备份目标文件到 {}", bak.display()))?;
         backup = json!(bak);

@@ -265,7 +265,8 @@ END;
 pub fn open(home: &Path) -> Result<Connection> {
     std::fs::create_dir_all(home)?;
     let conn = Connection::open(home.join("yourmem.db"))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+    // journal_size_limit：检查点后把 WAL 截回 64 MB 以内，长驻进程不会停在历史最高水位
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_size_limit=67108864;")?;
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(TRIGGERS_SQL)?;
     migrate(&conn)?;
@@ -1344,7 +1345,7 @@ pub fn trash_sessions(conn: &Connection) -> Result<Vec<Value>> {
 pub fn stats(conn: &Connection) -> Result<Value> {
     let get = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
     let mut stmt = conn.prepare(
-        "SELECT agent, COUNT(*), COALESCE(SUM(message_count),0) FROM sessions GROUP BY agent",
+        "SELECT agent, COUNT(*), COALESCE(SUM(message_count),0) FROM sessions WHERE deleted_at IS NULL GROUP BY agent",
     )?;
     let agents: Vec<Value> = stmt
         .query_map([], |r| {
@@ -1357,8 +1358,8 @@ pub fn stats(conn: &Connection) -> Result<Value> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(json!({
         "projects": get("SELECT COUNT(*) FROM projects WHERE archived_at IS NULL"),
-        "sessions": get("SELECT COUNT(*) FROM sessions"),
-        "messages": get("SELECT COUNT(*) FROM messages"),
+        "sessions": get("SELECT COUNT(*) FROM sessions WHERE deleted_at IS NULL"),
+        "messages": get("SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id = m.session_id WHERE s.deleted_at IS NULL"),
         "handoffs": get("SELECT COUNT(*) FROM handoffs"),
         "memories": get("SELECT COUNT(*) FROM memories"),
         "memories_suggested": get("SELECT COUNT(*) FROM memories WHERE status='suggested'"),

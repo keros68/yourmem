@@ -252,8 +252,8 @@ fn backfill_is_atomic_and_retryable() {
         "CREATE TRIGGER fail_artifact_update BEFORE UPDATE ON session_artifacts
          BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
     ).unwrap();
-    let r = ingest::import_all(&mut conn, home.path(), &roots, None, None);
-    assert!(r.is_err(), "artifact 更新失败必须让导入报错");
+    let r = ingest::import_all(&mut conn, home.path(), &roots, None, None).unwrap();
+    assert_eq!(r.files_failed, 1, "artifact 更新失败必须如实计为失败");
     let (cwd, pid): (Option<String>, Option<i64>) = conn.query_row(
         "SELECT cwd, project_id FROM sessions WHERE id = 'kimi:session_00000000-0000-0000-0000-00000000000e'",
         [], |r| Ok((r.get(0)?, r.get(1)?)),

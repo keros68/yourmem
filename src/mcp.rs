@@ -29,6 +29,12 @@ pub fn serve(home: &Path) -> anyhow::Result<()> {
                 continue;
             }
         };
+        // 回复 initialize 前先在后台起一次增量导入：agent 的连接超时只有几秒，
+        // 首次全量导入可能要几分钟，不能挡在握手前面
+        if req.get("method").and_then(Value::as_str) == Some("initialize") {
+            let home = home.to_path_buf();
+            std::thread::spawn(move || init_import(&home));
+        }
         if let Some(resp) = handle(home, &req) {
             write_msg(&mut out, &resp)?;
         }
@@ -53,10 +59,6 @@ pub fn handle(home: &Path, req: &Value) -> Option<Value> {
         return if has_id { Some(error(id, -32600, "invalid request: missing method")) } else { None };
     };
 
-    // 消费入口自带新鲜度：回复 initialize 前先尽力增量导入（失败不传导）。
-    if method == "initialize" {
-        init_import(home);
-    }
     match method {
         "notifications/initialized" | "notifications/cancelled" => None,
         _ if !has_id => None,
@@ -91,8 +93,8 @@ fn err_text(msg: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": msg }], "isError": true })
 }
 
-/// initialize 前同步增量导入（消费入口自带新鲜度）：尽力而为，失败只记 stderr 不传导；`.last_import` 60 秒单飞（watch/CLI/app 同钟）。
-fn init_import(home: &Path) {
+/// initialize 时在后台增量导入（消费入口自带新鲜度）：尽力而为，失败只记 stderr 不传导；`.last_import` 60 秒单飞（watch/CLI/app 同钟）。
+pub fn init_import(home: &Path) {
     let fresh = std::fs::metadata(home.join(".last_import")).and_then(|m| m.modified())
         .is_ok_and(|t| match t.elapsed() {
             Ok(d) => d < std::time::Duration::from_secs(60),

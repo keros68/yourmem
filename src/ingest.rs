@@ -24,6 +24,10 @@ pub struct ImportOutcome {
     pub files_skipped: usize,
     /// 源文件比已归档的字节数短（被截断或覆盖）：保留已归档内容，不导入该文件。
     pub files_shrunk: usize,
+    /// 读取或解析出错的文件与库源：跳过它们，其余照常采集，下轮重试。
+    pub files_failed: usize,
+    /// 出错原因（最多保留前 5 条）。
+    pub errors: Vec<String>,
     pub messages_added: u64,
     pub lines_archived: u64,
     pub opencode_sessions_updated: usize,
@@ -33,6 +37,16 @@ pub struct ImportOutcome {
     /// import_all never touch the real ~/.claude).
     pub memory_files_monitored: usize,
     pub memory_revisions_added: usize,
+}
+
+impl ImportOutcome {
+    fn record_failure(&mut self, source: &str, e: &anyhow::Error) {
+        self.files_failed += 1;
+        eprintln!("yourmem import: 跳过出错的来源（下轮重试）：{source}: {e:#}");
+        if self.errors.len() < 5 {
+            self.errors.push(format!("{source}: {e:#}"));
+        }
+    }
 }
 
 /// import 后半段共用：增量导入 + 原生 memory 采集 + `.last_import` 单飞时钟戳（MCP init 用，watch/CLI/app 同钟）。
@@ -312,6 +326,8 @@ pub fn import_all(
         files_updated: 0,
         files_skipped: 0,
         files_shrunk: 0,
+        files_failed: 0,
+        errors: Vec::new(),
         messages_added: 0,
         lines_archived: 0,
         opencode_sessions_updated: 0,
@@ -341,7 +357,10 @@ pub fn import_all(
                     eprintln!("yourmem import: 源文件比已归档内容短，保留已归档内容并跳过：{}", path.display());
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    out.record_failure(&path.display().to_string(), &e);
+                    continue;
+                }
             };
             if lines > 0 || msgs > 0 {
                 out.files_updated += 1;
@@ -351,15 +370,23 @@ pub fn import_all(
         }
     }
     if let Some(db_path) = opencode_db {
-        let oc = adapters::opencode::import(conn, home, db_path)?;
-        out.messages_added += oc.messages_added;
-        out.lines_archived += oc.lines_archived;
-        out.opencode_sessions_updated = oc.sessions_updated;
+        match adapters::opencode::import(conn, home, db_path) {
+            Ok(oc) => {
+                out.messages_added += oc.messages_added;
+                out.lines_archived += oc.lines_archived;
+                out.opencode_sessions_updated = oc.sessions_updated;
+            }
+            Err(e) => out.record_failure(&db_path.display().to_string(), &e),
+        }
     }
     if let Some(db_path) = hermes_db {
-        let hm = adapters::hermes::import(conn, home, db_path)?;
-        out.messages_added += hm.messages_added;
-        out.lines_archived += hm.lines_archived;
+        match adapters::hermes::import(conn, home, db_path) {
+            Ok(hm) => {
+                out.messages_added += hm.messages_added;
+                out.lines_archived += hm.lines_archived;
+            }
+            Err(e) => out.record_failure(&db_path.display().to_string(), &e),
+        }
     }
     out.lineage_links = db::detect_lineage(conn)?;
     Ok(out)
@@ -643,6 +670,8 @@ pub fn outcome_json(o: &ImportOutcome) -> Value {
         "files_updated": o.files_updated,
         "files_skipped": o.files_skipped,
         "files_shrunk": o.files_shrunk,
+        "files_failed": o.files_failed,
+        "errors": o.errors,
         "opencode_sessions_updated": o.opencode_sessions_updated,
         "messages_added": o.messages_added,
         "lines_archived": o.lines_archived,

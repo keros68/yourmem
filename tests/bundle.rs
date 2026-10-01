@@ -1115,3 +1115,44 @@ fn failed_index_backfill_rolls_back_the_entire_merge() {
     let c = db::open(target.path()).unwrap();
     assert_eq!(yourmem::memfiles::search(&c, target.path(), "source memory", 10).unwrap().len(), 1);
 }
+
+#[test]
+fn merge_replacement_keeps_local_links_and_trash_state() {
+    let (home, src) = make_src();
+    let out = home.path().join("first.tar.gz");
+    bundle::create(&db::open(home.path()).unwrap(), home.path(), &out, &bundle::BundleFilter::default()).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    bundle::restore(&out, target.path(), false).unwrap();
+    {
+        let tc = db::open(target.path()).unwrap();
+        tc.execute(
+            "INSERT INTO session_links(child_session_id, parent_session_id, link_type, created_at)
+             VALUES ('claude:bbbb', 'claude:aaaa', 'continuation', '2026-08-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        db::set_session_deleted(&tc, "claude:aaaa", true).unwrap();
+    }
+    // 源库里 aaaa 变长 → 合并时走替换
+    std::fs::write(
+        src.path().join("claude").join("aaaa.jsonl"),
+        std::fs::read_to_string(src.path().join("claude").join("aaaa.jsonl")).unwrap()
+            + r#"{"type":"user","cwd":"/tmp/proj-x","uuid":"a3","timestamp":"2026-08-01T11:00:00Z","message":{"role":"user","content":"追加行"}}"# + "\n",
+    ).unwrap();
+    let mut c = db::open(home.path()).unwrap();
+    ingest::import_all(&mut c, home.path(), &[(adapters::AGENT_CLAUDE, src.path().join("claude"))], None, None).unwrap();
+    let second = home.path().join("second.tar.gz");
+    bundle::create(&c, home.path(), &second, &bundle::BundleFilter::default()).unwrap();
+    let r = bundle::restore(&second, target.path(), true).unwrap();
+    assert_eq!(r["merged"]["sessions_replaced"], 1, "{r}");
+
+    let tc = db::open(target.path()).unwrap();
+    let links: i64 = tc.query_row(
+        "SELECT COUNT(*) FROM session_links WHERE child_session_id = 'claude:bbbb' AND parent_session_id = 'claude:aaaa'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(links, 1, "本机独有的谱系边保留");
+    let deleted: Option<String> = tc.query_row(
+        "SELECT deleted_at FROM sessions WHERE id = 'claude:aaaa'", [], |r| r.get(0)).unwrap();
+    assert!(deleted.is_some(), "本机已放进回收站的会话不因合并复活");
+    let mc: i64 = tc.query_row("SELECT message_count FROM sessions WHERE id = 'claude:aaaa'", [], |r| r.get(0)).unwrap();
+    assert_eq!(mc, 3, "内容已更新为包里的新版本");
+}

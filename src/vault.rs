@@ -58,7 +58,7 @@ impl Store {
         }
         let conn = Connection::open(db)?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=30000;
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=30000; PRAGMA journal_size_limit=67108864;
              CREATE TABLE IF NOT EXISTS objects(hash TEXT PRIMARY KEY, data BLOB NOT NULL);",
         )?;
         Ok(Store { conn, home: home.to_path_buf() })

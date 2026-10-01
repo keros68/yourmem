@@ -160,16 +160,13 @@ fn prune_snapshot(snap_path: &Path, filter: &BundleFilter) -> Result<Value> {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for (sid, agent, fpath) in all {
             if !keep.contains(&sid) {
-                // 文件型 agent 1 文件=1 会话：一并裁掉该文件的采集游标，否则恢复端
-                // import 会跳过这些字节，被裁会话永远采不回且无提示。opencode 是
-                // 整库共享游标，删了会让被裁会话在带源库的机器上整库重扫复活——
-                // 有意保留（静默少采比复活安全，墓碑对 SQLite agent 本就不生效）。
-                if agent != crate::adapters::opencode::AGENT_OPENCODE {
-                    conn.execute(
-                        "DELETE FROM source_files WHERE agent = ?1 AND path = ?2",
-                        params![agent, fpath],
-                    )?;
-                }
+                // 每个会话有自己的采集游标（文件型按文件路径，opencode/hermes 按
+                // `<agent>://<会话 id>`，都记在 sessions.file_path）：一并裁掉，否则
+                // 恢复端 import 会跳过这些内容，被裁会话永远采不回且无提示。
+                conn.execute(
+                    "DELETE FROM source_files WHERE agent = ?1 AND path = ?2",
+                    params![agent, fpath],
+                )?;
                 db::delete_session_data(&conn, &sid)?;
                 pruned += 1;
             }
@@ -728,8 +725,33 @@ fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
                             rows.collect::<std::result::Result<Vec<_>, _>>()?
                         };
                         replaced_pointer_coords.extend(coords);
+                        // 本机的谱系边与回收站状态不随替换丢失：替换只更新会话内容
+                        let local_links: Vec<(String, String, String, Option<String>, String)> = {
+                            let mut st = tx.prepare(
+                                "SELECT child_session_id, parent_session_id, link_type, via_uuid, created_at
+                                 FROM session_links WHERE child_session_id = ?1 OR parent_session_id = ?1",
+                            )?;
+                            let rows = st.query_map(params![sid], |r| {
+                                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                            })?;
+                            rows.collect::<std::result::Result<Vec<_>, _>>()?
+                        };
+                        let local_deleted_at: Option<String> = tx.query_row(
+                            "SELECT deleted_at FROM sessions WHERE id = ?1", params![sid], |r| r.get(0),
+                        )?;
                         db::delete_session_data(&tx, sid)?;
                         insert_session(&tx, &s, &project_map)?;
+                        tx.execute(
+                            "UPDATE sessions SET deleted_at = ?2 WHERE id = ?1",
+                            params![sid, local_deleted_at],
+                        )?;
+                        for (child, parent, link_type, via, created) in &local_links {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO session_links(child_session_id, parent_session_id, link_type, via_uuid, created_at)
+                                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                                params![child, parent, link_type, via, created],
+                            )?;
+                        }
                         sessions_replaced += 1;
                         replaced_ids.push(sid.to_string());
                     }

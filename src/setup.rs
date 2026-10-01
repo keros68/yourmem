@@ -584,8 +584,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// 写前备份 + 写 tmp 再 rename。返回 .bak 路径（若原件存在）。
 fn backup_then_write(path: &Path, content: &[u8]) -> Result<Option<PathBuf>> {
     let bak = if path.is_file() {
-        let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let bak = with_suffix(path, &format!("bak-{ts}"));
+        let bak = crate::fresh_backup_path(path);
         std::fs::copy(path, &bak).with_context(|| format!("备份 {}", bak.display()))?;
         Some(bak)
     } else {

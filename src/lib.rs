@@ -120,6 +120,22 @@ fn resolve_home(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
 /// 首次启动判定：数据目录里既无 config.json 也无 yourmem.db 才算新装——
 /// 升级用户/已有数据的目录不受向导打扰。桌面端须在首个页面打开数据库
 /// 之前调用（页面渲染即建库，之后此判定恒为 false）。
+/// Backup name next to `path`: `<name>.bak-YYYYMMDD-HHMMSS`, with `-2`, `-3`…
+/// appended when a backup from the same second already exists.
+pub fn fresh_backup_path(path: &Path) -> PathBuf {
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let mut n = 1;
+    loop {
+        let suffix = if n == 1 { String::new() } else { format!("-{n}") };
+        let candidate = path.with_file_name(format!("{name}.bak-{ts}{suffix}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 pub fn is_first_run(home: &Path) -> bool {
     !home.join("config.json").exists() && !home.join("yourmem.db").exists()
 }
