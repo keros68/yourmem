@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DOCTOR_INTERVAL_SECS: u64 = 86_400;
-/// Off until snapshots stop copying every vault object as its own file: on a
-/// real archive the first snapshot runs for hours while holding the import lock.
-const DEFAULT_SNAPSHOT_INTERVAL_DAYS: u64 = 0;
+/// Weekly: on a real archive of ~470k objects the first snapshot takes about
+/// five minutes and later ones about two, with collection paused meanwhile.
+const DEFAULT_SNAPSHOT_INTERVAL_DAYS: u64 = 7;
 const STALE_TMP: Duration = Duration::from_secs(86_400);
 const MIGRATE_BATCH: usize = 20_000;
 
@@ -81,21 +81,27 @@ pub fn run_due(home: &Path) -> Result<Value> {
 
     // Earlier versions wrote one file per object; move them into the object
     // store a batch per pass so collection is never held up for long.
+    let mut migrating = false;
     if crate::vault::objects_root(home).is_dir() {
         match crate::vault::migrate_legacy(home, MIGRATE_BATCH) {
             Ok(r) if r["moved"].as_u64().unwrap_or(0) > 0 => {
+                migrating = r["remaining"] == true;
                 let moved = state["migration"]["moved"].as_u64().unwrap_or(0) + r["moved"].as_u64().unwrap_or(0);
                 state["migration"] = json!({"moved": moved, "remaining": r["remaining"], "skipped": r["skipped"]});
                 save(home, &state)?;
                 ran.push("migration");
             }
             Ok(_) => {}
-            Err(e) => eprintln!("yourmem object migration: {e:#}"),
+            Err(e) => {
+                migrating = true;
+                eprintln!("yourmem object migration: {e:#}");
+            }
         }
     }
 
     let interval_days = snapshot_interval_days(home);
-    if interval_days > 0 && due(&state["snapshot_attempt_at"], interval_days * 86_400, now) {
+    // 迁移未完成时快照要逐个读旧文件，等迁完再做
+    if interval_days > 0 && !migrating && due(&state["snapshot_attempt_at"], interval_days * 86_400, now) {
         state["snapshot_attempt_at"] = json!(now);
         state["snapshot"] = match crate::snapshots::create(home) {
             Ok(r) => json!({"ok": true, "at": crate::now_iso(), "id": r["id"]}),
@@ -116,7 +122,7 @@ pub fn run_due(home: &Path) -> Result<Value> {
                     .into_iter()
                     .flatten()
                     .filter(|c| c["status"] != "ok")
-                    // 未开启自动快照时，"快照过旧"不是需要处理的问题
+                    // 关闭自动快照时，"快照过旧"不是需要处理的问题
                     .filter(|c| interval_days > 0 || c["name"] != "db_snapshot")
                     .cloned()
                     .collect();
@@ -145,7 +151,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         crate::db::open(home).unwrap();
-        crate::ingest::write_config(home, &json!({"snapshot_interval_days": 7})).unwrap();
         let stale = crate::vault::objects_root(home).join("ab");
         std::fs::create_dir_all(&stale).unwrap();
         let tmp = stale.join("abcd.tmp.1");
@@ -169,13 +174,31 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_are_off_by_default() {
+    fn zero_interval_turns_snapshots_off() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         crate::db::open(home).unwrap();
+        crate::ingest::write_config(home, &json!({"snapshot_interval_days": 0})).unwrap();
         let r = run_due(home).unwrap();
         assert_eq!(r["ran"], json!(["doctor"]));
         let problems = status(home)["doctor"]["problems"].clone();
         assert!(problems.as_array().unwrap().iter().all(|p| p["name"] != "db_snapshot"), "{problems}");
+    }
+
+    #[test]
+    fn snapshot_waits_for_legacy_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::db::open(home).unwrap();
+        for i in 0..(MIGRATE_BATCH + 1) {
+            let bytes = format!("legacy line {i}").into_bytes();
+            let path = crate::vault::object_path(home, &crate::vault::hash_bytes(&bytes));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let first = run_due(home).unwrap();
+        assert_eq!(first["ran"], json!(["migration", "doctor"]), "snapshot waits while files remain");
+        let second = run_due(home).unwrap();
+        assert_eq!(second["ran"], json!(["migration", "snapshot"]));
     }
 }
