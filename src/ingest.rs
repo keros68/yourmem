@@ -346,12 +346,7 @@ pub fn import_all(
     // 先列出全部文件得到总数，再逐个导入：界面据此显示进度
     let mut listed = Vec::new();
     for (agent, root) in roots {
-        let mut files = adapters::discover(root);
-        if *agent == adapters::AGENT_PI {
-            // 临时现场（scratchpad）整桶不采，见 adapters/pi.rs exclude_temp_buckets
-            files = adapters::pi::exclude_temp_buckets(files);
-        }
-        listed.push((*agent, files));
+        listed.push((*agent, adapters::discover(root)));
     }
     PROGRESS_DONE.store(0, Ordering::Relaxed);
     PROGRESS_TOTAL.store(listed.iter().map(|(_, f)| f.len()).sum(), Ordering::Relaxed);

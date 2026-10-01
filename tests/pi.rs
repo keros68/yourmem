@@ -7,7 +7,6 @@ use serde_json::json;
 use yourmem::adapters::{self, pi};
 use yourmem::{db, ingest};
 
-use std::path::{Path, PathBuf};
 
 fn lines(v: &[serde_json::Value]) -> Vec<(u64, String)> {
     v.iter().enumerate().map(|(i, j)| ((i + 1) as u64, j.to_string())).collect()
@@ -42,39 +41,25 @@ fn sample() -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn temp_buckets_are_excluded_at_discovery() {
-    // 真机形态：pi 会话桶 = `--` 包裹的 munge(cwd)；临时目录下的 scratchpad 整桶不采
-    let temp = Path::new("C:\\Users\\test\\AppData\\Local\\Temp");
-    let files = vec![
-        // 真实项目桶：保留
-        PathBuf::from("/r/--D--work-real--/a.jsonl"),
-        // temp 根本身 / temp 下 scratchpad：排除
-        PathBuf::from("/r/--C--Users-test-AppData-Local-Temp--/b.jsonl"),
-        PathBuf::from("/r/--C--Users-test-AppData-Local-Temp-claude-D--work-x-scratchpad--/c.jsonl"),
-        // 前缀相似但不属于 temp 的桶：保留（前缀后必须跟分隔符 `-`）
-        PathBuf::from("/r/--C--Users-test-AppData-Local-Templates--/d.jsonl"),
-        // 非 munge 桶形态（extra_roots 直挂文件等）：照常采集
-        PathBuf::from("/r/plain.jsonl"),
-        PathBuf::from("/r/not-a-bucket/e.jsonl"),
-    ];
-    let kept = pi::exclude_temp_buckets_with(temp, files);
-    assert_eq!(
-        kept,
-        vec![
-            PathBuf::from("/r/--D--work-real--/a.jsonl"),
-            PathBuf::from("/r/--C--Users-test-AppData-Local-Templates--/d.jsonl"),
-            PathBuf::from("/r/plain.jsonl"),
-            PathBuf::from("/r/not-a-bucket/e.jsonl"),
-        ],
-        "temp 本身与子路径排除，相似前缀与直挂文件保留"
-    );
+fn temp_dir_sessions_are_collected_into_a_discarded_project() {
+    // 临时目录下的运行现场照常采集（可搜索、可备份），所在项目新建即归入已废弃
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let scratch = std::env::temp_dir().join("pi-scratch-run");
+    let bucket = root.path().join("--scratch-bucket--");
+    std::fs::create_dir_all(&bucket).unwrap();
+    let mut rows = sample();
+    rows[0]["cwd"] = json!(scratch.to_string_lossy());
+    let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
+    std::fs::write(bucket.join("2026-09-01T10-00-00-000Z_00000000-0000-0000-0000-00000000000b.jsonl"), body).unwrap();
 
-    // 大小写不一致仍命中（Windows 路径大小写不敏感，TEMP 环境值与桶名大小写可能不同）
-    let one = vec![PathBuf::from("/r/--c--users-test-appdata-local-temp--/f.jsonl")];
-    assert!(pi::exclude_temp_buckets_with(temp, one).is_empty());
-    // 剥掉 temp 根尾部分隔符（GetTempPathW 带尾杠的环境差异）
-    let one = vec![PathBuf::from("/r/--C--Users-test-AppData-Local-Temp--/g.jsonl")];
-    assert!(pi::exclude_temp_buckets_with(Path::new("C:\\Users\\test\\AppData\\Local\\Temp\\"), one).is_empty());
+    let mut conn = db::open(home.path()).unwrap();
+    let out = ingest::import_all(&mut conn, home.path(), &[(adapters::AGENT_PI, root.path().to_path_buf())], None, None).unwrap();
+    assert!(out.messages_added > 0, "照常采集");
+    let archived: Option<String> = conn.query_row(
+        "SELECT p.archived_at FROM sessions s JOIN projects p ON p.id = s.project_id WHERE s.agent = 'pi'",
+        [], |r| r.get(0)).unwrap();
+    assert!(archived.is_some(), "临时目录项目默认隐藏");
 }
 
 #[test]
