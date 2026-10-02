@@ -291,6 +291,11 @@ pub fn default_pi_root() -> PathBuf {
     home_dir().join(".pi").join("agent").join("sessions")
 }
 
+/// Antigravity CLI 的会话根：`brain/<uuid>/.system_generated/logs/transcript_full.jsonl`。
+pub fn default_antigravity_root() -> PathBuf {
+    home_dir().join(".gemini").join("antigravity-cli").join("brain")
+}
+
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }

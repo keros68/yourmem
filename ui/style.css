@@ -293,6 +293,7 @@ input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px;
 .pill.zcode { color: var(--yellow); background: rgba(251, 191, 36, 0.12); }
 .pill.kimi { color: #c4b5fd; background: rgba(196, 181, 253, 0.12); }
 .pill.hermes { color: var(--teal, #5eead4); background: rgba(94, 234, 212, 0.12); }
+.pill.antigravity { color: #93c5fd; background: rgba(147, 197, 253, 0.12); }
 .pill.suggested { color: var(--yellow); background: rgba(251, 191, 36, 0.12); }
 .pill.stale { color: var(--yellow); background: rgba(251, 191, 36, 0.12); }
 .pill.confirmed { color: var(--green); background: rgba(74, 222, 128, 0.12); }
@@ -474,6 +475,7 @@ pre.memfile {
 .activity-agent.kimi i, .activity-project footer i b.kimi { background: #a78bfa; }
 .activity-agent.zcode i, .activity-project footer i b.zcode { background: var(--yellow); }
 .activity-agent.hermes i, .activity-project footer i b.hermes { background: var(--green); }
+.activity-agent.antigravity i, .activity-project footer i b.antigravity { background: #60a5fa; }
 
 #page-today.page.active { display: flex; height: calc(100vh - 90px); min-height: 510px; flex-direction: column; overflow: hidden; }
 .activity-heading { flex: none; margin-bottom: 13px; }

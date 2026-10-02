@@ -41,7 +41,9 @@ pub fn plan(home: &Path, include_backups: bool) -> Result<Value> {
         "backup_separate": backup_separate,
         "backups_kept_inside": backups_kept_inside,
         "location_pointer": crate::data_home_pointer(),
-        "preserved": [crate::default_claude_root(), crate::default_codex_root(), crate::default_zcode_root(), crate::default_kimi_root(), crate::default_pi_root(), crate::adapters::opencode::default_db_path(), crate::adapters::hermes::default_db_path()],
+        "preserved": crate::ingest::FILE_AGENTS.iter().map(|(_, _, d)| d())
+            .chain([crate::adapters::opencode::default_db_path(), crate::adapters::hermes::default_db_path()])
+            .collect::<Vec<_>>(),
         "preserved_scope": "所有 agent 自有会话与用户配置中除 yourmem 条目外的内容",
     });
     let token = format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?));

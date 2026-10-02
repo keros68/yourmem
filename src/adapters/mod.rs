@@ -5,6 +5,7 @@
 //! fatal. Session identity is derived from the file name so incremental
 //! re-imports stay consistent without parser state.
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod hermes;
@@ -26,6 +27,7 @@ pub const AGENT_KIMI: &str = "kimi";
 /// hermes：多端网关 agent（~/.hermes/state.db，SQLite 单库源，0.3.9 起）。
 /// cron 来源按 hermes 本人裁定不采（运行日志，非知识资产）。
 pub use hermes::AGENT_HERMES;
+pub use antigravity::AGENT_ANTIGRAVITY;
 /// pi：树状 JSONL 文件型源（~/.pi/agent/sessions，2026-09-10 真机样本驱动）。
 pub const AGENT_PI: &str = "pi";
 
@@ -66,7 +68,7 @@ pub(crate) fn push_message(
 }
 
 /// Recursively find `*.jsonl` session files under a source root.
-pub fn discover(root: &Path) -> Vec<PathBuf> {
+pub fn discover(agent: &str, root: &Path) -> Vec<PathBuf> {
     if !root.is_dir() {
         return Vec::new();
     }
@@ -77,6 +79,7 @@ pub fn discover(root: &Path) -> Vec<PathBuf> {
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
         .filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false))
+        .filter(|p| agent != AGENT_ANTIGRAVITY || antigravity::is_transcript(p))
         .collect();
     out.sort();
     out
@@ -90,6 +93,11 @@ pub fn native_id(agent: &str, path: &Path) -> String {
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
+    if agent == AGENT_ANTIGRAVITY {
+        if let Some(id) = antigravity::native_id(path) {
+            return id;
+        }
+    }
     if agent == AGENT_ZCODE {
         // 文件名 model-io-sess_<uuid>.jsonl → 与 zcode 库里的会话 id 对齐
         if let Some(rest) = stem.strip_prefix("model-io-") {
@@ -176,6 +184,7 @@ pub fn parse_chunk(agent: &str, lines: &[(u64, String)]) -> ParseOutput {
         AGENT_ZCODE => zcode::parse_lines(lines),
         AGENT_KIMI => kimi::parse_lines(lines),
         AGENT_PI => pi::parse_lines(lines),
+        AGENT_ANTIGRAVITY => antigravity::parse_lines(lines),
         _ => ParseOutput::default(),
     }
 }
@@ -226,6 +235,11 @@ pub fn capability_matrix() -> serde_json::Value {
           "lineage": "no", "resume": "yes",
           "writeback": "no", "encrypted": "no",
           "notes": "暂不识别对话之间的继承关系；暂不支持写回" },
+        { "agent": AGENT_ANTIGRAVITY, "transcript": "yes", "search": "yes",
+          // 采 CLI 的明文转录（transcript_full.jsonl）；IDE 主存储是 protobuf，不读
+          "lineage": "no", "resume": "no",
+          "writeback": "no", "encrypted": "no",
+          "notes": "采集命令行版的对话记录；支持取回上下文压缩前的原文；没有续聊命令" },
     ])
 }
 
@@ -233,9 +247,5 @@ pub fn capability_matrix() -> serde_json::Value {
 pub fn encrypted_watchlist() -> serde_json::Value {
     serde_json::json!([
         { "agent": "trae", "encrypted": "yes", "notes": "数据已加密，暂不支持" },
-        // antigravity 的"加密"出自 Swob 对 IDE 主存储（protobuf）的观察；resume-skills
-        // 报道存在明文转录 lane（brain/<id>/.system_generated/logs/transcript.jsonl）。
-        // 两条 lane 可能并存——按样本门禁：本机拿到真实样本核验后才改判，现维持硬阻断。
-        { "agent": "antigravity", "encrypted": "yes", "notes": "数据已加密，暂不支持" },
     ])
 }

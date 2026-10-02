@@ -120,16 +120,10 @@ pub fn import_overriding(home: &Path, overrides: &[(&str, PathBuf)]) -> Result<I
                 .unwrap_or(d),
         )
     };
-    let mut roots: Vec<(String, PathBuf)> = [
-        (adapters::AGENT_CLAUDE, "YOUMEM_CLAUDE_DIR", crate::default_claude_root()),
-        (adapters::AGENT_CODEX, "YOUMEM_CODEX_DIR", crate::default_codex_root()),
-        (adapters::AGENT_ZCODE, "YOUMEM_ZCODE_DIR", crate::default_zcode_root()),
-        (adapters::AGENT_KIMI, "YOUMEM_KIMI_DIR", crate::default_kimi_root()),
-        (adapters::AGENT_PI, "YOUMEM_PI_DIR", crate::default_pi_root()),
-    ]
-    .into_iter()
-    .filter_map(|(a, v, d)| pick(a, v, d).map(|p| (a.to_string(), p)))
-    .collect();
+    let mut roots: Vec<(String, PathBuf)> = FILE_AGENTS
+        .into_iter()
+        .filter_map(|(a, v, d)| pick(a, v, d()).map(|p| (a.to_string(), p)))
+        .collect();
     apply_extra_roots_and_gates(home, &mut roots);
     let refs: Vec<(&str, PathBuf)> = roots.iter().map(|(a, p)| (a.as_str(), p.clone())).collect();
     let oc = pick(adapters::opencode::AGENT_OPENCODE, "YOUMEM_OPENCODE_DB", adapters::opencode::default_db_path());
@@ -142,11 +136,20 @@ pub fn import_overriding(home: &Path, overrides: &[(&str, PathBuf)]) -> Result<I
 // $YOUMEM_HOME/config.json 的 extra_roots。只支持文件型 agent
 // （claude/codex/zcode/kimi）；opencode 是单库源，用 YOUMEM_OPENCODE_DB 覆盖。
 
-/// 可登记额外根的文件型 agent。
-pub const EXTRA_ROOT_AGENTS: [&str; 5] = [
-    adapters::AGENT_CLAUDE, adapters::AGENT_CODEX, adapters::AGENT_ZCODE, adapters::AGENT_KIMI,
-    adapters::AGENT_PI,
+/// 文件型 agent：(名称, 根目录覆盖环境变量, 默认根)。都可登记额外根；
+/// 新增文件型 agent 只改这里。
+pub const FILE_AGENTS: [(&str, &str, fn() -> PathBuf); 6] = [
+    (adapters::AGENT_CLAUDE, "YOUMEM_CLAUDE_DIR", crate::default_claude_root),
+    (adapters::AGENT_CODEX, "YOUMEM_CODEX_DIR", crate::default_codex_root),
+    (adapters::AGENT_ZCODE, "YOUMEM_ZCODE_DIR", crate::default_zcode_root),
+    (adapters::AGENT_KIMI, "YOUMEM_KIMI_DIR", crate::default_kimi_root),
+    (adapters::AGENT_PI, "YOUMEM_PI_DIR", crate::default_pi_root),
+    (adapters::AGENT_ANTIGRAVITY, "YOUMEM_ANTIGRAVITY_DIR", crate::default_antigravity_root),
 ];
+
+fn is_file_agent(agent: &str) -> bool {
+    FILE_AGENTS.iter().any(|(a, ..)| *a == agent)
+}
 
 pub fn read_config(home: &Path) -> Value {
     std::fs::read_to_string(home.join("config.json")).ok()
@@ -194,12 +197,10 @@ pub fn disabled_agents(home: &Path) -> Vec<String> {
 }
 
 pub fn set_agent_disabled(home: &Path, agent: &str, disabled: bool) -> Result<Value> {
-    let known = [
-        adapters::AGENT_CLAUDE, adapters::AGENT_CODEX, adapters::AGENT_ZCODE,
-        adapters::AGENT_KIMI, adapters::AGENT_PI,
-        adapters::opencode::AGENT_OPENCODE, adapters::hermes::AGENT_HERMES,
-    ];
-    anyhow::ensure!(known.contains(&agent), "unknown agent: {agent}");
+    anyhow::ensure!(
+        is_file_agent(agent) || [adapters::opencode::AGENT_OPENCODE, adapters::hermes::AGENT_HERMES].contains(&agent),
+        "unknown agent: {agent}"
+    );
     let mut cfg = read_config(home);
     let mut list: Vec<String> = disabled_agents(home);
     if disabled {
@@ -229,7 +230,7 @@ pub const WATCHLIST: [(&str, fn() -> PathBuf); 7] = [
 ];
 
 pub fn add_extra_root(home: &Path, agent: &str, path: &Path) -> Result<Value> {
-    anyhow::ensure!(EXTRA_ROOT_AGENTS.contains(&agent),
+    anyhow::ensure!(is_file_agent(agent),
         "unsupported agent for extra root: {agent}（opencode 是单库源，用 YOUMEM_OPENCODE_DB 覆盖）");
     anyhow::ensure!(path.is_dir(), "not a directory: {}", path.display());
     let mut cfg = read_config(home);
@@ -275,13 +276,7 @@ pub fn agent_sources(home: &Path, conn: &Connection) -> Result<Value> {
     let disabled = disabled_agents(home);
     let is_disabled = |a: &str| disabled.iter().any(|d| d == a);
     let mut out = Vec::new();
-    for (agent, root) in [
-        (adapters::AGENT_CLAUDE, crate::default_claude_root()),
-        (adapters::AGENT_CODEX, crate::default_codex_root()),
-        (adapters::AGENT_ZCODE, crate::default_zcode_root()),
-        (adapters::AGENT_KIMI, crate::default_kimi_root()),
-        (adapters::AGENT_PI, crate::default_pi_root()),
-    ] {
+    for (agent, root) in FILE_AGENTS.map(|(a, _, d)| (a, d())) {
         out.push(json!({
             "agent": agent,
             "root": root,
@@ -356,7 +351,7 @@ pub fn import_all(
     // 先列出全部文件得到总数，再逐个导入：界面据此显示进度
     let mut listed = Vec::new();
     for (agent, root) in roots {
-        listed.push((*agent, adapters::discover(root)));
+        listed.push((*agent, adapters::discover(agent, root)));
     }
     PROGRESS_DONE.store(0, Ordering::Relaxed);
     PROGRESS_TOTAL.store(listed.iter().map(|(_, f)| f.len()).sum(), Ordering::Relaxed);
@@ -499,6 +494,7 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
     let meta = match agent {
         adapters::AGENT_ZCODE => adapters::zcode::enrich_meta_from_db(&parsed.meta, &session_id),
         adapters::AGENT_KIMI => adapters::kimi::enrich_meta_from_state(&parsed.meta, path),
+        adapters::AGENT_ANTIGRAVITY => adapters::antigravity::enrich_meta_from_history(&parsed.meta, path),
         _ => parsed.meta,
     };
 
