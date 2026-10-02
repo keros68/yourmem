@@ -1,9 +1,10 @@
 name: Release desktop
 
+# Run manually on main (`gh workflow run "Release desktop" --ref main`) after
+# bumping the version: tauri-action creates the v<version> draft release and its
+# tag. Caches are scoped to the ref that created them and only the default
+# branch's caches are shared, so tag-triggered runs would never reuse a build.
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -22,29 +23,30 @@ jobs:
         include:
           - name: Windows x64
             platform: windows-latest
-            manual: false
             args: --bundles nsis
           - name: macOS Apple Silicon
             platform: macos-latest
-            manual: true
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin --bundles app,dmg
           - name: macOS Intel
             platform: macos-latest
-            manual: true
             target: x86_64-apple-darwin
             args: --target x86_64-apple-darwin --bundles app,dmg
 
     steps:
       - uses: actions/checkout@v7
-        if: github.event_name == 'push' || matrix.manual
 
       - name: Add Rust target
-        if: (github.event_name == 'push' || matrix.manual) && matrix.target != ''
+        if: matrix.target != ''
         run: rustup target add ${{ matrix.target }}
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.name }}
+
       - name: Build and upload installer
-        if: github.event_name == 'push' || matrix.manual
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
