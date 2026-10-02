@@ -42,6 +42,8 @@ pub struct ImportOutcome {
     pub lines_archived: u64,
     pub opencode_sessions_updated: usize,
     pub lineage_links: u64,
+    /// 本轮按 save_memory 工具调用补上来源的记忆条数。
+    pub memory_sources_linked: u64,
     /// Native memory file backup (DESIGN-0.3 §2), filled by import_with
     /// (`memfiles::collect` runs after import_all, not inside it, so tests of
     /// import_all never touch the real ~/.claude).
@@ -340,6 +342,7 @@ pub fn import_all(
         lines_archived: 0,
         opencode_sessions_updated: 0,
         lineage_links: 0,
+        memory_sources_linked: 0,
         memory_files_monitored: 0,
         memory_revisions_added: 0,
     };
@@ -401,6 +404,7 @@ pub fn import_all(
         }
     }
     out.lineage_links = db::detect_lineage(conn)?;
+    out.memory_sources_linked = db::link_memory_sources(conn)?;
     Ok(out)
 }
 
@@ -691,6 +695,7 @@ pub fn outcome_json(o: &ImportOutcome) -> Value {
         "messages_added": o.messages_added,
         "lines_archived": o.lines_archived,
         "lineage_links": o.lineage_links,
+        "memory_sources_linked": o.memory_sources_linked,
         "memory_files_monitored": o.memory_files_monitored,
         "memory_revisions_added": o.memory_revisions_added,
     })

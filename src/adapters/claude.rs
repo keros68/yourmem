@@ -1,6 +1,9 @@
 //! Claude Code adapter (`~/.claude/projects/**/*.jsonl`).
 //!
 //! Content-bearing line types: user, assistant, system, summary.
+//! Compaction: older versions start a new file (summary line + compact
+//! lineage edge); 2.1+ compacts in place (`system/compact_boundary` line
+//! followed by an `isCompactSummary` user line) → `compact_line`.
 //! Ignored: mode, permission-mode, attachment, queue-operation,
 //! file-history-snapshot, last-prompt, and unknown future types.
 
@@ -53,10 +56,23 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                     meta.first_parent_uuid =
                         v.get("parentUuid").and_then(Value::as_str).map(str::to_string);
                 }
-                let base = if kind == "user" { MessageKind::User } else { MessageKind::Assistant };
+                // 同文件压缩后紧跟的摘要行（isCompactSummary）是 harness 生成的
+                // 压缩摘要，不是用户输入。
+                let base = if v.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+                    MessageKind::Summary
+                } else if kind == "user" {
+                    MessageKind::User
+                } else {
+                    MessageKind::Assistant
+                };
                 extract_blocks(&v["message"]["content"], base, *line_no, &ts, &uuid, &mut out.messages, &mut out.artifacts);
             }
             "system" => {
+                // 同文件压缩（Claude Code 2.1 起）：compact_boundary 行即压缩点，
+                // 之前的消息是压缩前原文；chunk 内取最早，跨 chunk 由 ingest 取 MIN。
+                if v.get("subtype").and_then(Value::as_str) == Some("compact_boundary") {
+                    out.compact_line = Some(out.compact_line.map_or(*line_no, |c| c.min(*line_no)));
+                }
                 if let Some(text) = v.get("content").and_then(Value::as_str) {
                     push(&mut out.messages, *line_no, MessageKind::System, text.to_string(), ts, uuid);
                 }

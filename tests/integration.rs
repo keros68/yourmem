@@ -1367,3 +1367,55 @@ fn claude_subagent_sessions_link_to_their_main_session() {
     let sub = list.iter().find(|s| s["session_id"] == "claude:agent-abc123").unwrap();
     assert_eq!(sub["parent_session_id"], format!("claude:{main_id}"));
 }
+
+#[test]
+fn claude_in_file_compaction_marks_boundary_and_slices() {
+    // Claude Code 2.1+ 在同一文件内压缩：system/compact_boundary 行 + isCompactSummary 摘要行。
+    let home = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let proj = src.path().join("claude").join("D--work-compact");
+    std::fs::create_dir_all(&proj).unwrap();
+    let sid = "99999999-8888-7777-6666-555555555555";
+    let lines = [
+        r#"{"type":"user","cwd":"/work/compact","uuid":"c1","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"压缩前的提问"}}"#,
+        r#"{"type":"assistant","uuid":"c2","timestamp":"2026-10-01T10:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"压缩前的回答"}]}}"#,
+        r#"{"type":"system","subtype":"compact_boundary","content":"Conversation compacted","parentUuid":null,"logicalParentUuid":"c2","uuid":"c3","timestamp":"2026-10-01T10:05:00Z"}"#,
+        r#"{"type":"user","isCompactSummary":true,"parentUuid":"c3","uuid":"c4","timestamp":"2026-10-01T10:05:00Z","message":{"role":"user","content":"This session is being continued from a previous conversation."}}"#,
+        r#"{"type":"user","uuid":"c5","timestamp":"2026-10-01T10:06:00Z","message":{"role":"user","content":"压缩后的提问"}}"#,
+    ];
+    std::fs::write(proj.join(format!("{sid}.jsonl")), lines.join("\n") + "\n").unwrap();
+
+    let mut conn = db::open(home.path()).unwrap();
+    ingest::import_all(&mut conn, home.path(), &[(adapters::AGENT_CLAUDE, src.path().join("claude"))], None, None).unwrap();
+    let id = format!("claude:{sid}");
+    let cl: i64 = conn
+        .query_row("SELECT compact_line_no FROM sessions WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(cl, 3, "压缩点 = compact_boundary 所在行");
+    let kind: String = conn
+        .query_row("SELECT kind FROM messages WHERE session_id = ?1 AND line_no = 4", rusqlite::params![id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(kind, "summary", "压缩摘要不算用户输入");
+
+    let pre = db::read_session(&conn, &id, 100, None, true).unwrap();
+    let texts: Vec<&str> = pre["messages"].as_array().unwrap().iter().filter_map(|m| m["content"].as_str()).collect();
+    assert_eq!(texts, ["压缩前的提问", "压缩前的回答"]);
+
+    // v16 迁移：修复前导入的库没有压缩点、摘要记为 user，升级后补齐。
+    conn.execute_batch(&format!(
+        "UPDATE sessions SET compact_line_no = NULL WHERE id = '{id}';
+         UPDATE messages SET kind = 'user' WHERE session_id = '{id}' AND line_no = 4;
+         PRAGMA user_version = 15;"
+    ))
+    .unwrap();
+    drop(conn);
+    let conn = db::open(home.path()).unwrap();
+    let (cl, kind): (i64, String) = conn
+        .query_row(
+            "SELECT s.compact_line_no, m.kind FROM sessions s JOIN messages m ON m.session_id = s.id AND m.line_no = 4 WHERE s.id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((cl, kind.as_str()), (3, "summary"));
+}

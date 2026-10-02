@@ -12,6 +12,8 @@ use crate::now_iso;
 
 mod session_window;
 pub use session_window::{session_window, message_content};
+mod memory_source;
+pub use memory_source::link_memory_sources;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
@@ -282,7 +284,7 @@ pub fn open(home: &Path) -> Result<Connection> {
 /// Current schema version, stamped into `PRAGMA user_version` by migrate().
 /// Bump this (and add a migration step below) whenever the schema changes;
 /// bundle manifests record it (DESIGN-0.3 §5.1 `schema_version`).
-pub const SCHEMA_VERSION: i32 = 15;
+pub const SCHEMA_VERSION: i32 = 16;
 
 /// Idempotent column additions for databases created by older versions.
 /// `user_version` drives the fast path: a database already stamped with the
@@ -450,6 +452,24 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version < 15 {
         // 项目内派工运行目录与子代理工作树一次性归入已废弃项目
         archive_projects_where(conn, crate::is_dispatch_site_path)?;
+    }
+    if version < 16 {
+        // Claude Code 同文件压缩此前未识别：已导入的会话按压缩边界行（system
+        // "Conversation compacted"）补压缩点，压缩摘要行改记为 summary。
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             UPDATE sessions SET compact_line_no = (
+                 SELECT MIN(line_no) FROM messages
+                 WHERE session_id = sessions.id AND kind = 'system' AND content = 'Conversation compacted')
+             WHERE agent = 'claude' AND compact_line_no IS NULL AND EXISTS (
+                 SELECT 1 FROM messages
+                 WHERE session_id = sessions.id AND kind = 'system' AND content = 'Conversation compacted');
+             UPDATE messages SET kind = 'summary'
+             WHERE kind = 'user'
+               AND content LIKE 'This session is being continued from a previous conversation%'
+               AND session_id IN (SELECT id FROM sessions WHERE agent = 'claude');
+             COMMIT;",
+        )?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())

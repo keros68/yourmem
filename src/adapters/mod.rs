@@ -174,7 +174,7 @@ pub fn capability_matrix() -> serde_json::Value {
           // fork/compact 谱系边（session_uuids 目击表）
           "lineage": "yes", "resume": "yes",
           "writeback": "yes", "encrypted": "no",
-          "notes": "上下文压缩后的新对话与原对话相连；可写回原目录" },
+          "notes": "支持取回上下文压缩前的原文；压缩后的新对话与原对话相连；可写回原目录" },
         { "agent": AGENT_CODEX, "transcript": "yes", "search": "yes",
           "lineage": "yes", "resume": "yes",
           "writeback": "yes", "encrypted": "no",
