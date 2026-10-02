@@ -189,3 +189,20 @@ fn a_corrupt_repository_object_is_repaired_by_the_next_snapshot() {
     let path = out.path().join("full.tar.gz");
     snapshots::export(home.path(), id(&second), &path).unwrap();
 }
+
+#[test]
+fn snapshot_succeeds_even_when_auto_cleanup_fails() {
+    let home = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    append(home.path(), source.path(), 1);
+    let first = snapshots::create(home.path()).unwrap();
+    // 伪造一份引用缺失数据库对象的旧快照：自动清理检查它时会出错
+    let dir = yourmem::backups_dir(home.path()).join("snapshots-v1").join("snapshots");
+    let mut bad: Value = serde_json::from_slice(&std::fs::read(dir.join(format!("{}.json", id(&first)))).unwrap()).unwrap();
+    bad["id"] = json!("broken-0001");
+    bad["db_hash"] = json!("0".repeat(64));
+    std::fs::write(dir.join("broken-0001.json"), bad.to_string()).unwrap();
+    let next = snapshots::create(home.path()).unwrap();
+    assert!(next["cleanup_error"].is_string(), "{next}");
+    assert!(dir.join(format!("{}.json", id(&next))).exists());
+}

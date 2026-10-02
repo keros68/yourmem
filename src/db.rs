@@ -336,36 +336,38 @@ fn migrate(conn: &Connection) -> Result<()> {
     // 就让错误显式冒出来——静默跳过等于把数据问题藏进下一次双插。
     // (a) 指针重定向：memories.source_message_id 指向将被删除的重复行时，
     //     改指同组保留行（保留行 = 组内最小 rowid；无 FK，必须显式维护）。
-    conn.execute_batch(
-        "UPDATE memories SET source_message_id = (
-           SELECT MIN(keep.rowid) FROM messages keep
-           JOIN messages dup ON dup.session_id = keep.session_id
-               AND dup.line_no = keep.line_no AND dup.ord = keep.ord
-           WHERE keep.rowid = (SELECT MIN(k2.rowid) FROM messages k2
-                               WHERE k2.session_id = dup.session_id
-                                 AND k2.line_no = dup.line_no AND k2.ord = dup.ord)
-             AND dup.rowid = memories.source_message_id
-         ) WHERE source_message_id IS NOT NULL
-           AND source_message_id IN (
-             SELECT rowid FROM messages WHERE rowid NOT IN (
-               SELECT MIN(rowid) FROM messages GROUP BY session_id, line_no, ord))",
-    )?;
-    // (b) 删重复（保留每组最小 rowid；FTS 由 ad 触发器联动）
-    conn.execute_batch(
-        "DELETE FROM messages WHERE rowid NOT IN (
-           SELECT MIN(rowid) FROM messages GROUP BY session_id, line_no, ord)",
-    )?;
-    // (c) 会话计数重算为真相
-    conn.execute_batch(
-        "UPDATE sessions SET message_count =
-           (SELECT COUNT(*) FROM messages WHERE messages.session_id = sessions.id)",
-    )?;
-    if let Err(e) = conn.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_slo ON messages(session_id, line_no, ord)",
-    ) {
-        let msg = e.to_string();
-        if !msg.contains("already exists") {
-            return Err(e.into());
+    if version < 5 {
+        conn.execute_batch(
+            "UPDATE memories SET source_message_id = (
+               SELECT MIN(keep.rowid) FROM messages keep
+               JOIN messages dup ON dup.session_id = keep.session_id
+                   AND dup.line_no = keep.line_no AND dup.ord = keep.ord
+               WHERE keep.rowid = (SELECT MIN(k2.rowid) FROM messages k2
+                                   WHERE k2.session_id = dup.session_id
+                                     AND k2.line_no = dup.line_no AND k2.ord = dup.ord)
+                 AND dup.rowid = memories.source_message_id
+             ) WHERE source_message_id IS NOT NULL
+               AND source_message_id IN (
+                 SELECT rowid FROM messages WHERE rowid NOT IN (
+                   SELECT MIN(rowid) FROM messages GROUP BY session_id, line_no, ord))",
+        )?;
+        // (b) 删重复（保留每组最小 rowid；FTS 由 ad 触发器联动）
+        conn.execute_batch(
+            "DELETE FROM messages WHERE rowid NOT IN (
+               SELECT MIN(rowid) FROM messages GROUP BY session_id, line_no, ord)",
+        )?;
+        // (c) 会话计数重算为真相
+        conn.execute_batch(
+            "UPDATE sessions SET message_count =
+               (SELECT COUNT(*) FROM messages WHERE messages.session_id = sessions.id)",
+        )?;
+        if let Err(e) = conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_slo ON messages(session_id, line_no, ord)",
+        ) {
+            let msg = e.to_string();
+            if !msg.contains("already exists") {
+                return Err(e.into());
+            }
         }
     }
     // v8：source_files 主键 path → (agent, path)。同一目录可被多个 agent 登记
@@ -697,9 +699,8 @@ fn tool_result_preview(content: &str, max_bytes: usize) -> String {
     )
 }
 
-/// 裁定（DESIGN-0.3 §8）：**有意非事务**。本函数只从 ingest 的截断/替换
-/// 重导路径与 bundle prune 调用；每条语句幂等，中途崩溃留下的残余会在下一次
-/// 重导入前被再次调用清掉（自愈）。加事务没有收益，维持现状。
+/// 本身不开事务：purge 在自己的事务里调用；bundle prune 每条语句幂等，
+/// 中途崩溃的残余在下次调用时被清掉（自愈）。
 pub fn delete_session_data(conn: &Connection, session_id: &str) -> Result<()> {
     // messages 的 rowid 删除后会被新行复用：先把指向本会话消息的来源指针置
     // NULL（行号口径已变，置空比重映射诚实——5f6de93 修的正是这类错挂）；
@@ -883,12 +884,14 @@ fn hit_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<HitRow> {
     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?))
 }
 
+/// One FTS5 phrase: wrap in quotes, doubling any embedded quote.
+fn fts_phrase(t: &str) -> String {
+    format!("\"{}\"", t.replace('"', "\"\""))
+}
+
 /// Quote each whitespace-separated token and AND them together.
 fn fts_query(q: &str) -> String {
-    q.split_whitespace()
-        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" AND ")
+    q.split_whitespace().map(fts_phrase).collect::<Vec<_>>().join(" AND ")
 }
 
 // -------------------------------------------------------- 轻量索引（1.0.1）
@@ -1015,6 +1018,8 @@ fn snippet_for(content: &str, query: &str) -> String {
         None => (0, 0),
     };
     let chars: Vec<char> = content.chars().collect();
+    // 小写化可能变长（如 İ），lower 里的位置会越过原文
+    let start = start.min(chars.len());
     let end = (start + 240).min(chars.len());
     let mut s = String::new();
     if start > 0 {
@@ -1075,7 +1080,7 @@ fn list_projects_q(conn: &Connection, archived: bool) -> Result<Vec<Value>> {
 /// 路径由调用方做 ~ 展开与存在性校验；重复登记幂等返回现有 id，
 /// 重登记已归档路径 = 顺带恢复（用户明确表示要用了）。
 pub fn add_project(conn: &Connection, path: &str) -> Result<(i64, bool)> {
-    let trimmed = path.trim_end_matches('/');
+    let trimmed = path.trim_end_matches(['/', '\\']);
     let name = std::path::Path::new(trimmed)
         .file_name()
         .and_then(|s| s.to_str())
@@ -1083,8 +1088,8 @@ pub fn add_project(conn: &Connection, path: &str) -> Result<(i64, bool)> {
         .ok_or_else(|| anyhow::anyhow!("cannot derive project name from path: {path}"))?;
     if let Some((id, was_archived)) = conn
         .query_row(
-            "SELECT id, archived_at FROM projects WHERE path = ?1",
-            params![trimmed],
+            &format!("SELECT id, archived_at FROM projects WHERE {PATH_KEY_SQL} = ?1 ORDER BY id LIMIT 1"),
+            params![path_key(trimmed)],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?.is_some())),
         )
         .optional()?
@@ -1125,6 +1130,17 @@ pub fn set_project_archived(conn: &Connection, id: i64, archived: bool) -> Resul
     Ok(())
 }
 
+/// `resolve_project`，找不到即报错。
+pub fn require_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>) -> Result<(i64, String, String)> {
+    resolve_project(conn, ident, cwd)?
+        .ok_or_else(|| anyhow::anyhow!("no matching project; run `yourmem import` first"))
+}
+
+/// 只在显式给了项目时解析；未给 = 不限项目。
+pub fn optional_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>) -> Result<Option<i64>> {
+    ident.map(|p| require_project(conn, Some(p), cwd).map(|r| r.0)).transpose()
+}
+
 /// Resolve a project by exact name, else path/name substring.
 /// `None` matches a project whose path contains the given cwd, or the only project.
 pub fn resolve_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>) -> Result<Option<(i64, String, String)>> {
@@ -1142,11 +1158,17 @@ pub fn resolve_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>
         return Ok(row);
     }
     if let Some(cwd) = cwd {
+        // 与 upsert_project 同一身份键：Windows 下不同 agent 报来的路径大小写/分隔符不一
         let (root, _) = project_root_for(cwd);
+        let sep = if cfg!(windows) { "\\" } else { "/" };
         let row = conn
             .query_row(
-                "SELECT id, name, path FROM projects WHERE path = ?1 OR ?1 LIKE path||'/%' ORDER BY LENGTH(path) DESC LIMIT 1",
-                params![root],
+                &format!(
+                    "SELECT id, name, path FROM projects
+                     WHERE {PATH_KEY_SQL} = ?1 OR substr(?1, 1, length({PATH_KEY_SQL}) + 1) = {PATH_KEY_SQL} || ?2
+                     ORDER BY LENGTH(path) DESC LIMIT 1"
+                ),
+                params![path_key(&root), sep],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
@@ -1154,13 +1176,15 @@ pub fn resolve_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>
             return Ok(row);
         }
     }
-    // fall back to the single most recently active project.
+    // fall back to the single most recently active project（不含已废弃项目：
+    // 运行现场目录建即归档，却常是最近活跃的）。
     // deleted_at 过滤放 JOIN 条件而非 WHERE：回收站会话不再推高"最近活跃"，
     // 但只剩回收站会话的项目仍保留候选资格（与原语义一致，只是排到最后）
     let row = conn
         .query_row(
             "SELECT p.id, p.name, p.path FROM projects p
              LEFT JOIN sessions s ON s.project_id = p.id AND s.deleted_at IS NULL
+             WHERE p.archived_at IS NULL
              GROUP BY p.id ORDER BY MAX(s.ended_at) DESC LIMIT 1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -1805,7 +1829,7 @@ pub fn find_similar(conn: &Connection, content: &str, project_id: Option<i64>, r
     // 大时同项目同类型的真候选可能被其他项目挤掉（codex 评审 suggestion）
     let query = distinct
         .iter()
-        .map(|t| format!("\"{t}\""))
+        .map(|t| fts_phrase(t))
         .collect::<Vec<_>>()
         .join(" OR ");
     let mut stmt = conn.prepare(&format!(
@@ -1964,13 +1988,22 @@ pub fn set_memory_fts(conn: &Connection, file_id: i64, content: &str) -> Result<
 }
 
 pub fn list_memory_files(conn: &Connection) -> Result<Vec<Value>> {
+    memory_files_where(conn, None)
+}
+
+pub fn memory_file_by_id(conn: &Connection, file_id: i64) -> Result<Option<Value>> {
+    Ok(memory_files_where(conn, Some(file_id))?.pop())
+}
+
+fn memory_files_where(conn: &Connection, file_id: Option<i64>) -> Result<Vec<Value>> {
     let mut stmt = conn.prepare(
         "SELECT f.id, f.agent, f.scope, f.path, f.current_hash, f.updated_at,
                 COUNT(r.id) AS revisions, MAX(r.captured_at) AS last_captured
          FROM memory_files f LEFT JOIN memory_revisions r ON r.file_id = f.id
+         WHERE ?1 IS NULL OR f.id = ?1
          GROUP BY f.id ORDER BY f.agent, f.scope, f.path",
     )?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map(params![file_id], |r| {
         Ok(json!({
             "id": r.get::<_, i64>(0)?,
             "agent": r.get::<_, String>(1)?,
@@ -1983,11 +2016,6 @@ pub fn list_memory_files(conn: &Connection) -> Result<Vec<Value>> {
         }))
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-}
-
-pub fn memory_file_by_id(conn: &Connection, file_id: i64) -> Result<Option<Value>> {
-    let row = list_memory_files(conn)?.into_iter().find(|f| f["id"].as_i64() == Some(file_id));
-    Ok(row)
 }
 
 /// Revision timeline, newest first.
@@ -2035,11 +2063,13 @@ pub fn insert_artifacts(
     project_id: Option<i64>,
     artifacts: &[crate::models::NewArtifact],
 ) -> Result<()> {
+    // 本批没带 cwd（pi 只在头行给、codex 无 turn_context 的增量）时项目取会话行的。
     // 产物时间取所属会话的结束时间（调用方已写入本批消息的会话行）：实时采集时
     // 即最新消息时间，补导历史时是会话实际结束时间，而不是导入时刻
     let mut stmt = conn.prepare(
         "INSERT OR IGNORE INTO session_artifacts(session_id, project_id, path, tool, created_at)
-         VALUES (?1,?2,?3,?4, COALESCE((SELECT ended_at FROM sessions WHERE id = ?1), ?5))",
+         VALUES (?1, COALESCE(?2, (SELECT project_id FROM sessions WHERE id = ?1)), ?3, ?4,
+                 COALESCE((SELECT ended_at FROM sessions WHERE id = ?1), ?5))",
     )?;
     for a in artifacts {
         stmt.execute(params![session_id, project_id, a.path, a.tool, now_iso()])?;
@@ -2321,6 +2351,13 @@ pub fn lineage_tree(conn: &Connection, session_id: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snippet_survives_lowercase_expansion() {
+        // İ 小写化后变成两个字符，lower 中的位置会越过原文长度
+        let content = format!("{}abc", "İ".repeat(200));
+        assert!(snippet_for(&content, "abc").starts_with('…'));
+    }
 
     fn seed_session(conn: &Connection, id: &str) {
         conn.execute(

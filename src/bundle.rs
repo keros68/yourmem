@@ -250,25 +250,15 @@ fn prune_snapshot(snap_path: &Path, filter: &BundleFilter) -> Result<Value> {
         )?;
         conn.execute("DELETE FROM memory_files WHERE agent != ?1", params![agent])?;
     }
-    // Filtered archives must not retain deleted text in SQLite free pages or FTS segments.
+    // 被裁内容不能残留在 FTS 段与空闲页里：随后的 strip_indexes 清空全部
+    // 全文索引并以 secure_delete 整库 VACUUM，这里不必重建。
     if filter.project.is_some() {
         conn.execute("DELETE FROM usage_log", [])?;
     }
-    let full = db::tool_index_enabled(&conn)?;
-    conn.execute_batch("INSERT INTO messages_fts(messages_fts) VALUES ('delete-all');
-        INSERT INTO messages_tools_fts(messages_tools_fts) VALUES ('delete-all');
-        INSERT INTO messages_fts(rowid,content) SELECT id,content FROM messages WHERE kind <> 'tool_result';
-        INSERT INTO memories_fts(memories_fts) VALUES ('rebuild');
-        INSERT INTO memory_fts(memory_fts) VALUES ('rebuild');")?;
-    if full {
-        conn.execute("INSERT INTO messages_tools_fts(rowid,content) SELECT id,content FROM messages WHERE kind = 'tool_result'", [])?;
-    }
-    conn.execute_batch("VACUUM;")?;
     Ok(json!({ "agent": filter.agent, "project": filter.project, "sessions_pruned": pruned,
         "includes_global_memory": filter.project.is_none() }))
 }
 
-/// Hashes still referenced by a (possibly pruned) snapshot.
 pub(crate) fn strip_indexes(path: &Path) -> Result<()> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
@@ -306,6 +296,7 @@ fn rebuild_indexes(path: &Path, object_home: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Hashes still referenced by a (possibly pruned) snapshot.
 pub(crate) fn referenced_hashes(conn: &Connection) -> Result<HashSet<String>> {
     let mut keep = HashSet::new();
     for sql in ["SELECT DISTINCT hash FROM vault_lines", "SELECT DISTINCT hash FROM memory_revisions"] {
@@ -421,7 +412,7 @@ fn verify_layout(layout: &BundleLayout) -> Result<Value> {
             let data = std::fs::read(entry.path())?;
             objects += 1;
             bytes += data.len() as u64;
-            let valid = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            let valid = vault::is_hash(&hash);
             if valid && entry.path() == objects_dir.join(&hash[..2]).join(&hash) {
                 present.insert(hash.clone());
             } else {
@@ -495,12 +486,12 @@ pub fn restore(bundle: &Path, target_home: &Path, merge: bool) -> Result<Value> 
         .root
         .join("db")
         .join(layout.manifest["db_snapshot"].as_str().unwrap());
-    if layout.manifest["indexes_omitted"] == true {
+    let indexes_omitted = layout.manifest["indexes_omitted"] == true;
+    if indexes_omitted {
         anyhow::ensure!(
             layout.manifest["format_version"] == 2,
             "索引省略标记需要备份格式 v2"
         );
-        rebuild_indexes(&src_db_path, &layout.root)?;
     }
     std::fs::create_dir_all(target_home)?;
     let _lock =
@@ -513,6 +504,10 @@ pub fn restore(bundle: &Path, target_home: &Path, merge: bool) -> Result<Value> 
             "{} 已存在——恢复到全新目录，或加 --merge 合并",
             target_db.display()
         );
+        // 合并只读 bundle 的数据表、索引在目标库里维护；全新恢复才需要补建
+        if indexes_omitted {
+            rebuild_indexes(&src_db_path, &layout.root)?;
+        }
         std::fs::create_dir_all(target_home.join("objects"))?;
         let copied = copy_objects(&layout.root, target_home)
             .context("对象恢复失败，数据库尚未写入；排除磁盘或权限问题后可重试")?;
@@ -573,49 +568,27 @@ fn copy_objects(bundle_root: &Path, target_home: &Path) -> Result<u64> {
     Ok(copied)
 }
 
-/// Merge a bundle's DB snapshot into an existing library (ATTACH + upserts).
-///
-/// 规则：
-/// - projects 按 path 合并（记录 id 重映射，所有带 project_id 的表一律走它）；
-/// - session 已存在且 bundle 侧不更新：整体跳过；bundle 更新（消息更多）：
-///   该会话整体替换（消息重插拿新 rowid，FTS 由触发器维护）；
-/// - 小表按主键/唯一约束 INSERT OR IGNORE；source_files offset 取 max；
-/// - memory_revisions 无唯一约束，按 (file_id, hash) 查重后插入（file_id 重映射）。
 /// 给缺 memory_fts 行的原生 memory 文件按最新修订回填索引（内容在 vault 对象里）。
 /// `force` 里的文件即使已有 fts 行也强制重建（merge 更新过 current_hash，旧行是
 /// 旧内容）。对象缺失/非 UTF-8 跳过——与 memfiles collect 的"留到下一轮"口径
 /// 一致；返回实际（重）建了索引的条数。
 fn backfill_memory_fts(conn: &Connection, home: &Path, force: &[i64]) -> Result<u64> {
-    let mut targets: Vec<(i64, Option<String>)> = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT f.id, COALESCE(f.current_hash, (SELECT r.hash FROM memory_revisions r
-                           WHERE r.file_id = f.id ORDER BY r.id DESC LIMIT 1))
-             FROM memory_files f
+    // 索引以文件的当前修订为准：合并补进来的历史修订行 id 更大，但不是当前内容
+    let mut targets: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT id, current_hash FROM memory_files f
              WHERE NOT EXISTS (SELECT 1 FROM memory_fts WHERE rowid = f.id)",
-        )?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        targets.extend(rows);
-    }
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     for &fid in force {
         let hash: Option<String> = conn
-            .query_row(
-                // 索引以文件的当前修订为准：合并补进来的历史修订行 id 更大，但不是当前内容
-                "SELECT COALESCE(f.current_hash, (SELECT r.hash FROM memory_revisions r
-                     WHERE r.file_id = f.id ORDER BY r.id DESC LIMIT 1))
-                 FROM memory_files f WHERE f.id = ?1",
-                params![fid],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        targets.push((fid, hash));
+            .query_row("SELECT current_hash FROM memory_files WHERE id = ?1", params![fid], |r| r.get(0))
+            .optional()?;
+        targets.extend(hash.map(|h| (fid, h)));
     }
     let mut done = 0u64;
     for (fid, hash) in targets {
-        let Some(hash) = hash else { continue };
         match vault::read_object(home, &hash, false) {
             Ok(bytes) => match std::str::from_utf8(&bytes) {
                 Ok(text) => {
@@ -630,6 +603,21 @@ fn backfill_memory_fts(conn: &Connection, home: &Path, force: &[i64]) -> Result<
     Ok(done)
 }
 
+/// bundle 库某表的列名；旧版本 bundle 可能缺列或缺整张表（空列表）。
+fn src_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut st = conn.prepare(&format!("PRAGMA src.table_info({table})"))?;
+    let cols = st.query_map([], |r| r.get::<_, String>(1))?;
+    Ok(cols.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// Merge a bundle's DB snapshot into an existing library (ATTACH + upserts).
+///
+/// 规则：
+/// - projects 按 path 合并（记录 id 重映射，所有带 project_id 的表一律走它）；
+/// - session 已存在且 bundle 侧不更新：整体跳过；bundle 更新（消息更多）：
+///   该会话整体替换（消息重插拿新 rowid，FTS 由触发器维护）；
+/// - 小表按主键/唯一约束 INSERT OR IGNORE；source_files offset 取 max；
+/// - memory_revisions 无唯一约束，按 (file_id, hash) 查重后插入（file_id 重映射）。
 fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
     target.execute("ATTACH DATABASE ?1 AS src", params![src_db.to_string_lossy().as_ref()])?;
     let r = (|| -> Result<Value> {
@@ -640,19 +628,15 @@ fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
         {
             // archived_at 是 schema v11 的列；更早的 bundle 没有它，按 NULL（活跃）并入。
             // src 有值时并入目标且 MAX 取新：任何一侧已归档都保持归档——merge 不复活。
-            let arch_col = {
-                let mut st = tx.prepare("PRAGMA src.table_info(projects)")?;
-                let cols = st.query_map([], |r| r.get::<_, String>(1))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                if cols.iter().any(|c| c == "archived_at") { "archived_at" } else { "NULL" }
-            };
+            let arch_col =
+                if src_columns(&tx, "projects")?.iter().any(|c| c == "archived_at") { "archived_at" } else { "NULL" };
             let mut stmt = tx.prepare(&format!(
-                "SELECT id, path, name, created_at, updated_at, {arch_col} FROM src.projects"
+                "SELECT id, path, name, {arch_col} FROM src.projects"
             ))?;
-            let rows: Vec<(i64, String, String, String, String, Option<String>)> = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+            let rows: Vec<(i64, String, String, Option<String>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            for (old_id, path, name, created, _updated, archived_at) in rows {
+            for (old_id, path, name, archived_at) in rows {
                 let new_id = db::upsert_project(&tx, &path, &name)?;
                 if let Some(ts) = archived_at {
                     tx.execute(
@@ -660,7 +644,6 @@ fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
                         params![ts, new_id],
                     )?;
                 }
-                let _ = created;
                 project_map.insert(old_id, new_id);
             }
         }
@@ -678,9 +661,7 @@ fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
             // deleted_at 是 schema v4 的列；v3 bundle 没有它，按 NULL（未删除）并入。
             // compact_line_no 是 v10 的列；更早的 bundle 没有它，按 NULL（无压缩点）并入。
             let (del_col, compact_col) = {
-                let mut st = tx.prepare("PRAGMA src.table_info(sessions)")?;
-                let cols = st.query_map([], |r| r.get::<_, String>(1))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let cols = src_columns(&tx, "sessions")?;
                 (
                     if cols.iter().any(|c| c == "deleted_at") { "deleted_at" } else { "NULL" },
                     if cols.iter().any(|c| c == "compact_line_no") { "compact_line_no" } else { "NULL" },
@@ -807,32 +788,24 @@ fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
         let mut messages_added = 0u64;
         for sid in &replaced_ids {
             let mut stmt = tx.prepare(
-                "SELECT line_no, ord, kind, content, timestamp, uuid FROM src.messages
+                "SELECT line_no, ord, kind, content, timestamp, uuid, id FROM src.messages
                  WHERE session_id = ?1 ORDER BY line_no, ord",
             )?;
-            let msgs: Vec<(i64, i64, String, String, Option<String>, Option<String>)> = stmt
+            #[allow(clippy::type_complexity)]
+            let msgs: Vec<(i64, i64, String, String, Option<String>, Option<String>, i64)> = stmt
                 .query_map(params![sid], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             // 消息 rowid 重插后会变——记录旧→新映射，memories 的
             // source_message_id 必须跟着重映射（终审 blocker）
-            for (line_no, ord, kind, content, timestamp, uuid) in &msgs {
-                let old_id: Option<i64> = tx
-                    .query_row(
-                        "SELECT id FROM src.messages WHERE session_id = ?1 AND line_no = ?2 AND ord = ?3",
-                        params![sid, line_no, ord],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
+            for (line_no, ord, kind, content, timestamp, uuid, old_id) in &msgs {
                 tx.execute(
                     "INSERT INTO messages(session_id, line_no, ord, kind, content, timestamp, uuid)
                      VALUES (?1,?2,?3,?4,?5,?6,?7)",
                     params![sid, line_no, ord, kind, content, timestamp, uuid],
                 )?;
-                if let Some(oid) = old_id {
-                    msg_id_map.insert(oid, tx.last_insert_rowid());
-                }
+                msg_id_map.insert(*old_id, tx.last_insert_rowid());
             }
             messages_added += msgs.len() as u64;
             tx.execute(
@@ -900,10 +873,7 @@ fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
         // purged_sources 墓碑随迁（v6）：合并不带墓碑的话，目标库 import 会把
         // 已清除的会话复活（codex 八审）。v3-v5 旧 bundle 没这张表——探测后跳过。
         {
-            let mut st = tx.prepare("PRAGMA src.table_info(purged_sources)")?;
-            let has: Vec<String> = st.query_map([], |r| r.get::<_, String>(1))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            if !has.is_empty() {
+            if !src_columns(&tx, "purged_sources")?.is_empty() {
                 tx.execute(
                     "INSERT OR IGNORE INTO purged_sources(path, session_id, purged_at)
                      SELECT path, session_id, purged_at FROM src.purged_sources",
@@ -916,41 +886,24 @@ fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
         // 合并来的 codex 文件游标已就位而标志为 0，后续纯 event_msg 增量会双录
         // （codex 评审 blocker）。v6 及更早的 bundle 没这列——探测后按 0 并入。
         // （INSERT...SELECT...ON CONFLICT 的 SELECT 必须带 WHERE，否则 SQLite 报语法错）
-        let has_saw = {
-            let cols: Vec<String> = {
-                let mut st = tx.prepare("PRAGMA src.table_info(source_files)")?;
-                let rows = st.query_map([], |r| r.get::<_, String>(1))?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            cols.iter().any(|c| c == "saw_response_item")
-        };
-        if has_saw {
-            tx.execute(
+        // saw_response_item 是 v6 的列；更早的 bundle 按 0（未见过）并入，MAX 保留目标值
+        let saw_col =
+            if src_columns(&tx, "source_files")?.iter().any(|c| c == "saw_response_item") { "saw_response_item" } else { "0" };
+        tx.execute(
+            &format!(
                 "INSERT INTO source_files(path, agent, imported_bytes, line_count, cursor_text,
                                           saw_response_item, updated_at)
-                 SELECT path, agent, imported_bytes, line_count, cursor_text, saw_response_item, updated_at
+                 SELECT path, agent, imported_bytes, line_count, cursor_text, {saw_col}, updated_at
                  FROM src.source_files WHERE 1=1
                  ON CONFLICT(agent, path) DO UPDATE SET
                    imported_bytes = MAX(source_files.imported_bytes, excluded.imported_bytes),
                    line_count = MAX(source_files.line_count, excluded.line_count),
                    cursor_text = COALESCE(excluded.cursor_text, source_files.cursor_text),
                    saw_response_item = MAX(source_files.saw_response_item, excluded.saw_response_item),
-                   updated_at = MAX(source_files.updated_at, excluded.updated_at)",
-                [],
-            )?;
-        } else {
-            tx.execute(
-                "INSERT INTO source_files(path, agent, imported_bytes, line_count, cursor_text, updated_at)
-                 SELECT path, agent, imported_bytes, line_count, cursor_text, updated_at FROM src.source_files
-                 WHERE 1=1
-                 ON CONFLICT(agent, path) DO UPDATE SET
-                   imported_bytes = MAX(source_files.imported_bytes, excluded.imported_bytes),
-                   line_count = MAX(source_files.line_count, excluded.line_count),
-                   cursor_text = COALESCE(excluded.cursor_text, source_files.cursor_text),
-                   updated_at = MAX(source_files.updated_at, excluded.updated_at)",
-                [],
-            )?;
-        }
+                   updated_at = MAX(source_files.updated_at, excluded.updated_at)"
+            ),
+            [],
+        )?;
         // handoffs: project_id 重映射后追加（id 新分配）。同一 bundle 重复 --merge
         // 是常见误操作，按 (project_id, session_id, title, created_at) 查重跳过——
         // latest_handoff 按 id DESC 取，重复行会翻倍进卷宗

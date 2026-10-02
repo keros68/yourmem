@@ -131,16 +131,14 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
         "list_projects" => Ok(json!({ "projects": db::list_projects(&conn)? })),
 
         "get_project_context" => {
-            let (pid, ..) = db::resolve_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?
-                .ok_or_else(|| anyhow::anyhow!("no matching project; run `yourmem import` first"))?;
+            let (pid, ..) = db::require_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?;
             let mut context = db::project_context(&conn, pid)?;
             context["source_review"] = crate::project_review::status(&conn, home, pid)?;
             Ok(context)
         }
 
         "get_dossier" => {
-            let (pid, ..) = db::resolve_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?
-                .ok_or_else(|| anyhow::anyhow!("no matching project; run `yourmem import` first"))?;
+            let (pid, ..) = db::require_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?;
             crate::dossier::project_dossier(&conn, pid)
         }
 
@@ -174,8 +172,7 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
         }
 
         "create_handoff" => {
-            let (pid, ..) = db::resolve_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?
-                .ok_or_else(|| anyhow::anyhow!("no matching project; run `yourmem import` first"))?;
+            let (pid, ..) = db::require_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?;
             let session_id = arg_str("session_id");
             let fields = HandoffFields {
                 title: &arg_str("title").unwrap_or_default(),
@@ -201,14 +198,7 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
         }
 
         "get_recent_work" => {
-            let pid = match arg_str("project") {
-                Some(p) => Some(
-                    db::resolve_project(&conn, Some(&p), cwd.as_deref())?
-                        .ok_or_else(|| anyhow::anyhow!("no matching project"))?
-                        .0,
-                ),
-                None => None,
-            };
+            let pid = db::optional_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?;
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as u32;
             let sessions = db::recent_sessions(&conn, pid, limit)?;
             let handoff = match pid {
@@ -227,11 +217,7 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
             let pid = if scope == "global" {
                 None
             } else {
-                Some(
-                    db::resolve_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?
-                        .ok_or_else(|| anyhow::anyhow!("no matching project"))?
-                        .0,
-                )
+                Some(db::require_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?.0)
             };
             let source_session = arg_str("session_id");
             // 写路径纪律（engramory 吸收）：查重提示随结果返回，agent 据 此
@@ -258,7 +244,7 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
         "search_memory" => {
             let query = arg_str("query")
                 .ok_or_else(|| anyhow::anyhow!("missing required argument: query"))?;
-            let pid = resolve_optional_project(&conn, &arg_str("project"), cwd.as_deref())?;
+            let pid = db::optional_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?;
             let mems = db::search_memory(&conn, &query, &db::MemoryFilter {
                 project_id: pid,
                 scope: arg_str("scope"),
@@ -272,7 +258,7 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
         }
 
         "list_memories" => {
-            let pid = resolve_optional_project(&conn, &arg_str("project"), cwd.as_deref())?;
+            let pid = db::optional_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?;
             let mems = db::list_memories(&conn, &db::MemoryFilter {
                 project_id: pid,
                 scope: arg_str("scope"),
@@ -296,7 +282,7 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
         }
 
         "list_artifacts" => {
-            let pid = resolve_optional_project(&conn, &arg_str("project"), cwd.as_deref())?;
+            let pid = db::optional_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?;
             let session = arg_str("session_id");
             let arts = db::list_artifacts(
                 &conn,
@@ -308,21 +294,6 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
         }
 
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
-    }
-}
-
-fn resolve_optional_project(
-    conn: &rusqlite::Connection,
-    ident: &Option<String>,
-    cwd: Option<&str>,
-) -> anyhow::Result<Option<i64>> {
-    match ident {
-        Some(p) => Ok(Some(
-            db::resolve_project(conn, Some(p), cwd)?
-                .ok_or_else(|| anyhow::anyhow!("no matching project"))?
-                .0,
-        )),
-        None => Ok(None),
     }
 }
 

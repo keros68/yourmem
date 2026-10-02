@@ -475,38 +475,26 @@ fn run_import(
     opencode_db: Option<PathBuf>,
     hermes_db: Option<PathBuf>,
 ) -> Result<ingest::ImportOutcome> {
-    // 根解析优先级：CLI 旗标 > YOUMEM_*_DIR 环境变量 > 默认（与 watch/MCP
-    // 的 import_defaults 同一套环境变量——此前 CLI import 只认旗标，环境变量
-    // 在 CLI/后台两条路径行为不一致，测试冒烟三次踩坑）
-    let pick = |flag: Option<PathBuf>, var: &str, d: fn() -> PathBuf| {
-        flag.or_else(|| std::env::var_os(var).map(PathBuf::from)).unwrap_or_else(d)
-    };
-    let roots = vec![
-        (adapters::AGENT_CLAUDE, pick(claude_dir, "YOUMEM_CLAUDE_DIR", yourmem::default_claude_root)),
-        (adapters::AGENT_CODEX, pick(codex_dir, "YOUMEM_CODEX_DIR", yourmem::default_codex_root)),
-        (adapters::AGENT_ZCODE, pick(zcode_dir, "YOUMEM_ZCODE_DIR", yourmem::default_zcode_root)),
-        (adapters::AGENT_KIMI, pick(kimi_dir, "YOUMEM_KIMI_DIR", yourmem::default_kimi_root)),
-        (adapters::AGENT_PI, pick(pi_dir, "YOUMEM_PI_DIR", yourmem::default_pi_root)),
-    ];
-    let oc_explicit = opencode_db
-        .or_else(|| std::env::var_os("YOUMEM_OPENCODE_DB").map(PathBuf::from));
-    // 显式指定的库不存在必须报错：默认路径缺失=未装 opencode 是正常态；但
-    // 旗标/环境变量指向的文件多半是手误，静默跳过会让人以为采到了
-    if let Some(p) = &oc_explicit {
-        anyhow::ensure!(p.is_file(), "显式指定的 OpenCode 库不存在: {}", p.display());
+    // 显式指定的库不存在必须报错：默认路径缺失=未装是正常态；但旗标/环境变量
+    // 指向的文件多半是手误，静默跳过会让人以为采到了
+    for (flag, var, name) in [(&opencode_db, "YOUMEM_OPENCODE_DB", "OpenCode"), (&hermes_db, "YOUMEM_HERMES_DB", "Hermes")] {
+        if let Some(p) = flag.clone().or_else(|| std::env::var_os(var).map(PathBuf::from)) {
+            anyhow::ensure!(p.is_file(), "显式指定的 {name} 库不存在: {}", p.display());
+        }
     }
-    let oc_db = oc_explicit.unwrap_or_else(adapters::opencode::default_db_path);
-    let hm_explicit = hermes_db.or_else(|| std::env::var_os("YOUMEM_HERMES_DB").map(PathBuf::from));
-    if let Some(p) = &hm_explicit {
-        anyhow::ensure!(p.is_file(), "显式指定的 Hermes 库不存在: {}", p.display());
-    }
-    let hm_db = hm_explicit.unwrap_or_else(adapters::hermes::default_db_path);
-    let mut roots: Vec<(String, PathBuf)> = roots.into_iter().map(|(a, p)| (a.to_string(), p)).collect();
-    // extra_roots 合并 + 停用过滤（与 import_defaults 同语义；此前 CLI 漏掉，
-    // agents add 登记的自定义根只有桌面 app/MCP 能采到）
-    yourmem::ingest::apply_extra_roots_and_gates(home, &mut roots);
-    let refs: Vec<(&str, PathBuf)> = roots.iter().map(|(a, p)| (a.as_str(), p.clone())).collect();
-    ingest::import_with(home, &refs, oc_db.is_file().then_some(oc_db.as_path()), hm_db.is_file().then_some(hm_db.as_path()))
+    let overrides: Vec<(&str, PathBuf)> = [
+        (adapters::AGENT_CLAUDE, claude_dir),
+        (adapters::AGENT_CODEX, codex_dir),
+        (adapters::AGENT_ZCODE, zcode_dir),
+        (adapters::AGENT_KIMI, kimi_dir),
+        (adapters::AGENT_PI, pi_dir),
+        (adapters::opencode::AGENT_OPENCODE, opencode_db),
+        (adapters::hermes::AGENT_HERMES, hermes_db),
+    ]
+    .into_iter()
+    .filter_map(|(a, p)| Some((a, p?)))
+    .collect();
+    ingest::import_overriding(home, &overrides)
 }
 
 fn main() -> Result<()> {
@@ -634,8 +622,7 @@ fn main() -> Result<()> {
         Cmd::Context { project, markdown } => {
             let conn = db::open(&home)?;
             let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
-            let (pid, ..) = db::resolve_project(&conn, project.as_deref(), cwd.as_deref())?
-                .ok_or_else(|| anyhow::anyhow!("no matching project; run `yourmem import` first"))?;
+            let (pid, ..) = db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
             let mut d = db::project_context(&conn, pid)?;
             d["source_review"] = yourmem::project_review::status(&conn, &home, pid)?;
             if markdown {
@@ -648,8 +635,7 @@ fn main() -> Result<()> {
         Cmd::Dossier { project, markdown, out } => {
             let conn = db::open(&home)?;
             let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
-            let (pid, ..) = db::resolve_project(&conn, project.as_deref(), cwd.as_deref())?
-                .ok_or_else(|| anyhow::anyhow!("no matching project; run `yourmem import` first"))?;
+            let (pid, ..) = db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
             let d = yourmem::dossier::project_dossier(&conn, pid)?;
             if markdown || out.is_some() {
                 let md = yourmem::dossier::render_markdown(&d);
@@ -744,11 +730,7 @@ fn main() -> Result<()> {
                     let pid = if scope == "global" {
                         None
                     } else {
-                        Some(
-                            db::resolve_project(&conn, project.as_deref(), cwd.as_deref())?
-                                .ok_or_else(|| anyhow::anyhow!("no matching project"))?
-                                .0,
-                        )
+                        Some(db::require_project(&conn, project.as_deref(), cwd.as_deref())?.0)
                     };
                     // 写路径纪律（engramory 吸收）：查重在 save 之前——知情门控，不拦截
                     let (id, similar) = db::save_memory_with_similar(&conn, &db::MemoryInput {
@@ -775,22 +757,14 @@ fn main() -> Result<()> {
                     print_json(&json!({ "memory_id": id, "similar_count": similar.len() }));
                 }
                 MemoryCmd::List { project, scope, r#type, status, agent, limit } => {
-                    let pid = match &project {
-                        Some(p) => Some(db::resolve_project(&conn, Some(p), cwd.as_deref())?
-                            .ok_or_else(|| anyhow::anyhow!("no matching project"))?.0),
-                        None => None,
-                    };
+                    let pid = db::optional_project(&conn, project.as_deref(), cwd.as_deref())?;
                     let mems = db::list_memories(&conn, &db::MemoryFilter {
                         project_id: pid, scope, r#type, status, agent, include_global: pid.is_some(), limit,
                     })?;
                     print_json(&json!({ "memories": mems }));
                 }
                 MemoryCmd::Search { query, project, r#type, status, agent, limit } => {
-                    let pid = match &project {
-                        Some(p) => Some(db::resolve_project(&conn, Some(p), cwd.as_deref())?
-                            .ok_or_else(|| anyhow::anyhow!("no matching project"))?.0),
-                        None => None,
-                    };
+                    let pid = db::optional_project(&conn, project.as_deref(), cwd.as_deref())?;
                     let mems = db::search_memory(&conn, &query, &db::MemoryFilter {
                         project_id: pid, scope: None, r#type, status, agent, include_global: pid.is_some(), limit,
                     })?;
@@ -833,11 +807,7 @@ fn main() -> Result<()> {
         Cmd::Artifacts { project, session, limit } => {
             let conn = db::open(&home)?;
             let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
-            let pid = match &project {
-                Some(p) => Some(db::resolve_project(&conn, Some(p), cwd.as_deref())?
-                    .ok_or_else(|| anyhow::anyhow!("no matching project"))?.0),
-                None => None,
-            };
+            let pid = db::optional_project(&conn, project.as_deref(), cwd.as_deref())?;
             print_json(&json!({ "artifacts": db::list_artifacts(&conn, pid, session.as_deref(), limit)? }));
         }
 
@@ -846,8 +816,7 @@ fn main() -> Result<()> {
             let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
             match cmd {
                 HandoffCmd::Create { project, title, done, state, decisions, files, issues, next, session } => {
-                    let (pid, name, _) = db::resolve_project(&conn, project.as_deref(), cwd.as_deref())?
-                        .ok_or_else(|| anyhow::anyhow!("no matching project"))?;
+                    let (pid, name, _) = db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
                     let fields = db::HandoffFields {
                         title: &title, done: &done, state: &state, decisions: &decisions,
                         files_changed: &files, open_issues: &issues, next_steps: &next,
@@ -857,8 +826,7 @@ fn main() -> Result<()> {
                     print_json(&json!({ "handoff_id": id, "project": name }));
                 }
                 HandoffCmd::Show { project } => {
-                    let (pid, ..) = db::resolve_project(&conn, project.as_deref(), cwd.as_deref())?
-                        .ok_or_else(|| anyhow::anyhow!("no matching project"))?;
+                    let (pid, ..) = db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
                     print_json(&json!({ "latest_handoff": db::latest_handoff(&conn, pid)? }));
                 }
             }
@@ -971,8 +939,7 @@ fn main() -> Result<()> {
 
         Cmd::Teardown { delete_data, delete_backups, yes } => {
             let targets = yourmem::setup::Targets::default();
-            let agents = ["claude", "codex", "zcode", "kimi", "gemini", "cursor", "hermes"]
-                .map(str::to_string);
+            let agents = yourmem::setup::SETUP_AGENTS.map(str::to_string);
             let disconnect = yourmem::setup::remove_plan_selected(&targets, &agents)?;
             let cleanup = delete_data.then(|| yourmem::cleanup::plan(&home, delete_backups)).transpose()?;
             print_json(&json!({"disconnect":disconnect,"cleanup":cleanup}));
@@ -1018,18 +985,15 @@ fn main() -> Result<()> {
             }
             IndexCmd::EnableTools => {
                 let conn = db::open(&home)?;
-                let _ = db::log_usage(&conn, "cli", "index enable-tools");
                 print_json(&db::set_tool_index(&home, &conn, true)?);
             }
             IndexCmd::DisableTools => {
                 let conn = db::open(&home)?;
-                let _ = db::log_usage(&conn, "cli", "index disable-tools");
                 print_json(&db::set_tool_index(&home, &conn, false)?);
             }
             IndexCmd::Compact => {
                 let conn = db::open(&home)?;
                 let before = db::index_status(&conn)?;
-                let _ = db::log_usage(&conn, "cli", "index compact");
                 conn.execute_batch("VACUUM")?;
                 vault::Store::open(&home)?.compact()?;
                 let mut after = db::index_status(&conn)?;

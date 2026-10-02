@@ -26,7 +26,6 @@ use crate::vault;
 
 pub const AGENT_HERMES: &str = "hermes";
 
-const MAX_CONTENT: usize = 200_000;
 
 /// hermes 压缩摘要行的内容特征前缀（按其自述摘要形态内置；
 /// 真机尚无样本，首例触发后校准）。
@@ -169,7 +168,7 @@ fn import_session(
     let mut compact_line: Option<i64> = None;
     let mut units: Vec<(u64, Vec<u8>)> = Vec::new();
 
-    for (id, role, content, _tool_call_id, tool_name, ts, tool_calls, active, compacted) in &rows {
+    for (id, role, content, tool_call_id, tool_name, ts, tool_calls, active, compacted) in &rows {
         let line_no = *id as u64;
         let iso = secs_to_iso(*ts);
         parse_message(role, content.as_deref(), tool_name.as_deref(), tool_calls.as_deref(), line_no, &iso, &mut messages, &mut artifacts);
@@ -182,7 +181,7 @@ fn import_session(
         // Vault unit：整行关键字段 JSON 保真（含 active/compacted 软归档标志）
         let unit = serde_json::json!({
             "id": id, "session_id": sess.id, "role": role, "content": content,
-            "tool_name": tool_name, "timestamp": ts, "tool_calls": tool_calls,
+            "tool_call_id": tool_call_id, "tool_name": tool_name, "timestamp": ts, "tool_calls": tool_calls,
             "active": active, "compacted": compacted,
         });
         units.push((line_no, serde_json::to_vec(&unit)?));
@@ -197,13 +196,14 @@ fn import_session(
         compact_leaf_uuid: None,
     };
 
+    // 对象先于引用它的清单行落盘（对象库独立提交），一次打开整批写入
+    let hashes = vault::Store::open(home)?.put_many(units.iter().map(|(_, raw)| raw.as_slice()))?;
     let tx = conn.transaction()?;
     db::upsert_session(&tx, &session_key, AGENT_HERMES, &sess.id, project_id, &src_key, &meta, messages.len() as u64)?;
     db::insert_messages(&tx, &session_key, &messages)?;
     db::insert_artifacts(&tx, &session_key, project_id, &artifacts)?;
 
-    for (n, raw) in &units {
-        let hash = vault::store_line(home, raw)?;
+    for ((n, _), hash) in units.iter().zip(&hashes) {
         tx.execute(
             "INSERT OR REPLACE INTO vault_lines(session_id, line_no, hash) VALUES (?1,?2,?3)",
             params![session_key, *n as i64, hash],
@@ -277,7 +277,7 @@ fn parse_message(
                                 })
                                 .unwrap_or_default();
                             push(out, line_no, MessageKind::ToolCall, format!("[{name}] {args}"), ts.clone());
-                            if matches!(name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
+                            if super::FILE_TOOLS.contains(&name) {
                                 if let Some(fp) = args_obj
                                     .as_ref()
                                     .and_then(|a| a.get("file_path"))
@@ -310,21 +310,9 @@ fn parse_message(
 }
 
 fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, content: String, ts: Option<String>) {
-    let content = if content.chars().count() > MAX_CONTENT {
-        let t: String = content.chars().take(MAX_CONTENT).collect();
-        format!("{t}…[truncated]")
-    } else {
-        content
-    };
-    if content.trim().is_empty() {
-        return;
-    }
-    let ord = out.iter().filter(|m| m.line_no == line_no).count() as u32;
-    out.push(NewMessage { line_no, ord, kind, content, timestamp: ts, uuid: None });
+    super::push_message(out, line_no, kind, content, ts, None);
 }
 
 fn secs_to_iso(secs: Option<f64>) -> Option<String> {
-    let ms = (secs? * 1000.0) as i64;
-    chrono::DateTime::from_timestamp_millis(ms)
-        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    super::ms_to_iso((secs? * 1000.0) as i64)
 }

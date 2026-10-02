@@ -100,16 +100,25 @@ fn push_extra_root(roots: &mut Vec<(String, PathBuf)>, agent: String, path: Path
 }
 
 pub fn import_defaults(home: &Path) -> Result<ImportOutcome> {
-    let pick = |var: &str, d: PathBuf| std::env::var_os(var).map(PathBuf::from).unwrap_or(d);
+    import_overriding(home, &[])
+}
+
+/// 根解析优先级：`overrides`（CLI 旗标）> YOUMEM_* 环境变量 > 默认。停用的 agent
+/// 一律跳过（覆盖同样被拦——停用是明确的"不要这个源"，与目录在哪无关）。
+pub fn import_overriding(home: &Path, overrides: &[(&str, PathBuf)]) -> Result<ImportOutcome> {
     let off = disabled_agents(home);
-    let off_root = |agent: &str, var: &str, d: PathBuf| -> Option<PathBuf> {
-        // 停用的 agent 不再作为采集源（YOUMEM_*_DIR 覆盖同样被拦——停用是
-        // 明确的"不要这个源"，与目录在哪无关）。已卸载的源默认根本来就不存在，
-        // 双重保险。
+    let pick = |agent: &str, var: &str, d: PathBuf| -> Option<PathBuf> {
         if off.iter().any(|a| a == agent) {
             return None;
         }
-        Some(pick(var, d))
+        Some(
+            overrides
+                .iter()
+                .find(|(a, _)| *a == agent)
+                .map(|(_, p)| p.clone())
+                .or_else(|| std::env::var_os(var).map(PathBuf::from))
+                .unwrap_or(d),
+        )
     };
     let mut roots: Vec<(String, PathBuf)> = [
         (adapters::AGENT_CLAUDE, "YOUMEM_CLAUDE_DIR", crate::default_claude_root()),
@@ -119,14 +128,12 @@ pub fn import_defaults(home: &Path) -> Result<ImportOutcome> {
         (adapters::AGENT_PI, "YOUMEM_PI_DIR", crate::default_pi_root()),
     ]
     .into_iter()
-    .filter_map(|(a, v, d)| off_root(a, v, d).map(|p| (a.to_string(), p)))
+    .filter_map(|(a, v, d)| pick(a, v, d).map(|p| (a.to_string(), p)))
     .collect();
     apply_extra_roots_and_gates(home, &mut roots);
     let refs: Vec<(&str, PathBuf)> = roots.iter().map(|(a, p)| (a.as_str(), p.clone())).collect();
-    let oc = pick("YOUMEM_OPENCODE_DB", adapters::opencode::default_db_path());
-    let oc = if off.iter().any(|a| a == adapters::opencode::AGENT_OPENCODE) { None } else { Some(oc) };
-    let hm = pick("YOUMEM_HERMES_DB", adapters::hermes::default_db_path());
-    let hm = if off.iter().any(|a| a == adapters::hermes::AGENT_HERMES) { None } else { Some(hm) };
+    let oc = pick(adapters::opencode::AGENT_OPENCODE, "YOUMEM_OPENCODE_DB", adapters::opencode::default_db_path());
+    let hm = pick(adapters::hermes::AGENT_HERMES, "YOUMEM_HERMES_DB", adapters::hermes::default_db_path());
     import_with(home, &refs, oc.as_deref(), hm.as_deref())
 }
 
@@ -625,16 +632,12 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
     }
     db::insert_artifacts(&tx, &session_id, project_id, &artifacts)?;
     db::insert_uuid_sightings(&tx, &session_id, &uuids)?;
-    // kimi 旧 artifact 的空项目归属无条件修复（codex 三审）：早前无 state.json
-    // 时入账的 artifact project_id 为 NULL，本块新 artifact 有归属而旧的可能
-    // 没有；回填分支的 cwd IS NULL 门槛过后就再无人修它。与会话同事务。
-    if agent == adapters::AGENT_KIMI {
-        if let Some(pid) = project_id {
-            tx.execute(
-                "UPDATE session_artifacts SET project_id = ?1 WHERE session_id = ?2 AND project_id IS NULL",
-                rusqlite::params![pid, session_id],
-            )?;
-        }
+    // 早先入账时尚无项目归属的 artifact（如 kimi 缺 state.json 时）随会话补上。
+    if let Some(pid) = project_id {
+        tx.execute(
+            "UPDATE session_artifacts SET project_id = ?1 WHERE session_id = ?2 AND project_id IS NULL",
+            rusqlite::params![pid, session_id],
+        )?;
     }
 
     // 对象先于引用它的清单行落盘：对象库独立提交（完全同步），崩溃最多留下无引用对象
@@ -701,11 +704,7 @@ pub fn outcome_json(o: &ImportOutcome) -> Value {
     })
 }
 
-/// 错误链里是否为文件读取被占用/被拒（Windows 文件占用锁的信号；真机实测
-/// 2026-09-03：独占写打开的文件报 os error 32/33（ERROR_SHARING_VIOLATION /
-/// ERROR_LOCK_VIOLATION），不是 error 5 的 PermissionDenied——两者都要接住）。
-/// raw_os_error 数值平台相关，Windows 码值只在 Windows 分支比对；Unix 上
-/// 读文件几乎不会 PermissionDenied，行为不变。
+/// 源文件比已归档字节短：保留归档、跳过该文件（不删会话重导）。
 #[derive(Debug)]
 struct SourceShrunk;
 
@@ -717,6 +716,11 @@ impl std::fmt::Display for SourceShrunk {
 
 impl std::error::Error for SourceShrunk {}
 
+/// 错误链里是否为文件读取被占用/被拒（Windows 文件占用锁的信号；真机实测
+/// 2026-09-03：独占写打开的文件报 os error 32/33（ERROR_SHARING_VIOLATION /
+/// ERROR_LOCK_VIOLATION），不是 error 5 的 PermissionDenied——两者都要接住）。
+/// raw_os_error 数值平台相关，Windows 码值只在 Windows 分支比对；Unix 上
+/// 读文件几乎不会 PermissionDenied，行为不变。
 fn is_file_busy(e: &anyhow::Error) -> bool {
     e.chain().any(|c| match c.downcast_ref::<std::io::Error>() {
         Some(io) => {

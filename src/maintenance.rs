@@ -75,10 +75,19 @@ pub fn status(home: &Path) -> Value {
     state
 }
 
-fn save(home: &Path, state: &Value) -> Result<()> {
-    let tmp = home.join(format!("maintenance.json.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_string_pretty(state)?)?;
-    std::fs::rename(&tmp, state_path(home))?;
+/// Serialises read-modify-write of `maintenance.json` between the background
+/// worker and on-demand commands in the same process.
+static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Re-read the state, apply `f` and write it back, so one writer never
+/// overwrites fields another one changed meanwhile.
+fn update(home: &Path, f: impl FnOnce(&mut Value)) -> Result<()> {
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = load(home);
+    f(&mut state);
+    let mut tmp = tempfile::NamedTempFile::new_in(home)?;
+    serde_json::to_writer_pretty(tmp.as_file_mut(), &state)?;
+    tmp.persist(state_path(home)).map_err(|e| e.error)?;
     Ok(())
 }
 
@@ -93,41 +102,35 @@ fn snapshot_interval_days(home: &Path) -> u64 {
 /// Object temp files are renamed into place within milliseconds; one older
 /// than a day was left by a crash.
 fn remove_stale_tmp(home: &Path) -> usize {
-    let root = crate::vault::objects_root(home);
-    let mut removed = 0;
-    for entry in walkdir::WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() || !entry.file_name().to_string_lossy().contains(".tmp.") {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= STALE_TMP);
-        if stale && std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
-        }
-    }
-    removed
+    crate::vault::tmp_files(home)
+        .into_iter()
+        .filter(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= STALE_TMP)
+        })
+        .filter(|p| std::fs::remove_file(p).is_ok())
+        .count()
 }
 
 /// Create a snapshot on request and record it as the latest automatic one,
 /// so a previous failure stops being reported.
 pub fn snapshot_now(home: &Path) -> Result<Value> {
     let r = crate::snapshots::create(home)?;
-    let mut state = load(home);
-    state["snapshot_attempt_at"] = json!(now_secs());
-    state["snapshot_retry_at"] = Value::Null;
-    state["snapshot"] = json!({"ok": true, "at": crate::now_iso(), "id": r["id"]});
-    save(home, &state)?;
+    update(home, |state| {
+        state["snapshot_attempt_at"] = json!(now_secs());
+        state["snapshot_retry_at"] = Value::Null;
+        state["snapshot"] = json!({"ok": true, "at": crate::now_iso(), "id": r["id"]});
+    })?;
     Ok(r)
 }
 
 /// Run whatever is due. Each task records its attempt time, so a failing task
 /// is retried on its next interval rather than on every collection pass.
 pub fn run_due(home: &Path) -> Result<Value> {
-    let mut state = load(home);
+    let state = load(home);
     let now = now_secs();
     let mut ran = Vec::new();
 
@@ -138,9 +141,10 @@ pub fn run_due(home: &Path) -> Result<Value> {
         match crate::vault::migrate_legacy(home, MIGRATE_BATCH) {
             Ok(r) if r["moved"].as_u64().unwrap_or(0) > 0 => {
                 migrating = r["remaining"] == true;
-                let moved = state["migration"]["moved"].as_u64().unwrap_or(0) + r["moved"].as_u64().unwrap_or(0);
-                state["migration"] = json!({"moved": moved, "remaining": r["remaining"], "skipped": r["skipped"]});
-                save(home, &state)?;
+                update(home, |state| {
+                    let moved = state["migration"]["moved"].as_u64().unwrap_or(0) + r["moved"].as_u64().unwrap_or(0);
+                    state["migration"] = json!({"moved": moved, "remaining": r["remaining"], "skipped": r["skipped"]});
+                })?;
                 ran.push("migration");
             }
             Ok(_) => {}
@@ -159,7 +163,8 @@ pub fn run_due(home: &Path) -> Result<Value> {
         && !retry_wait
         && due(&state["snapshot_attempt_at"], interval_days * 86_400, now)
     {
-        match crate::snapshots::create_within(home, LOCK_WAIT) {
+        let result = crate::snapshots::create_within(home, LOCK_WAIT);
+        update(home, |state| match result {
             Ok(r) => {
                 state["snapshot_attempt_at"] = json!(now);
                 state["snapshot_retry_at"] = Value::Null;
@@ -168,8 +173,7 @@ pub fn run_due(home: &Path) -> Result<Value> {
             // 被采集或其他操作占着锁：不算失败，不推迟到下个周期，过一会儿再试
             Err(e) if is_busy(&e) => {
                 state["snapshot_retry_at"] = json!(now + BUSY_RETRY_SECS);
-                let last_ok = state["snapshot"]["ok"] == true;
-                if !last_ok {
+                if state["snapshot"]["ok"] != true {
                     state["snapshot"] = json!({"ok": false, "retry": true, "at": crate::now_iso()});
                 }
             }
@@ -178,16 +182,16 @@ pub fn run_due(home: &Path) -> Result<Value> {
                 state["snapshot_retry_at"] = Value::Null;
                 state["snapshot"] = json!({"ok": false, "at": crate::now_iso(), "error": format!("{e:#}")});
             }
-        }
-        save(home, &state)?;
+        })?;
         ran.push("snapshot");
     }
 
     if due(&state["doctor_attempt_at"], DOCTOR_INTERVAL_SECS, now) {
-        state["doctor_attempt_at"] = json!(now);
         let tmp_removed = remove_stale_tmp(home);
         let report = crate::db::open(home).and_then(|conn| crate::doctor::run(&conn, home));
-        state["doctor"] = match report {
+        // 快照状态取最新（自检期间可能刚有一次手动快照）
+        let snapshot_ok = load(home)["snapshot"]["ok"] == true;
+        let doctor = match report {
             Ok(r) => {
                 let problems: Vec<Value> = r["checks"]
                     .as_array()
@@ -196,7 +200,7 @@ pub fn run_due(home: &Path) -> Result<Value> {
                     .filter(|c| c["status"] != "ok")
                     // "快照过旧"只在曾成功创建过快照时才算问题：关闭自动快照或首份
                     // 尚未完成时不提示，失败另有快照状态说明
-                    .filter(|c| c["name"] != "db_snapshot" || (interval_days > 0 && state["snapshot"]["ok"] == true))
+                    .filter(|c| c["name"] != "db_snapshot" || (interval_days > 0 && snapshot_ok))
                     .cloned()
                     .collect();
                 json!({"ok": r["ok"], "at": r["checked_at"], "problems": problems, "tmp_removed": tmp_removed})
@@ -208,7 +212,10 @@ pub fn run_due(home: &Path) -> Result<Value> {
                 "tmp_removed": tmp_removed,
             }),
         };
-        save(home, &state)?;
+        update(home, |state| {
+            state["doctor_attempt_at"] = json!(now);
+            state["doctor"] = doctor;
+        })?;
         ran.push("doctor");
     }
 
@@ -292,9 +299,7 @@ mod tests {
         drop(lock);
 
         // 等待时间到后自动补做
-        let mut state = status(home);
-        state["snapshot_retry_at"] = json!(now_secs() - 1);
-        save(home, &state).unwrap();
+        update(home, |state| state["snapshot_retry_at"] = json!(now_secs() - 1)).unwrap();
         run_due(home).unwrap();
         let st = status(home);
         assert_eq!(st["snapshot"]["ok"], true, "{st}");
@@ -306,7 +311,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         crate::db::open(home).unwrap();
-        save(home, &json!({
+        update(home, |state| *state = json!({
             "snapshot_attempt_at": now_secs(),
             "snapshot": {"ok": false, "at": "2026-10-01T01:00:00Z", "error": "database is locked"},
             "doctor_attempt_at": now_secs(),

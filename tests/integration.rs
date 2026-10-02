@@ -1419,3 +1419,41 @@ fn claude_in_file_compaction_marks_boundary_and_slices() {
         .unwrap();
     assert_eq!((cl, kind.as_str()), (3, "summary"));
 }
+
+#[test]
+fn memory_with_double_quotes_saves() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    for c in ["a\"b", "set key=\"value\" in config file now"] {
+        db::save_memory(&conn, &db::MemoryInput {
+            project_id: None, scope: "global", r#type: "fact", content: c,
+            status: None, source_session_id: None, source_message_id: None,
+        }).unwrap();
+    }
+    assert_eq!(db::find_similar(&conn, "set key=\"value\" in config file now", None, "fact").unwrap().len(), 1);
+}
+
+#[test]
+fn resolve_project_by_cwd_skips_archived_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let proj = base.path().join("proj");
+    let sub = proj.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let (pid, _) = db::add_project(&conn, proj.to_str().unwrap()).unwrap();
+    // 子目录（非 git）按前缀命中所在项目
+    let hit = db::resolve_project(&conn, None, sub.to_str()).unwrap().unwrap();
+    assert_eq!(hit.0, pid);
+    #[cfg(windows)]
+    {
+        let upper = sub.to_str().unwrap().to_uppercase();
+        assert_eq!(db::resolve_project(&conn, None, Some(&upper)).unwrap().unwrap().0, pid, "Windows 路径不分大小写");
+        let (again, created) = db::add_project(&conn, &proj.to_str().unwrap().to_uppercase()).unwrap();
+        assert!(!created && again == pid, "大小写不同的同一目录不得重复登记");
+    }
+    // 兜底不选已废弃项目
+    db::set_project_archived(&conn, pid, true).unwrap();
+    let other = base.path().join("elsewhere");
+    assert!(db::resolve_project(&conn, None, other.to_str()).unwrap().is_none());
+}

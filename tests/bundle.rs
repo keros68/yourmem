@@ -198,7 +198,7 @@ fn merge_refreshes_fts_for_updated_memory_file() {
     let seed = |home: &std::path::Path, text: &str, updated: &str| {
         let conn = db::open(home).unwrap();
         let bytes = text.as_bytes();
-        let hash = vault::store_bytes(home, bytes).unwrap();
+        let hash = vault::store_line(home, bytes).unwrap();
         let (fid, _) = db::upsert_memory_file(&conn, "claude", "global", "/proj/CLAUDE.md", &hash).unwrap();
         db::insert_memory_revision(&conn, fid, &hash, bytes.len() as u64).unwrap();
         // 手动设 updated_at 让新旧可比（upsert 内部用 now_iso）
@@ -979,7 +979,7 @@ fn project_bundle_excludes_other_project_and_global_memory_bytes() {
         ("project:/tmp/proj-y", "/tmp/proj-y/AGENTS.md", "EXCLUDED_PROJECT_MEMORY"),
         ("global", "/tmp/global/AGENTS.md", "EXCLUDED_GLOBAL_MEMORY"),
     ] {
-        let hash = vault::store_bytes(home.path(), text.as_bytes()).unwrap();
+        let hash = vault::store_line(home.path(), text.as_bytes()).unwrap();
         let (fid, _) = db::upsert_memory_file(&conn, "codex", scope, path, &hash).unwrap();
         db::insert_memory_revision(&conn, fid, &hash, text.len() as u64).unwrap();
         db::set_memory_fts(&conn, fid, text).unwrap();
@@ -1096,7 +1096,7 @@ fn cli_restore_into_default_fresh_home_does_not_create_database_early() {
 fn failed_index_backfill_rolls_back_the_entire_merge() {
     let (home, _src) = make_src();
     let conn = db::open(home.path()).unwrap();
-    let hash = vault::store_bytes(home.path(), b"source memory").unwrap();
+    let hash = vault::store_line(home.path(), b"source memory").unwrap();
     let (fid, _) = db::upsert_memory_file(&conn, "codex", "global", "/tmp/AGENTS.md", &hash).unwrap();
     db::insert_memory_revision(&conn, fid, &hash, 13).unwrap();
     db::set_memory_fts(&conn, fid, "source memory").unwrap();
@@ -1166,9 +1166,9 @@ fn merging_missing_history_keeps_the_current_memory_text_searchable() {
     let (current, old) = ("决策：当前版本的内容", "决策：早期版本的内容");
     let sc = db::open(src.path()).unwrap();
     let dc = db::open(dst.path()).unwrap();
-    let a = vault::store_bytes(src.path(), current.as_bytes()).unwrap();
-    let b = vault::store_bytes(src.path(), old.as_bytes()).unwrap();
-    vault::store_bytes(dst.path(), current.as_bytes()).unwrap();
+    let a = vault::store_line(src.path(), current.as_bytes()).unwrap();
+    let b = vault::store_line(src.path(), old.as_bytes()).unwrap();
+    vault::store_line(dst.path(), current.as_bytes()).unwrap();
     for (c, t) in [(&sc, "2026-09-30T00:00:00Z"), (&dc, "2026-09-25T00:00:00Z")] {
         c.execute(
             "INSERT INTO memory_files(id, agent, scope, path, current_hash, updated_at)

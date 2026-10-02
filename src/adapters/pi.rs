@@ -26,7 +26,6 @@ use serde_json::Value;
 
 use crate::models::{MessageKind, NewArtifact, NewMessage, ParseOutput, SessionMetaPatch};
 
-const MAX_CONTENT: usize = 200_000;
 
 /// pi 的写文件工具（真机词表：bash/read/edit/write/grep/ls/find）。
 const FILE_TOOLS: [&str; 2] = ["write", "edit"];
@@ -132,22 +131,7 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
 }
 
 fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, text: &str, ts: Option<&str>) {
-    let content: String = if text.chars().count() > MAX_CONTENT {
-        format!("{}…[truncated]", text.chars().take(MAX_CONTENT).collect::<String>())
-    } else {
-        text.to_string()
-    };
-    if content.trim().is_empty() {
-        return;
-    }
-    out.push(NewMessage {
-        line_no,
-        ord: out.iter().filter(|m| m.line_no == line_no).count() as u32,
-        kind,
-        content,
-        timestamp: ts.map(str::to_string),
-        uuid: None,
-    });
+    super::push_message(out, line_no, kind, text.to_string(), ts.map(str::to_string), None);
 }
 
 fn track_min(meta: &mut SessionMetaPatch, ts: &str) {

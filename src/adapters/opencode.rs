@@ -19,7 +19,6 @@ use crate::vault;
 
 pub const AGENT_OPENCODE: &str = "opencode";
 
-const MAX_CONTENT: usize = 200_000;
 
 pub fn default_db_path() -> PathBuf {
     // Windows 布局未验证（无真实样本，拿到样本再改），用 YOUMEM_OPENCODE_DB 覆盖。
@@ -160,7 +159,7 @@ fn import_session(
         line_no += 1;
         let part: Value = serde_json::from_str(part_data).unwrap_or(Value::Null);
         let msg: Value = serde_json::from_str(msg_data).unwrap_or(Value::Null);
-        let iso = ms_to_iso(*part_ts);
+        let iso = super::ms_to_iso(*part_ts);
         parse_part(&part, &msg, line_no, &iso, &mut messages, &mut artifacts);
 
         // Vault unit: raw part + parent message JSON, verbatim.
@@ -177,19 +176,20 @@ fn import_session(
     let meta = crate::models::SessionMetaPatch {
         cwd: sess.directory.clone(),
         git_branch: None,
-        started_at: sess.time_created.and_then(ms_to_iso),
-        ended_at: sess.time_updated.and_then(ms_to_iso),
+        started_at: sess.time_created.and_then(super::ms_to_iso),
+        ended_at: sess.time_updated.and_then(super::ms_to_iso),
         first_parent_uuid: None,
         compact_leaf_uuid: None,
     };
 
+    // 对象先于引用它的清单行落盘（对象库独立提交），一次打开整批写入
+    let hashes = vault::Store::open(home)?.put_many(units.iter().map(|(_, raw)| raw.as_slice()))?;
     let tx = conn.transaction()?;
     db::upsert_session(&tx, &session_key, AGENT_OPENCODE, native_id, project_id, &src_key, &meta, messages.len() as u64)?;
     db::insert_messages(&tx, &session_key, &messages)?;
     db::insert_artifacts(&tx, &session_key, project_id, &artifacts)?;
 
-    for (n, raw) in &units {
-        let hash = vault::store_line(home, raw)?;
+    for ((n, _), hash) in units.iter().zip(&hashes) {
         tx.execute(
             "INSERT OR REPLACE INTO vault_lines(session_id, line_no, hash) VALUES (?1,?2,?3)",
             params![session_key, *n as i64, hash],
@@ -268,17 +268,7 @@ fn parse_part(
 }
 
 fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, content: String, ts: Option<String>) {
-    let content = if content.chars().count() > MAX_CONTENT {
-        let t: String = content.chars().take(MAX_CONTENT).collect();
-        format!("{t}…[truncated]")
-    } else {
-        content
-    };
-    if content.trim().is_empty() {
-        return;
-    }
-    let ord = out.iter().filter(|m| m.line_no == line_no).count() as u32;
-    out.push(NewMessage { line_no, ord, kind, content, timestamp: ts, uuid: None });
+    super::push_message(out, line_no, kind, content, ts, None);
 }
 
 fn compact(v: &Value) -> String {
@@ -292,11 +282,6 @@ fn compact(v: &Value) -> String {
     } else {
         s
     }
-}
-
-pub fn ms_to_iso(ms: i64) -> Option<String> {
-    chrono::DateTime::from_timestamp_millis(ms)
-        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
 #[cfg(test)]

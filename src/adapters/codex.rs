@@ -9,7 +9,6 @@ use serde_json::Value;
 
 use crate::models::{MessageKind, NewArtifact, NewMessage, ParseOutput, SessionMetaPatch};
 
-const MAX_CONTENT: usize = 200_000;
 
 pub fn parse_lines(lines: &[(u64, String)], prior_saw_response_items: bool) -> ParseOutput {
     let mut output = ParseOutput::default();
@@ -169,17 +168,7 @@ fn stringify(v: &Value) -> String {
 }
 
 fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, content: String, ts: Option<String>) {
-    let content = if content.chars().count() > MAX_CONTENT {
-        let t: String = content.chars().take(MAX_CONTENT).collect();
-        format!("{t}…[truncated]")
-    } else {
-        content
-    };
-    if content.trim().is_empty() {
-        return;
-    }
-    let ord = out.iter().filter(|m| m.line_no == line_no).count() as u32;
-    out.push(NewMessage { line_no, ord, kind, content, timestamp: ts, uuid: None });
+    super::push_message(out, line_no, kind, content, ts, None);
 }
 
 fn track_ts(meta: &mut SessionMetaPatch, ts: Option<&str>) {

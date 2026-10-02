@@ -526,7 +526,8 @@ async function renderSessions() {
   }
   sessData = [...groups.entries()];
   if (!sessSel || !groups.has(sessSel)) sessSel = sessData[0]?.[0] ?? null;
-  drawSessionsPage();
+  // 等待列表期间已切到回收站：不覆盖回收站画面
+  if (!sessTrash) drawSessionsPage();
 }
 
 // 子任务对话（subagent）折叠到同一列表里的主对话下；主对话不在列表里时照常单独显示
@@ -583,19 +584,17 @@ function drawSessionsPage() {
   // 重画整页会清掉内部滚动位置：侧栏滚动任何交互都保留（点下部项目不能跳顶，
   // 真机反馈 2026-09-04）；表格滚动仅在「显示更多」续排时保留（上方内容不变，
   // 同一偏移即同一视野），切项目/agent 回顶看新选择的第一屏。
+  const redraw = (keepTable) => {
+    const keep = [".sess-projs", ...(keepTable ? ["#sess-table"] : [])]
+      .map((sel) => [sel, document.querySelector(sel)?.scrollTop || 0]);
+    drawSessionsPage();
+    for (const [sel, top] of keep) { const el = document.querySelector(sel); if (el) el.scrollTop = top; }
+  };
   document.querySelectorAll(".sess-proj-item").forEach((el) => {
-    el.onclick = () => {
-      const side = document.querySelector(".sess-projs")?.scrollTop || 0;
-      sessSel = el.dataset.proj; sessChecked = new Set(); sessShown = 200; drawSessionsPage();
-      const pj = document.querySelector(".sess-projs"); if (pj) pj.scrollTop = side;
-    };
+    el.onclick = () => { sessSel = el.dataset.proj; sessChecked = new Set(); sessShown = 200; redraw(false); };
   });
   document.querySelectorAll("#page-sessions .chip[data-agent]").forEach((el) => {
-    el.onclick = () => {
-      const side = document.querySelector(".sess-projs")?.scrollTop || 0;
-      sessAgent = el.dataset.agent; sessShown = 200; drawSessionsPage();
-      const pj = document.querySelector(".sess-projs"); if (pj) pj.scrollTop = side;
-    };
+    el.onclick = () => { sessAgent = el.dataset.agent; sessShown = 200; redraw(false); };
   });
   const switchGroup = (group) => {
     if (sessGroup === group) return;
@@ -620,20 +619,10 @@ function drawSessionsPage() {
       e.stopPropagation();
       const id = b.dataset.subs;
       if (sessExpanded.has(id)) sessExpanded.delete(id); else sessExpanded.add(id);
-      const side = document.querySelector(".sess-projs")?.scrollTop || 0;
-      const tbl = document.querySelector("#sess-table")?.scrollTop || 0;
-      drawSessionsPage();
-      const pj = document.querySelector(".sess-projs"); if (pj) pj.scrollTop = side;
-      const tb = document.querySelector("#sess-table"); if (tb) tb.scrollTop = tbl;
+      redraw(true);
     };
   });
-  $("#sess-more")?.addEventListener("click", () => {
-    const side = document.querySelector(".sess-projs")?.scrollTop || 0;
-    const tbl = document.querySelector("#sess-table")?.scrollTop || 0;
-    sessShown += 200; drawSessionsPage();
-    const pj = document.querySelector(".sess-projs"); if (pj) pj.scrollTop = side;
-    const tb = document.querySelector("#sess-table"); if (tb) tb.scrollTop = tbl;
-  });
+  $("#sess-more")?.addEventListener("click", () => { sessShown += 200; redraw(true); });
   bindSessionRows("#page-sessions");
 
   // 批量选择：勾选出现批量删除按钮，二次确认执行
@@ -1440,7 +1429,12 @@ async function renderSettings() {
   };
 
   $("#auto-purge").onchange = async (e) => {
-    await invoke("auto_purge_set", { enabled: e.target.checked });
+    try {
+      await invoke("auto_purge_set", { enabled: e.target.checked });
+    } catch (err) {
+      e.target.checked = !e.target.checked;
+      return toast(`设置失败：${String(err)}`);
+    }
     toast(e.target.checked
       ? "已开启：下次启动 app 时自动清理超期回收站"
       : "已关闭自动清理");
@@ -2355,7 +2349,7 @@ function openGraphOverlay(graphEl, title) {
       <button class="btn small" data-gz="out">−</button>
       <button class="btn small" data-gz="reset">100%</button>
       <button class="btn small" data-gz="in">＋</button>
-      ${graphEl.querySelector(".gnode") ? `<button class="btn small graph-orient">${graphVertical ? "横排" : "竖排"}</button>` : ""}
+      ${graphEl.querySelector(".gnode:not(.mnode-g)") ? `<button class="btn small graph-orient">${graphVertical ? "横排" : "竖排"}</button>` : ""}
       <button class="btn small" data-gz="close">关闭（Esc）</button>
     </div>
     <div class="go-scroll"><div class="go-canvas">${graphEl.outerHTML.replaceAll("lg-arrow", "lg-arrow-z")}</div></div>`;

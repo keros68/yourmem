@@ -26,10 +26,7 @@ use serde_json::Value;
 
 use crate::models::{MessageKind, NewArtifact, NewMessage, ParseOutput, SessionMetaPatch};
 
-const MAX_CONTENT: usize = 200_000;
 
-/// input/args 里 file_path 标记写文件产物的工具（与 claude/zcode 同口径）。
-const FILE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
     let mut out = ParseOutput::default();
@@ -43,7 +40,7 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
             Ok(v) => v,
             Err(_) => continue, // partial / corrupt line: vault still has it
         };
-        let ts = v.get("time").and_then(Value::as_i64).and_then(ms_to_iso);
+        let ts = v.get("time").and_then(Value::as_i64).and_then(super::ms_to_iso);
         if let Some(t) = ts.as_deref() {
             track_min(meta, t);
             track_max(meta, t);
@@ -89,7 +86,7 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                         let display = serde_json::to_string(&args).unwrap_or_default();
                         push(&mut out.messages, *line_no, MessageKind::ToolCall,
                             &format!("[{name}] {display}"), ts.clone());
-                        if FILE_TOOLS.contains(&name) {
+                        if super::FILE_TOOLS.contains(&name) {
                             // 真实 Kimi 的写文件参数是 args.path（相对 cwd 的路径）
                             if let Some(fp) = args.get("path").and_then(Value::as_str) {
                                 out.artifacts.push(NewArtifact { path: fp.to_string(), tool: name.to_string() });
@@ -136,30 +133,8 @@ pub fn enrich_meta_from_state(meta: &SessionMetaPatch, wire_path: &Path) -> Sess
     meta
 }
 
-/// wire 协议的 time 是 epoch 毫秒 → RFC3339（统一 schema 口径）。
-/// 越界毫秒按缺失降级（None），不产生空字符串时间戳。
-fn ms_to_iso(ms: i64) -> Option<String> {
-    chrono::DateTime::from_timestamp_millis(ms)
-        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-}
-
 fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, text: &str, ts: Option<String>) {
-    let content: String = if text.chars().count() > MAX_CONTENT {
-        format!("{}…[truncated]", text.chars().take(MAX_CONTENT).collect::<String>())
-    } else {
-        text.to_string()
-    };
-    if content.trim().is_empty() {
-        return;
-    }
-    out.push(NewMessage {
-        line_no,
-        ord: out.iter().filter(|m| m.line_no == line_no).count() as u32,
-        kind,
-        content,
-        timestamp: ts,
-        uuid: None,
-    });
+    super::push_message(out, line_no, kind, text.to_string(), ts, None);
 }
 
 fn track_min(meta: &mut SessionMetaPatch, ts: &str) {

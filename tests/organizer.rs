@@ -24,6 +24,13 @@ fn ai_settings_persist_without_a_secret() {
 }
 
 #[test]
+fn plain_http_only_for_loopback_hosts() {
+    assert!(organizer::validate_settings(&settings("http://[::1]:11434/v1".into())).is_ok());
+    assert!(organizer::validate_settings(&settings("http://localhost:11434/v1".into())).is_ok());
+    assert!(organizer::validate_settings(&settings("http://api.example.com/v1".into())).is_err());
+}
+
+#[test]
 fn organizer_calls_openai_compatible_endpoint_and_validates_sources() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

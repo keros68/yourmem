@@ -11,10 +11,7 @@ use serde_json::Value;
 
 use crate::models::{MessageKind, NewArtifact, NewMessage, ParseOutput, SessionMetaPatch, UuidSighting};
 
-const MAX_CONTENT: usize = 200_000;
 
-/// Tools whose `input.file_path` marks a written artifact.
-const FILE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
     let mut out = ParseOutput::default();
@@ -120,7 +117,7 @@ fn extract_blocks(
                     Some("tool_use") => {
                         let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
                         let input = compact(&item["input"], 2000);
-                        if FILE_TOOLS.contains(&name) {
+                        if super::FILE_TOOLS.contains(&name) {
                             if let Some(p) = item["input"].get("file_path").and_then(Value::as_str) {
                                 artifacts.push(NewArtifact { path: p.to_string(), tool: name.to_string() });
                             }
@@ -148,28 +145,14 @@ fn extract_blocks(
 }
 
 fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, content: String, ts: Option<String>, uuid: Option<String>) {
-    let content = truncate_chars(content, MAX_CONTENT);
-    if content.trim().is_empty() {
-        return;
-    }
-    let ord = out.iter().filter(|m| m.line_no == line_no).count() as u32;
-    out.push(NewMessage { line_no, ord, kind, content, timestamp: ts, uuid });
+    super::push_message(out, line_no, kind, content, ts, uuid);
 }
 
 fn compact(v: &Value, max: usize) -> String {
     match v {
         Value::Null => String::new(),
-        Value::String(s) => truncate_chars(s.clone(), max),
-        other => truncate_chars(other.to_string(), max),
-    }
-}
-
-fn truncate_chars(s: String, max: usize) -> String {
-    if s.chars().count() <= max {
-        s
-    } else {
-        let t: String = s.chars().take(max).collect();
-        format!("{t}…[truncated]")
+        Value::String(s) => super::truncate_chars(s.clone(), max),
+        other => super::truncate_chars(other.to_string(), max),
     }
 }
 

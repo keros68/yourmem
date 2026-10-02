@@ -47,8 +47,9 @@ pub fn validate_settings(settings: &AiSettings) -> Result<()> {
     anyhow::ensure!(url.username().is_empty() && url.password().is_none(), "API 地址不能包含账号或密码");
     anyhow::ensure!(url.query().is_none() && url.fragment().is_none(), "API 地址不能包含查询参数或片段");
     let host = url.host_str().unwrap_or("");
+    // IPv6 主机名带方括号（[::1]），去掉才能按 IP 解析
     let loopback = host.eq_ignore_ascii_case("localhost")
-        || host.parse::<IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false);
+        || host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
     anyhow::ensure!(url.scheme() == "https" || (url.scheme() == "http" && loopback),
         "远程 API 必须使用 HTTPS；HTTP 仅允许 localhost/回环地址");
     Ok(())
@@ -62,12 +63,7 @@ pub fn save_settings(home: &Path, settings: &AiSettings) -> Result<()> {
 }
 
 pub fn settings_json(home: &Path) -> Value {
-    let s = load_settings(home);
-    json!({
-        "base_url": s.base_url,
-        "model": s.model,
-        "max_input_chars": s.max_input_chars,
-    })
+    serde_json::to_value(load_settings(home)).unwrap_or_default()
 }
 
 fn clip(s: &str, max: usize) -> String {

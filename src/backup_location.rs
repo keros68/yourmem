@@ -2,9 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Default)]
@@ -24,6 +22,10 @@ pub fn set(home: &Path, configured: &str) -> Result<Value> {
         path
     };
 
+    // 快照、清除归档等写备份目录的操作都持导入锁：迁移期间挡住它们，
+    // 否则搬走（或复制后删除）的同时还有新文件写进旧目录
+    let _lock = crate::ingest::ImportLockTx::acquire(home, std::time::Duration::from_secs(10))
+        .context("正在采集或备份，请稍后再改备份位置")?;
     if same_path(&old, &new) {
         fs::create_dir_all(&new).with_context(|| format!("目录不可用：{}", new.display()))?;
         save_config(home, raw)?;
@@ -143,7 +145,7 @@ fn copy_verified(source: &Path, destination: &Path) -> Result<CopyStats> {
             }
             fs::copy(entry.path(), &target)?;
             anyhow::ensure!(
-                file_hash(entry.path())? == file_hash(&target)?,
+                crate::vault::hash_reader(fs::File::open(entry.path())?)? == crate::vault::hash_reader(fs::File::open(&target)?)?,
                 "迁移校验失败：{}",
                 entry.path().display()
             );
@@ -158,20 +160,6 @@ fn copy_verified(source: &Path, destination: &Path) -> Result<CopyStats> {
         }
     }
     Ok(stats)
-}
-
-fn file_hash(path: &Path) -> Result<Vec<u8>> {
-    let mut file = fs::File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        digest.update(&buf[..n]);
-    }
-    Ok(digest.finalize().to_vec())
 }
 
 fn dir_stats(path: &Path) -> Result<CopyStats> {

@@ -44,7 +44,12 @@ pub struct MemfilesOutcome {
 fn claude_project_encodings(cwd: &str) -> Vec<String> {
     let mut out = vec![cwd.replace('/', "-")];
     for candidate in [
-        cwd.replace('\\', "-"),             // Windows 反斜杠分隔的 cwd
+        // 当前版本：每个非 ASCII 字母数字的 UTF-16 码元都换成 '-'（中文、空格、冒号都在内）
+        String::from_utf16_lossy(
+            &cwd.encode_utf16()
+                .map(|u| if u < 128 && (u as u8).is_ascii_alphanumeric() { u } else { u16::from(b'-') })
+                .collect::<Vec<_>>(),
+        ),
         cwd.replace(['/', '\\', ':'], "-"), // Windows 全量归一（盘符冒号不入目录名）
         out[0].replace('.', "-"),
         out[0].replace('.', "-").replace('_', "-"),
@@ -140,9 +145,9 @@ pub fn collect(conn: &Connection, home: &Path, dirs: &SourceDirs) -> Result<Memf
         let hash = vault::hash_bytes(&bytes);
         let path_str = path.to_string_lossy().to_string();
         // 先落 vault 再动库：内容寻址，重复写同一对象无害；若 upsert 先行而
-        // store_bytes 中途失败，current_hash 会指向缺失对象，下一轮 changed=false
+        // store_line 中途失败，current_hash 会指向缺失对象，下一轮 changed=false
         // 永久跳过该文件。库侧三步包一个事务，失败整体回滚下轮重来。
-        vault::store_bytes(home, &bytes)?;
+        vault::store_line(home, &bytes)?;
         let tx = conn.unchecked_transaction()?;
         let (file_id, changed) = db::upsert_memory_file(&tx, &agent, &scope, &path_str, &hash)?;
         if !changed {
@@ -306,4 +311,13 @@ fn line_diff(old: &str, new: &str) -> String {
         out.push_str(&format!("+ {line}\n"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn claude_encoding_masks_non_ascii_and_spaces() {
+        let enc = super::claude_project_encodings(r"F:\OneDrive\科研 项目");
+        assert!(enc.iter().any(|e| e == "F--OneDrive------"), "{enc:?}");
+    }
 }

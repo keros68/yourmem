@@ -7,19 +7,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-fn bytes(path: &Path) -> u64 {
-    if path.is_file() {
-        return path.metadata().map(|m| m.len()).unwrap_or(0);
-    }
-    walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
-}
-
 fn safe_directory(path: &Path) -> Result<PathBuf> {
     ensure!(
         path.is_absolute() && path.parent().is_some(),
@@ -44,12 +31,12 @@ pub fn plan(home: &Path, include_backups: bool) -> Result<Value> {
     let backup_separate = !backup.starts_with(&data);
     // 备份在数据目录内且选择保留：删除数据目录时绕开备份子树
     let backups_kept_inside = !include_backups && !backup_separate && backup.exists();
-    let data_bytes = if backups_kept_inside { bytes(home).saturating_sub(bytes(&backup)) } else { bytes(home) };
+    let data_bytes = if backups_kept_inside { crate::dir_bytes(home).saturating_sub(crate::dir_bytes(&backup)) } else { crate::dir_bytes(home) };
     let payload = json!({
         "data_dir": data,
         "data_bytes": data_bytes,
         "backup_dir": backup,
-        "backup_bytes": if include_backups && backup_separate { bytes(&backup) } else { 0 },
+        "backup_bytes": if include_backups && backup_separate { crate::dir_bytes(&backup) } else { 0 },
         "include_backups": include_backups,
         "backup_separate": backup_separate,
         "backups_kept_inside": backups_kept_inside,

@@ -30,10 +30,7 @@ use serde_json::Value;
 
 use crate::models::{MessageKind, NewArtifact, NewMessage, ParseOutput, SessionMetaPatch};
 
-const MAX_CONTENT: usize = 200_000;
 
-/// input.file_path 标记写文件产物的工具（与 claude.rs 同口径）。
-const FILE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 /// harness 上下文压缩的摘要前缀（0.3.8 真机验证：本会话压缩后 34 处命中——
 /// 压缩之后每个携带全量历史的请求，其首条 user 消息都以它开头）。
@@ -47,6 +44,7 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
     let meta = &mut out.meta;
     // (kind+content 哈希, 快照内出现序号) 的已入账集合——历史快照间去重
     let mut seen: HashSet<(u64, u32)> = HashSet::new();
+    let mut last_summary: Option<u64> = None;
 
     for (line_no, raw) in lines {
         if raw.trim().is_empty() {
@@ -85,7 +83,7 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                     let display = serde_json::to_string(&input).unwrap_or_default();
                     push(&mut out.messages, *line_no, MessageKind::ToolCall,
                         &format!("[{name}] {display}"), ts.clone());
-                    if FILE_TOOLS.contains(&name) {
+                    if super::FILE_TOOLS.contains(&name) {
                         if let Some(fp) = input.get("file_path").and_then(Value::as_str) {
                             out.artifacts.push(NewArtifact { path: fp.to_string(), tool: name.to_string() });
                         }
@@ -125,9 +123,18 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                     }),
                     _ => None,
                 };
-                if head.is_some_and(|t| t.starts_with(COMPACT_SUMMARY_PREFIX)) {
+                if let Some(t) = head.filter(|t| t.starts_with(COMPACT_SUMMARY_PREFIX)) {
                     out.compact_line =
                         Some(out.compact_line.map_or(*line_no, |l| l.min(*line_no)));
+                    // 新摘要 = 一次新的压缩：快照从摘要重新起算，出现序号随之归零，
+                    // 旧的已入账集合不再适用（否则压缩后与压缩前同文的消息会被吞掉）
+                    let mut h = DefaultHasher::new();
+                    t.hash(&mut h);
+                    let h = h.finish();
+                    if last_summary != Some(h) {
+                        last_summary = Some(h);
+                        seen.clear();
+                    }
                     break;
                 }
             }
@@ -267,26 +274,7 @@ pub fn enrich_meta_from_db(meta: &SessionMetaPatch, session_id: &str) -> Session
 }
 
 fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, text: &str, ts: Option<String>) {
-    let content = truncate(text);
-    if content.trim().is_empty() {
-        return;
-    }
-    out.push(NewMessage {
-        line_no,
-        ord: out.iter().filter(|m| m.line_no == line_no).count() as u32,
-        kind,
-        content,
-        timestamp: ts,
-        uuid: None,
-    });
-}
-
-fn truncate(s: &str) -> String {
-    if s.chars().count() <= MAX_CONTENT {
-        s.to_string()
-    } else {
-        format!("{}…[truncated]", s.chars().take(MAX_CONTENT).collect::<String>())
-    }
+    super::push_message(out, line_no, kind, text.to_string(), ts, None);
 }
 
 fn track_min(meta: &mut SessionMetaPatch, ts: &str) {

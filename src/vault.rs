@@ -128,7 +128,7 @@ impl Store {
             let mut exists = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)")?;
             let mut insert = tx.prepare_cached("INSERT OR IGNORE INTO objects(hash, data) VALUES (?1, ?2)")?;
             for bytes in items {
-                let hash = hex_sha256(bytes);
+                let hash = hash_bytes(bytes);
                 let present: bool = exists.query_row([&hash], |r| r.get(0))?;
                 if !present && !object_path(&self.home, &hash).is_file() {
                     insert.execute(rusqlite::params![hash, encode_object(bytes)?])?;
@@ -212,7 +212,7 @@ impl Store {
 pub fn verified(hash: &str, stored: &[u8]) -> Result<Vec<u8>> {
     let bytes = decode_object(stored).with_context(|| format!("decode vault object {hash}"))?;
     anyhow::ensure!(
-        hex_sha256(&bytes) == hash,
+        hash_bytes(&bytes) == hash,
         "vault object {hash} failed hash verification (corrupted on disk)"
     );
     Ok(bytes)
@@ -226,7 +226,8 @@ pub fn store_disk_bytes(home: &Path) -> u64 {
     files + legacy_files(home).iter().map(|x| x.1).sum::<u64>()
 }
 
-fn is_hash_name(name: &str) -> bool {
+/// 64 位小写十六进制：对象地址格式。
+pub fn is_hash(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
@@ -242,7 +243,7 @@ fn legacy_files(home: &Path) -> Vec<(String, u64)> {
         .filter(|e| e.file_type().is_file())
         .filter_map(|e| {
             let name = e.file_name().to_str()?.to_string();
-            is_hash_name(&name).then(|| (name, e.metadata().map(|m| m.len()).unwrap_or(0)))
+            is_hash(&name).then(|| (name, e.metadata().map(|m| m.len()).unwrap_or(0)))
         })
         .collect()
 }
@@ -261,7 +262,7 @@ pub fn migrate_legacy(home: &Path, limit: usize) -> Result<Value> {
     let mut remaining = false;
     for entry in walkdir::WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
         let Some(name) = entry.file_name().to_str() else { continue };
-        if !entry.file_type().is_file() || !is_hash_name(name) {
+        if !entry.file_type().is_file() || !is_hash(name) {
             continue;
         }
         if batch.len() == limit {
@@ -301,16 +302,10 @@ pub fn migrate_legacy(home: &Path, limit: usize) -> Result<Value> {
     Ok(json!({"moved": moved.len(), "skipped": skipped, "remaining": remaining}))
 }
 
-/// Store one raw line (without the trailing newline). Returns its hash.
+/// Store one raw line (without the trailing newline) or a whole native memory
+/// file. Returns its hash.
 pub fn store_line(home: &Path, bytes: &[u8]) -> Result<String> {
     Ok(Store::open(home)?.put_many([bytes])?.remove(0))
-}
-
-/// Semantic alias for `store_line` (DESIGN-0.3 §2): native memory files are
-/// archived as whole-file bytes — they are rewritten in place, unlike the
-/// append-only session JSONL, so line-level addressing doesn't apply.
-pub fn store_bytes(home: &Path, bytes: &[u8]) -> Result<String> {
-    store_line(home, bytes)
 }
 
 /// Read one vault object; see `Store::get`. Callers reading many objects
@@ -338,13 +333,21 @@ fn decode_object(stored: &[u8]) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
-pub fn hash_bytes(bytes: &[u8]) -> String {
-    hex_sha256(bytes)
+/// 流式 SHA-256，十六进制小写。
+pub fn hash_reader(mut reader: impl Read) -> Result<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            return Ok(format!("{:x}", digest.finalize()));
+        }
+        digest.update(&buffer[..n]);
+    }
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Rebuild the raw session JSONL from the vault, verifying every object's
@@ -516,7 +519,7 @@ pub fn orphan_cleanup(conn: &Connection, home: &Path, token: &str) -> Result<Val
     let mut removed = 0u64;
     let mut reclaimed = 0u64;
     for (key, size) in rows {
-        if !is_hash_name(&key) {
+        if !is_hash(&key) {
             std::fs::remove_file(&key)?;
         } else {
             let referenced: i64 = conn.query_row(

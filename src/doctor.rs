@@ -98,13 +98,7 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
     });
 
     // 4. 被引用对象磁盘缺失全量扫描（stat 级别，不重算哈希）
-    let referenced: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT hash FROM vault_lines UNION SELECT hash FROM memory_revisions",
-        )?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
+    let referenced = crate::bundle::referenced_hashes(conn)?;
     let stored: std::collections::HashSet<String> =
         store.inventory()?.into_iter().map(|(h, _)| h).collect();
     let missing = referenced.iter().filter(|h| !stored.contains(*h)).count();
@@ -115,9 +109,7 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
     });
 
     // 5. 盘上未被引用的对象（泄漏：既不属 vault_lines 也不属 memory_revisions）
-    let refset: std::collections::HashSet<&str> =
-        referenced.iter().map(String::as_str).collect();
-    let orphans = stored.iter().filter(|h| !refset.contains(h.as_str())).count();
+    let orphans = stored.difference(&referenced).count();
     let tmp_residue = vault::tmp_files(home).len();
     checks.push(if tmp_residue == 0 {
         check("tmp_residue", "ok", "无崩溃残留的 tmp 文件")
@@ -133,7 +125,7 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
     // 6. memory_files 当前修订的对象都在（current_hash 悬空 = 详情页打不开）
     let cur_missing = {
         let mut stmt =
-            conn.prepare("SELECT current_hash FROM memory_files WHERE current_hash IS NOT NULL")?;
+            conn.prepare("SELECT current_hash FROM memory_files")?;
         let hashes: Vec<String> = stmt
             .query_map([], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;

@@ -27,38 +27,6 @@ async fn stats() -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn today() -> Result<Value, String> {
-    let conn = open()?;
-    let sessions = db::recent_sessions(&conn, None, 200).map_err(|e| e.to_string())?;
-    // "今天"按本地日的 UTC 区间算（与日报卡同口径）；时间戳存 UTC，直接前缀匹配
-    // 会让东八区 00:00-08:00 的会话算错天。
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let (lo, hi) = yourmem::dossier::day_bounds_utc(&today).map_err(|e| e.to_string())?;
-    let in_day = |t: Option<&str>| t.map(|t| t >= lo.as_str() && t < hi.as_str()).unwrap_or(false);
-    let todays: Vec<Value> = sessions
-        .into_iter()
-        .filter(|s| in_day(s["started_at"].as_str()) || in_day(s["ended_at"].as_str()))
-        .collect();
-    let tasks = db::open_tasks(&conn, None).map_err(|e| e.to_string())?;
-    let recent = db::recent_sessions(&conn, None, 10).map_err(|e| e.to_string())?;
-    // latest handoff per most-recent projects
-    let projects = db::list_projects(&conn).map_err(|e| e.to_string())?;
-    let mut handoffs = Vec::new();
-    for p in projects.iter().take(3) {
-        if let Some(h) = db::latest_handoff(&conn, p["id"].as_i64().unwrap_or(0)).map_err(|e| e.to_string())? {
-            handoffs.push(json!({ "project": p["name"], "handoff": h }));
-        }
-    }
-    Ok(json!({
-        "today_sessions": todays,
-        "open_tasks": tasks,
-        "recent_sessions": recent,
-        "recent_handoffs": handoffs,
-        "stats": db::stats(&conn).map_err(|e| e.to_string())?,
-    }))
-}
-
-#[tauri::command]
 fn projects() -> Result<Value, String> {
     let conn = open()?;
     let mut rows = db::list_projects(&conn).map_err(|e| e.to_string())?;
@@ -119,7 +87,9 @@ fn open_in_finder(path: String, reveal: Option<bool>) -> Result<Value, String> {
     if !std::path::Path::new(&p).exists() {
         return Err(format!("路径不存在：{p}"));
     }
-    let reveal = reveal.unwrap_or(false);
+    // 非定位模式只开文件夹：路径来自 agent 日志里的 cwd，指向文件时
+    // explorer/open 会直接运行它，退化为在文件夹中定位
+    let reveal = reveal.unwrap_or(false) || !std::path::Path::new(&p).is_dir();
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("explorer");
         if reveal {
@@ -227,26 +197,29 @@ async fn ai_settings_get() -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn ai_settings_save(
+async fn ai_settings_save(
     base_url: String,
     model: String,
     max_input_chars: usize,
     api_key: Option<String>,
     clear_key: Option<bool>,
 ) -> Result<Value, String> {
-    let settings = yourmem::organizer::AiSettings { base_url, model, max_input_chars };
-    yourmem::organizer::validate_settings(&settings).map_err(|e| e.to_string())?;
-    if clear_key.unwrap_or(false) {
-        match ai_key_entry()?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {}
-            Err(e) => return Err(format!("移除 API Key 失败：{e}")),
+    run_blocking(move || {
+        let settings = yourmem::organizer::AiSettings { base_url, model, max_input_chars };
+        yourmem::organizer::validate_settings(&settings).map_err(|e| e.to_string())?;
+        if clear_key.unwrap_or(false) {
+            match ai_key_entry()?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => return Err(format!("移除 API Key 失败：{e}")),
+            }
+        } else if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+            ai_key_entry()?.set_password(key.trim())
+                .map_err(|e| format!("保存 API Key 失败：{e}"))?;
         }
-    } else if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
-        ai_key_entry()?.set_password(key.trim())
-            .map_err(|e| format!("保存 API Key 失败：{e}"))?;
-    }
-    yourmem::organizer::save_settings(&data_home(), &settings).map_err(|e| e.to_string())?;
-    ai_settings_value()
+        yourmem::organizer::save_settings(&data_home(), &settings).map_err(|e| e.to_string())?;
+        ai_settings_value()
+    })
+    .await
 }
 
 #[tauri::command]
@@ -276,11 +249,14 @@ fn ai_summary_save(day: String, summary: Value) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn sessions(project_id: Option<i64>, limit: Option<u32>) -> Result<Value, String> {
-    let conn = open()?;
-    // limit 缺省 = 不限量（u32::MAX 对 SQLite 即无限）：对话资产不封顶，
-    // 渲染分批由前端负责
-    Ok(json!({ "sessions": db::recent_sessions(&conn, project_id, limit.unwrap_or(u32::MAX)).map_err(|e| e.to_string())? }))
+async fn sessions(project_id: Option<i64>, limit: Option<u32>) -> Result<Value, String> {
+    run_blocking(move || {
+        let conn = open()?;
+        // limit 缺省 = 不限量（u32::MAX 对 SQLite 即无限）：对话资产不封顶，
+        // 渲染分批由前端负责
+        Ok(json!({ "sessions": db::recent_sessions(&conn, project_id, limit.unwrap_or(u32::MAX)).map_err(|e| e.to_string())? }))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -310,17 +286,20 @@ fn session_agent_path(conn: &rusqlite::Connection, session_id: &str) -> Result<(
 
 /// 证明卡数据：vault 清单统计 + 源文件是否还在磁盘上（没了正好凸显备份价值）。
 #[tauri::command]
-fn session_proof(session_id: String) -> Result<Value, String> {
-    let home = data_home();
-    let conn = open()?;
-    let (agent, file_path) = session_agent_path(&conn, &session_id)?;
-    let mut p = yourmem::vault::session_proof(&conn, &home, &session_id).map_err(|e| e.to_string())?;
-    p["agent"] = json!(agent);
-    p["file_path"] = json!(file_path);
-    p["source_exists"] = json!(std::path::Path::new(&file_path).is_file());
-    // 写回仅限文件型 agent（restore::FILE_BASED_AGENTS）——SQLite 型不给入口
-    p["writeback_supported"] = json!(yourmem::restore::FILE_BASED_AGENTS.contains(&agent.as_str()));
-    Ok(p)
+async fn session_proof(session_id: String) -> Result<Value, String> {
+    run_blocking(move || {
+        let home = data_home();
+        let conn = open()?;
+        let (agent, file_path) = session_agent_path(&conn, &session_id)?;
+        let mut p = yourmem::vault::session_proof(&conn, &home, &session_id).map_err(|e| e.to_string())?;
+        p["agent"] = json!(agent);
+        p["file_path"] = json!(file_path);
+        p["source_exists"] = json!(std::path::Path::new(&file_path).is_file());
+        // 写回仅限文件型 agent（restore::FILE_BASED_AGENTS）——SQLite 型不给入口
+        p["writeback_supported"] = json!(yourmem::restore::FILE_BASED_AGENTS.contains(&agent.as_str()));
+        Ok(p)
+    })
+    .await
 }
 
 /// 立即校验：逐对象重算哈希（vault::verify_session）。
@@ -489,51 +468,54 @@ fn first_run_state() -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn first_run_configure(data_path: String, backup_path: String, agents: Vec<String>) -> Result<Value, String> {
-    let data = std::path::PathBuf::from(data_path.trim());
-    let backup = std::path::PathBuf::from(backup_path.trim());
-    let valid = |p: &std::path::Path| p.is_absolute() && p.parent().is_some();
-    if !valid(&data) || !valid(&backup) {
-        return Err("核心数据和备份都必须选择非磁盘根目录的绝对路径".into());
-    }
-    let key = |p: &std::path::Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
-    let dk = key(&data);
-    let bk = key(&backup);
-    if dk == bk || dk.starts_with(&(bk.clone() + "\\")) || bk.starts_with(&(dk.clone() + "\\")) {
-        return Err("核心数据与备份位置不能相同或互相包含".into());
-    }
-    let nonempty = |p: &std::path::Path| -> Result<bool, String> {
-        if !p.exists() { return Ok(false); }
-        Ok(std::fs::read_dir(p).map_err(|e| e.to_string())?.next().is_some())
-    };
-    if nonempty(&data)? || nonempty(&backup)? {
-        return Err("核心数据和备份都需要选择空目录".into());
-    }
-    std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&backup).map_err(|e| e.to_string())?;
-    let probe = backup.join(format!(".write-test-{}", std::process::id()));
-    std::fs::write(&probe, b"yourmem").and_then(|_| std::fs::remove_file(&probe)).map_err(|e| e.to_string())?;
-    let cfg = json!({
-        "backup_dir": backup,
-        "index_tool_output": false,
-        "snapshot_auto_cleanup": true,
-        "snapshot_keep_recent": 3,
-        "snapshot_keep_monthly": 3,
-    });
-    yourmem::ingest::write_config(&data, &cfg).map_err(|e| e.to_string())?;
-    if let Err(e) = yourmem::set_data_home_pointer(&data) {
-        let _ = std::fs::remove_file(data.join("config.json"));
-        return Err(e.to_string());
-    }
-    let setup = if agents.is_empty() {
-        json!({"agents":[],"skipped":true})
-    } else {
-        match yourmem::setup::execute_selected(&yourmem::setup::Targets::default(), &agents) {
-            Ok(result) => result,
-            Err(e) => json!({"error":e.to_string()}),
+async fn first_run_configure(data_path: String, backup_path: String, agents: Vec<String>) -> Result<Value, String> {
+    run_blocking(move || {
+        let data = std::path::PathBuf::from(data_path.trim());
+        let backup = std::path::PathBuf::from(backup_path.trim());
+        let valid = |p: &std::path::Path| p.is_absolute() && p.parent().is_some();
+        if !valid(&data) || !valid(&backup) {
+            return Err("核心数据和备份都必须选择非磁盘根目录的绝对路径".into());
         }
-    };
-    Ok(json!({"data_dir":data,"backup_dir":backup,"setup":setup}))
+        let key = |p: &std::path::Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+        let dk = key(&data);
+        let bk = key(&backup);
+        if dk == bk || dk.starts_with(&(bk.clone() + "\\")) || bk.starts_with(&(dk.clone() + "\\")) {
+            return Err("核心数据与备份位置不能相同或互相包含".into());
+        }
+        let nonempty = |p: &std::path::Path| -> Result<bool, String> {
+            if !p.exists() { return Ok(false); }
+            Ok(std::fs::read_dir(p).map_err(|e| e.to_string())?.next().is_some())
+        };
+        if nonempty(&data)? || nonempty(&backup)? {
+            return Err("核心数据和备份都需要选择空目录".into());
+        }
+        std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&backup).map_err(|e| e.to_string())?;
+        let probe = backup.join(format!(".write-test-{}", std::process::id()));
+        std::fs::write(&probe, b"yourmem").and_then(|_| std::fs::remove_file(&probe)).map_err(|e| e.to_string())?;
+        let cfg = json!({
+            "backup_dir": backup,
+            "index_tool_output": false,
+            "snapshot_auto_cleanup": true,
+            "snapshot_keep_recent": 3,
+            "snapshot_keep_monthly": 3,
+        });
+        yourmem::ingest::write_config(&data, &cfg).map_err(|e| e.to_string())?;
+        if let Err(e) = yourmem::set_data_home_pointer(&data) {
+            let _ = std::fs::remove_file(data.join("config.json"));
+            return Err(e.to_string());
+        }
+        let setup = if agents.is_empty() {
+            json!({"agents":[],"skipped":true})
+        } else {
+            match yourmem::setup::execute_selected(&yourmem::setup::Targets::default(), &agents) {
+                Ok(result) => result,
+                Err(e) => json!({"error":e.to_string()}),
+            }
+        };
+        Ok(json!({"data_dir":data,"backup_dir":backup,"setup":setup}))
+    })
+    .await
 }
 
 /// 向导预填建议：`fsutil fsinfo drives` 枚举盘符（系统内置、瞬时、无权限要求），
@@ -773,21 +755,24 @@ fn auto_purge_if_enabled() {
 }
 
 #[tauri::command]
-fn search(query: String, project: Option<String>, agent: Option<String>, kind: Option<String>, limit: Option<u32>) -> Result<Value, String> {
-    let result = (|| {
-        let conn = open()?;
-        let _ = db::log_usage(&conn, "app", "search");
-        db::search(&conn, &db::SearchOpts {
-            query,
-            project,
-            agent,
-            kind,
-            limit: limit.unwrap_or(50),
-        })
-        .map_err(|e| e.to_string())
-    })();
-    yourmem::recall_status::record(&data_home(), "app", "search", result.is_ok(), result.as_ref().ok().map(|v| v.len() as u64));
-    Ok(json!({ "results": result? }))
+async fn search(query: String, project: Option<String>, agent: Option<String>, kind: Option<String>, limit: Option<u32>) -> Result<Value, String> {
+    run_blocking(move || {
+        let result = (|| {
+            let conn = open()?;
+            let _ = db::log_usage(&conn, "app", "search");
+            db::search(&conn, &db::SearchOpts {
+                query,
+                project,
+                agent,
+                kind,
+                limit: limit.unwrap_or(50),
+            })
+            .map_err(|e| e.to_string())
+        })();
+        yourmem::recall_status::record(&data_home(), "app", "search", result.is_ok(), result.as_ref().ok().map(|v| v.len() as u64));
+        Ok(json!({ "results": result? }))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -861,12 +846,6 @@ async fn memory_add(project_id: Option<i64>, r#type: String, content: String) ->
 fn update_memory(id: String, action: String, superseded_by: Option<String>) -> Result<Value, String> {
     db::update_memory_status(&open()?, &id, &action, superseded_by.as_deref()).map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true }))
-}
-
-#[tauri::command]
-fn artifacts(project_id: Option<i64>, session_id: Option<String>, limit: Option<u32>) -> Result<Value, String> {
-    let conn = open()?;
-    Ok(json!({ "artifacts": db::list_artifacts(&conn, project_id, session_id.as_deref(), limit.unwrap_or(200)).map_err(|e| e.to_string())? }))
 }
 
 #[tauri::command]
@@ -1022,8 +1001,7 @@ async fn setup_run(agents: Vec<String>) -> Result<Value, String> {
 }
 
 fn all_setup_agents() -> Vec<String> {
-    ["claude", "codex", "zcode", "kimi", "gemini", "cursor", "hermes"]
-        .map(str::to_string).to_vec()
+    yourmem::setup::SETUP_AGENTS.map(str::to_string).to_vec()
 }
 
 #[tauri::command]
@@ -1122,60 +1100,61 @@ fn purge_archive_root() -> std::path::PathBuf {
     yourmem::backups_dir(&data_home()).join("purge")
 }
 
-fn dir_size(path: &std::path::Path) -> u64 {
-    std::fs::read_dir(path).map(|rd| {
-        rd.filter_map(|e| e.ok()).map(|e| {
-            if e.path().is_dir() { dir_size(&e.path()) } else { e.metadata().map(|m| m.len()).unwrap_or(0) }
-        }).sum()
-    }).unwrap_or(0)
-}
-
 /// 列出彻底删除留下的离线档案（backups/purge/ 下每个目录一条：名称/大小/时间）。
 #[tauri::command]
-fn purge_archives() -> Result<Value, String> {
-    let root = purge_archive_root();
-    let mut items: Vec<Value> = std::fs::read_dir(&root).map(|rd| {
-        rd.filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| {
-                let meta = e.metadata().ok()?;
-                Some(json!({
-                    "name": e.file_name(),
-                    "bytes": dir_size(&e.path()),
-                    "modified": meta.modified().ok()
-                        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true))?,
-                }))
-            })
-            .collect()
-    }).unwrap_or_default();
-    items.sort_by(|a, b| b["modified"].as_str().cmp(&a["modified"].as_str()));
-    let total: u64 = items.iter().filter_map(|i| i["bytes"].as_u64()).sum();
-    Ok(json!({ "archives": items, "total_bytes": total, "root": root }))
+async fn purge_archives() -> Result<Value, String> {
+    run_blocking(move || {
+        let root = purge_archive_root();
+        let mut items: Vec<Value> = std::fs::read_dir(&root).map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| {
+                    let meta = e.metadata().ok()?;
+                    Some(json!({
+                        "name": e.file_name(),
+                        "bytes": yourmem::dir_bytes(&e.path()),
+                        "modified": meta.modified().ok()
+                            .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true))?,
+                    }))
+                })
+                .collect()
+        }).unwrap_or_default();
+        items.sort_by(|a, b| b["modified"].as_str().cmp(&a["modified"].as_str()));
+        let total: u64 = items.iter().filter_map(|i| i["bytes"].as_u64()).sum();
+        Ok(json!({ "archives": items, "total_bytes": total, "root": root }))
+    })
+    .await
 }
 
 /// 删除单个档案目录（name 只取文件名成分防目录穿越）。
 #[tauri::command]
-fn purge_archive_delete(name: String) -> Result<Value, String> {
-    let safe = std::path::Path::new(&name)
-        .file_name()
-        .ok_or_else(|| "非法档案名".to_string())?;
-    let target = purge_archive_root().join(safe);
-    std::fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
-    Ok(json!({ "deleted": safe.to_string_lossy() }))
+async fn purge_archive_delete(name: String) -> Result<Value, String> {
+    run_blocking(move || {
+        let safe = std::path::Path::new(&name)
+            .file_name()
+            .ok_or_else(|| "非法档案名".to_string())?;
+        let target = purge_archive_root().join(safe);
+        std::fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
+        Ok(json!({ "deleted": safe.to_string_lossy() }))
+    })
+    .await
 }
 
 /// 清空全部离线档案（backups/purge/ 整目录内容移除，目录本身保留）。
 #[tauri::command]
-fn purge_archive_clear() -> Result<Value, String> {
-    let root = purge_archive_root();
-    let mut removed = 0usize;
-    for e in std::fs::read_dir(&root).map_err(|e| e.to_string())?.filter_map(|e| e.ok()) {
-        if e.path().is_dir() {
-            std::fs::remove_dir_all(e.path()).map_err(|e| e.to_string())?;
-            removed += 1;
+async fn purge_archive_clear() -> Result<Value, String> {
+    run_blocking(move || {
+        let root = purge_archive_root();
+        let mut removed = 0usize;
+        for e in std::fs::read_dir(&root).map_err(|e| e.to_string())?.filter_map(|e| e.ok()) {
+            if e.path().is_dir() {
+                std::fs::remove_dir_all(e.path()).map_err(|e| e.to_string())?;
+                removed += 1;
+            }
         }
-    }
-    Ok(json!({ "removed": removed }))
+        Ok(json!({ "removed": removed }))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1258,7 +1237,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            session_window, message_content, maintenance_status, collect_progress, memory_add, stats, today, projects, context, project_dossier, daily_digest, daily_digest_export, sessions,
+            session_window, message_content, maintenance_status, collect_progress, memory_add, stats, projects, context, project_dossier, daily_digest, daily_digest_export, sessions,
             ai_settings_get, ai_settings_save, ai_organize_day, ai_summary_save,
             project_add, project_archive, project_restore, open_in_finder,
             session_proof, session_verify, session_export, session_writeback_plan,
@@ -1268,7 +1247,7 @@ fn main() {
             auto_purge_get, auto_purge_set, agent_set_enabled,
             backup_dir_get, backup_dir_set, backup_dir_pick, bundle_path_pick,
             first_run_state, first_run_configure, update_check, update_install, open_url,
-            search, memories, update_memory, artifacts, import_now,
+            search, memories, update_memory, import_now,
             memory_files, memory_file_show,
             agents_detect, agent_add_root, agent_remove_root,
             bundle_create, bundle_verify, bundle_restore, project_review, setup_plan, setup_run,

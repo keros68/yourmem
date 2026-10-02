@@ -24,13 +24,32 @@ pub mod recall_status;
 pub mod project_review;
 pub mod setup;
 pub mod snapshots;
-pub mod update;
 pub mod trash;
 pub mod vault;
 
 use std::path::{Path, PathBuf};
 
 /// Background utilities must not create a console window in the desktop app.
+/// 追加式后缀，完整保留原文件名（`a.jsonl` → `a.jsonl.bak-…`）。
+/// 不能用 `with_extension`：它替换最后一个扩展名。
+pub fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".");
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// 文件或目录树占用的字节数（读不到的项按 0 计）。
+pub fn dir_bytes(path: &Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
 pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let mut command = std::process::Command::new(program);
     #[cfg(windows)]

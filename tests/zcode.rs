@@ -428,3 +428,23 @@ fn resync_keeps_memory_source_pointers() {
         assert_eq!(pointed.as_deref(), Some("回复二"), "第 {i} 次重导后指针丢失");
     }
 }
+
+#[test]
+fn same_text_after_compaction_is_not_swallowed() {
+    let hist = |msgs: serde_json::Value| serde_json::json!({
+        "type": "model_io", "querySource": "main_turn",
+        "startedAt": "2026-08-23T08:20:00Z", "completedAt": "2026-08-23T08:20:05Z",
+        "request": { "body": { "messages": msgs }},
+        "response": {"text": "", "toolCalls": []}
+    }).to_string();
+    let summary = zcode::COMPACT_SUMMARY_PREFIX.to_string() + "摘要";
+    let lines = vec![
+        (1, hist(serde_json::json!([{"role": "user", "content": "继续"}]))),
+        // 压缩后同一摘要出现在之后每个快照里：只在首次时重新起算
+        (2, hist(serde_json::json!([{"role": "user", "content": summary}, {"role": "user", "content": "继续"}]))),
+        (3, hist(serde_json::json!([{"role": "user", "content": summary}, {"role": "user", "content": "继续"}]))),
+    ];
+    let out = zcode::parse_lines(&lines);
+    let n = out.messages.iter().filter(|m| m.content == "继续").count();
+    assert_eq!(n, 2, "压缩前后各一条，压缩后的重复快照不再入账");
+}

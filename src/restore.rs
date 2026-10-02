@@ -72,15 +72,6 @@ pub fn plan(conn: &Connection, agent: &str, session: &str) -> Result<Value> {
     }))
 }
 
-/// 追加式后缀，完整保留原文件名（`a.jsonl` → `a.jsonl.bak-…`）。
-/// 不能用 `with_extension`：它是替换最后一个扩展名，会把 `.jsonl` 吃掉。
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".");
-    name.push(suffix);
-    path.with_file_name(name)
-}
-
 /// 门控要素 2/3：确认后的执行。`confirmed` 由调用方（CLI 交互或 UI 弹窗）保证。
 pub fn execute(conn: &Connection, home: &Path, agent: &str, session: &str, force: bool) -> Result<Value> {
     let p = plan(conn, agent, session)?;
@@ -107,15 +98,16 @@ pub fn execute(conn: &Connection, home: &Path, agent: &str, session: &str, force
 
     // 写 tmp 再 rename：写回也不留半截文件（同 vault 写盘纪律）；
     // 失败时清理 tmp——半截文件躺在 agent 数据目录里会吓到人（自检 B5）
-    let tmp = with_suffix(&target, &format!("yourmem-tmp.{}", std::process::id()));
-    let lines = match vault::export_session(conn, home, &sid, &tmp) {
+    let tmp = crate::with_suffix(&target, &format!("yourmem-tmp.{}", std::process::id()));
+    let lines = match vault::export_session(conn, home, &sid, &tmp)
+        .and_then(|l| std::fs::rename(&tmp, &target).map(|_| l).map_err(Into::into))
+    {
         Ok(l) => l,
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
     };
-    std::fs::rename(&tmp, &target)?;
 
     Ok(json!({
         "restored": target,
@@ -134,11 +126,11 @@ mod tests {
     fn bak_and_tmp_names_keep_original_extension() {
         let p = Path::new("/tmp/x/session-abc.jsonl");
         assert_eq!(
-            with_suffix(p, "bak-20260823-235959"),
+            crate::with_suffix(p, "bak-20260823-235959"),
             PathBuf::from("/tmp/x/session-abc.jsonl.bak-20260823-235959")
         );
         assert_eq!(
-            with_suffix(p, "yourmem-tmp.123"),
+            crate::with_suffix(p, "yourmem-tmp.123"),
             PathBuf::from("/tmp/x/session-abc.jsonl.yourmem-tmp.123")
         );
     }

@@ -133,3 +133,26 @@ fn hermes_respects_disabled_agent() {
     // set_agent_disabled 只认已知 agent
     assert!(ingest::set_agent_disabled(home.path(), "nonexistent", true).is_err());
 }
+
+#[test]
+fn disabled_hermes_is_skipped_even_with_explicit_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("state.db");
+    make_source(&src_path);
+    let home = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    ingest::set_agent_disabled(home.path(), hermes::AGENT_HERMES, true).unwrap();
+    // 其他源都指向空目录，只看 hermes 是否被采
+    let overrides: Vec<(&str, std::path::PathBuf)> = [
+        adapters::AGENT_CLAUDE, adapters::AGENT_CODEX, adapters::AGENT_ZCODE, adapters::AGENT_KIMI, adapters::AGENT_PI,
+        adapters::opencode::AGENT_OPENCODE,
+    ]
+    .into_iter()
+    .map(|a| (a, empty.path().join(a)))
+    .chain([(hermes::AGENT_HERMES, src_path.clone())])
+    .collect();
+    ingest::import_overriding(home.path(), &overrides).unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM sessions WHERE agent = 'hermes'", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0, "停用的 hermes 不得被采集");
+}

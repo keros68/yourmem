@@ -5,10 +5,9 @@ use anyhow::{ensure, Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Cursor, Read, Write},
+    io::{Cursor, Write},
     path::{Path, PathBuf},
 };
 
@@ -26,11 +25,6 @@ struct Snapshot {
 
 pub fn root(home: &Path) -> PathBuf {
     crate::backups_dir(home).join("snapshots-v1")
-}
-fn hash_ok(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 fn id_ok(s: &str) -> bool {
     !s.is_empty() && s.len() < 100 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -113,20 +107,8 @@ fn contents(repo: &Path) -> Result<BTreeMap<String, u64>> {
 fn work_dir(repo: &Path) -> Result<tempfile::TempDir> {
     Ok(tempfile::Builder::new().prefix(".work-").tempdir_in(repo)?)
 }
-fn hash_reader(mut reader: impl Read) -> Result<String> {
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; 65536];
-    loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        digest.update(&buffer[..n]);
-    }
-    Ok(format!("{:x}", digest.finalize()))
-}
 fn decode(repo: &Path, hash: &str, out: &Path) -> Result<()> {
-    ensure!(hash_ok(hash), "备份对象地址无效");
+    ensure!(vault::is_hash(hash), "备份对象地址无效");
     let path = blob(repo, hash);
     regular(&path)?;
     let mut gz = flate2::read::GzDecoder::new(std::fs::File::open(path)?);
@@ -134,24 +116,20 @@ fn decode(repo: &Path, hash: &str, out: &Path) -> Result<()> {
     std::io::copy(&mut gz, &mut file)?;
     drop(file);
     ensure!(
-        hash_reader(std::fs::File::open(out)?)? == hash,
+        vault::hash_reader(std::fs::File::open(out)?)? == hash,
         "备份对象校验失败"
     );
     Ok(())
 }
-fn put(repo: &Path, source: &Path, expected: Option<&str>) -> Result<(String, u64)> {
-    put_bytes(repo, &std::fs::read(source)?, expected)
-}
-fn put_bytes(repo: &Path, bytes: &[u8], expected: Option<&str>) -> Result<(String, u64)> {
-    let hash = hash_reader(Cursor::new(bytes))?;
-    if let Some(expected) = expected {
-        ensure!(hash == expected, "原件校验失败");
-    }
+fn put(repo: &Path, source: &Path) -> Result<(String, u64)> {
+    let bytes = std::fs::read(source)?;
+    let bytes = bytes.as_slice();
+    let hash = vault::hash_reader(Cursor::new(bytes))?;
     let dst = blob(repo, &hash);
     if dst.exists() {
         regular(&dst)?;
         ensure!(
-            hash_reader(flate2::read::GzDecoder::new(std::fs::File::open(&dst)?))? == hash,
+            vault::hash_reader(flate2::read::GzDecoder::new(std::fs::File::open(&dst)?))? == hash,
             "已有备份对象损坏，请先检查备份仓库"
         );
         return Ok((hash, 0));
@@ -163,7 +141,7 @@ fn put_bytes(repo: &Path, bytes: &[u8], expected: Option<&str>) -> Result<(Strin
     encoder.finish()?;
     tmp.as_file().sync_all()?;
     ensure!(
-        hash_reader(flate2::read::GzDecoder::new(std::fs::File::open(
+        vault::hash_reader(flate2::read::GzDecoder::new(std::fs::File::open(
             tmp.path()
         )?))?
             == hash,
@@ -203,7 +181,7 @@ fn manifests(repo: &Path) -> Result<Vec<Snapshot>> {
             "快照清单无效"
         );
         ensure!(
-            hash_ok(&s.db_hash) && s.hashes.iter().all(|h| hash_ok(h)),
+            vault::is_hash(&s.db_hash) && s.hashes.iter().all(|h| vault::is_hash(h)),
             "快照对象地址无效"
         );
         chrono::DateTime::parse_from_rfc3339(&s.created_at)?;
@@ -228,7 +206,7 @@ fn inventory(repo: &Path) -> Result<BTreeMap<String, u64>> {
             .and_then(|x| x.to_str())
             .context("备份文件名无效")?
             .to_string();
-        ensure!(hash_ok(&name), "备份文件名无效");
+        ensure!(vault::is_hash(&name), "备份文件名无效");
         regular(&path)?;
         files.insert(name, path.metadata()?.len());
     }
@@ -261,11 +239,7 @@ pub fn list(home: &Path) -> Result<Value> {
             bytes += entry.metadata()?.len();
         }
     }
-    let policy = if repo.join("policy.json").exists() {
-        serde_json::from_slice::<Value>(&std::fs::read(repo.join("policy.json"))?)?
-    } else {
-        json!({"keep_recent":recent,"keep_monthly":monthly,"auto_cleanup":auto})
-    };
+    let policy = json!({"keep_recent":recent,"keep_monthly":monthly,"auto_cleanup":auto});
     Ok(
         json!({"root":repo,"repository_bytes":bytes,"policy":policy,"snapshots":rows.iter().map(|s|json!({
         "id":s.id,"created_at":s.created_at,"db_bytes":s.db_bytes,"objects_bytes":s.objects_bytes,"objects":s.hashes.len()
@@ -309,7 +283,7 @@ pub fn create_within(home: &Path, wait: std::time::Duration) -> Result<Value> {
     };
     let mut repaired = 0u64;
     for hash in &hashes {
-        ensure!(hash_ok(hash), "原件地址无效");
+        ensure!(vault::is_hash(hash), "原件地址无效");
         let live = store.raw(hash)?;
         let raw = vault::verified(hash, &live)?;
         objects_bytes += raw.len() as u64;
@@ -340,7 +314,7 @@ pub fn create_within(home: &Path, wait: std::time::Duration) -> Result<Value> {
         }
     }
     new_bytes += flush(&mut batch)?;
-    let (db_hash, added) = put(&repo, &path, None)?;
+    let (db_hash, added) = put(&repo, &path)?;
     new_bytes += added;
     let s = Snapshot {
         version: 1,
@@ -364,15 +338,24 @@ pub fn create_within(home: &Path, wait: std::time::Duration) -> Result<Value> {
     pending
         .persist_noclobber(repo.join("snapshots").join(format!("{}.json", s.id)))
         .map_err(|e| e.error)?;
+    // 快照已发布即成功：自动清理出错（如降级后留有新版本快照）只作提示，
+    // 不能把这份快照记成失败，否则此后每次都"失败"且永不清理
     let (recent, monthly, auto) = configured_policy(home);
+    let mut cleanup_error = None;
     let cleaned = if auto {
-        let p = plan(&repo, recent, monthly)?;
-        apply_plan(&repo, &p)?
+        match plan(&repo, recent, monthly).and_then(|p| apply_plan(&repo, &p)) {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup_error = Some(e.to_string());
+                json!({"removed":0,"reclaimed_bytes":0})
+            }
+        }
     } else {
         json!({"removed":0,"reclaimed_bytes":0})
     };
     Ok(json!({"id":s.id,"new_objects":new_objects,"new_bytes":new_bytes,"repaired_objects":repaired,
-        "auto_removed":cleaned["removed"],"auto_reclaimed_bytes":cleaned["reclaimed_bytes"]}))
+        "auto_removed":cleaned["removed"],"auto_reclaimed_bytes":cleaned["reclaimed_bytes"],
+        "cleanup_error":cleanup_error}))
 }
 fn inspect_db(repo: &Path, s: &Snapshot, tmp: &Path) -> Result<()> {
     decode(repo, &s.db_hash, tmp)?;
@@ -530,15 +513,6 @@ pub fn cleanup(home: &Path, recent: usize, monthly: usize, token: &str) -> Resul
     cfg["snapshot_keep_monthly"] = json!(monthly);
     cfg["snapshot_auto_cleanup"] = json!(true);
     crate::ingest::write_config(home, &cfg)?;
-    let mut pending = tempfile::NamedTempFile::new_in(&repo)?;
-    serde_json::to_writer(
-        pending.as_file_mut(),
-        &json!({"keep_recent":recent,"keep_monthly":monthly,"auto_cleanup":true}),
-    )?;
-    pending.as_file().sync_all()?;
-    pending
-        .persist(repo.join("policy.json"))
-        .map_err(|e| e.error)?;
     Ok(result)
 }
 

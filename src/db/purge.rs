@@ -8,8 +8,8 @@ use crate::now_iso;
 /// 回收站默认保留期（§6）：软删后 30 天内拒绝物理清除。
 pub const TRASH_RETENTION_DAYS: i64 = 30;
 
-/// 物理清除预览（§6 双重确认的第一道：打印将删除的对象数与字节数）。
-pub fn purge_plan(conn: &Connection, home: &Path, session_id: &str) -> Result<Value> {
+/// 回收站状态：不在回收站 → None；在 → (deleted_at, 已删天数, 消息数)。
+fn trash_age(conn: &Connection, session_id: &str) -> Result<Option<(String, i64, i64)>> {
     let row: Option<(Option<String>, i64)> = conn
         .query_row(
             "SELECT deleted_at, message_count FROM sessions WHERE id = ?1",
@@ -20,16 +20,22 @@ pub fn purge_plan(conn: &Connection, home: &Path, session_id: &str) -> Result<Va
     let Some((deleted_at, messages)) = row else {
         anyhow::bail!("session not found: {session_id}");
     };
-    let Some(deleted_at) = deleted_at else {
+    let Some(deleted_at) = deleted_at else { return Ok(None) };
+    let deleted_ts = chrono::DateTime::parse_from_rfc3339(&deleted_at)
+        .context("invalid deleted_at")?
+        .with_timezone(&chrono::Utc);
+    let age_days = (chrono::Utc::now() - deleted_ts).num_days();
+    Ok(Some((deleted_at, age_days, messages)))
+}
+
+/// 物理清除预览（§6 双重确认的第一道：打印将删除的对象数与字节数）。
+pub fn purge_plan(conn: &Connection, home: &Path, session_id: &str) -> Result<Value> {
+    let Some((deleted_at, age_days, messages)) = trash_age(conn, session_id)? else {
         return Ok(json!({
             "session_id": session_id, "in_trash": false,
             "note": "会话不在回收站（先 session delete），物理清除只对回收站内容开放",
         }));
     };
-    let deleted_ts = chrono::DateTime::parse_from_rfc3339(&deleted_at)
-        .context("invalid deleted_at")?
-        .with_timezone(&chrono::Utc);
-    let age_days = (chrono::Utc::now() - deleted_ts).num_days();
     let overdue = age_days >= TRASH_RETENTION_DAYS;
     let (vault_lines, artifacts): (i64, i64) = conn.query_row(
         "SELECT (SELECT COUNT(*) FROM vault_lines WHERE session_id = ?1),
@@ -89,11 +95,13 @@ fn slug_session_id(session_id: &str) -> String {
 /// 主库与磁盘字节都不再保留；过程仍是先归档再删——中途崩溃只会留下本应被
 /// 删的档案，不会丢数据，残留目录可在设置页档案管理清理）。
 pub fn purge_session(conn: &mut Connection, home: &Path, session_id: &str, force: bool, drop_archive: bool) -> Result<Value> {
-    let plan = purge_plan(conn, home, session_id)?;
-    anyhow::ensure!(plan["in_trash"] == true, "会话不在回收站：{session_id}");
+    // 只读门控所需的两列；完整预览（独占对象全表扫描）由调用方按需取
+    let Some((_, age_days, _)) = trash_age(conn, session_id)? else {
+        anyhow::bail!("会话不在回收站：{session_id}");
+    };
     if !force {
-        anyhow::ensure!(plan["can_purge"] == true,
-            "保留期内：还剩 {} 天（回收站默认保留 {} 天）", plan["remaining_days"], TRASH_RETENTION_DAYS);
+        anyhow::ensure!(age_days >= TRASH_RETENTION_DAYS,
+            "保留期内：还剩 {} 天（回收站默认保留 {} 天）", TRASH_RETENTION_DAYS - age_days, TRASH_RETENTION_DAYS);
     }
 
     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f");
@@ -122,16 +130,8 @@ pub fn purge_session(conn: &mut Connection, home: &Path, session_id: &str, force
     }
     let removed_messages: i64 = tx.query_row(
         "SELECT COUNT(*) FROM messages WHERE session_id = ?1", params![session_id], |r| r.get(0))?;
-    // (c) 删行（FTS 触发器联动；session_links 两端清）
-    tx.execute("DELETE FROM messages WHERE session_id = ?1", params![session_id])?;
-    tx.execute("DELETE FROM vault_lines WHERE session_id = ?1", params![session_id])?;
-    tx.execute("DELETE FROM session_uuids WHERE session_id = ?1", params![session_id])?;
-    tx.execute("DELETE FROM session_artifacts WHERE session_id = ?1", params![session_id])?;
-    tx.execute(
-        "DELETE FROM session_links WHERE child_session_id = ?1 OR parent_session_id = ?1",
-        params![session_id],
-    )?;
-    tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+    // (c) 删行（FTS 触发器联动；session_links 两端清；记忆的消息指针置空）
+    crate::db::delete_session_data(&tx, session_id)?;
     // (d) 游标清 + 墓碑立（阻止 import 完整重导复活）。游标按 (agent, path)：
     // 同一路径可能还有别的 agent 在采，只清本会话所属 agent 的
     tx.execute(
@@ -204,9 +204,7 @@ fn rusqlite_value_to_json(v: rusqlite::types::Value) -> Value {
     }
 }
 
-/// 对象移入归档目录：优先 rename（同盘瞬时）；失败（备份位置与数据目录
-/// 跨盘，Windows 报 os error 17）退化为 copy_fallback。
-/// 先把对象按存储形态写进归档目录（tmp 再 rename，只以完整形态出现），
+/// 对象移入归档目录：先把对象按存储形态写进归档目录（tmp 再 rename，只以完整形态出现），
 /// 再从对象库删除；中途崩溃时对象仍在库里、gc_pending 仍在，下轮 sweep 重试，
 /// 不产生半截归档对象。
 fn archive_object(store: &crate::vault::Store, hash: &str, dst: &Path) -> Result<()> {
@@ -221,7 +219,8 @@ fn archive_object(store: &crate::vault::Store, hash: &str, dst: &Path) -> Result
 }
 
 /// 归档式 GC：处理整个 gc_pending 队列（本会话的候选已入队）——对每个
-/// hash 双重引用复查（vault_lines ∪ memory_revisions），无引用则移入
+/// hash 复查引用（vault_lines ∪ memory_revisions；调用方持导入锁，查后到移出
+/// 之间无写入），无引用则移入
 /// 备份目录（archive_object）并出队；有引用则保留
 /// 出队；对象已不在则直接出队（幂等）。
 fn archive_objects(conn: &Connection, home: &Path, backup_dir: &Path) -> Result<(u64, u64)> {
@@ -242,19 +241,6 @@ fn archive_objects(conn: &Connection, home: &Path, backup_dir: &Path) -> Result<
         )?;
         if referenced > 0 || !store.contains(&hash)? {
             if referenced > 0 { kept += 1; }
-            conn.execute("DELETE FROM gc_pending WHERE hash = ?1", params![hash])?;
-            continue;
-        }
-        // unlink 前最后一刻再查（archive_objects 无锁窗口的兜底；公共互斥由
-        // 调用方 ImportLockTx 提供，bundle merge 侧同样持锁——两侧都盖住）
-        let referenced_now: i64 = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM vault_lines WHERE hash = ?1)
-                + EXISTS(SELECT 1 FROM memory_revisions WHERE hash = ?1)",
-            params![hash],
-            |r| r.get(0),
-        )?;
-        if referenced_now > 0 {
-            kept += 1;
             conn.execute("DELETE FROM gc_pending WHERE hash = ?1", params![hash])?;
             continue;
         }
@@ -284,6 +270,11 @@ pub fn gc_sweep(conn: &Connection, home: &Path) -> Result<Value> {
     let dir = crate::backups_dir(home).join("purge").join(format!("sweep-{ts}"));
     std::fs::create_dir_all(&dir)?;
     let (removed, kept) = archive_objects(conn, home, &dir.join("objects"))?;
+    if removed == 0 {
+        // 待处理对象都仍被引用：没有归档内容，不留空目录
+        let _ = std::fs::remove_dir_all(&dir);
+        return Ok(json!({ "swept": 0, "kept_shared": kept }));
+    }
     Ok(json!({ "swept": removed, "kept_shared": kept, "backup_dir": dir }))
 }
 

@@ -25,12 +25,44 @@ pub const AGENT_ZCODE: &str = "zcode";
 pub const AGENT_KIMI: &str = "kimi";
 /// hermes：多端网关 agent（~/.hermes/state.db，SQLite 单库源，0.3.9 起）。
 /// cron 来源按 hermes 本人裁定不采（运行日志，非知识资产）。
-pub const AGENT_HERMES: &str = "hermes";
+pub use hermes::AGENT_HERMES;
 /// pi：树状 JSONL 文件型源（~/.pi/agent/sessions，2026-09-10 真机样本驱动）。
 pub const AGENT_PI: &str = "pi";
 
-pub fn supported_agents() -> [&'static str; 5] {
-    [AGENT_CLAUDE, AGENT_CODEX, AGENT_ZCODE, AGENT_KIMI, AGENT_PI]
+/// 单条消息正文上限（字符），超出截断并标注。
+const MAX_CONTENT: usize = 200_000;
+
+/// Claude 系写文件工具：`input.file_path` 即产物（claude/kimi/zcode 同口径）。
+pub(crate) const FILE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// epoch 毫秒 → RFC3339（毫秒精度，UTC）。
+pub(crate) fn ms_to_iso(ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ms).map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+pub(crate) fn truncate_chars(s: String, max: usize) -> String {
+    if s.chars().count() <= max {
+        s
+    } else {
+        format!("{}…[truncated]", s.chars().take(max).collect::<String>())
+    }
+}
+
+/// 截断后入账，空白正文跳过；ord = 该行内已有消息数。
+pub(crate) fn push_message(
+    out: &mut Vec<crate::models::NewMessage>,
+    line_no: u64,
+    kind: crate::models::MessageKind,
+    content: String,
+    timestamp: Option<String>,
+    uuid: Option<String>,
+) {
+    let content = truncate_chars(content, MAX_CONTENT);
+    if content.trim().is_empty() {
+        return;
+    }
+    let ord = out.iter().filter(|m| m.line_no == line_no).count() as u32;
+    out.push(crate::models::NewMessage { line_no, ord, kind, content, timestamp, uuid });
 }
 
 /// Recursively find `*.jsonl` session files under a source root.
@@ -95,16 +127,9 @@ pub fn native_id(agent: &str, path: &Path) -> String {
         let parent = path.parent().and_then(Path::file_name).map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         return format!("{parent}/{stem}");
     }
-    if agent == AGENT_CODEX && stem.len() > 36 {
-        // 用 get() 避免多字节字符落在切片边界上时 panic（防御式解析，永不 panic）。
-        if let Some(tail) = stem.get(stem.len() - 36..) {
-            if tail.chars().filter(|c| *c == '-').count() == 4 {
-                return tail.to_string();
-            }
-        }
-    }
-    if agent == AGENT_PI && stem.len() > 36 {
-        // pi 文件名 <时间戳>_<uuid>.jsonl：尾部 36 位即会话 uuid（与 codex 同法）
+    if (agent == AGENT_CODEX || agent == AGENT_PI) && stem.len() > 36 {
+        // 文件名 <前缀>_<uuid>.jsonl：尾部 36 位即会话 uuid。用 get() 避免多字节
+        // 字符落在切片边界上时 panic（防御式解析，永不 panic）。
         if let Some(tail) = stem.get(stem.len() - 36..) {
             if tail.chars().filter(|c| *c == '-').count() == 4 {
                 return tail.to_string();

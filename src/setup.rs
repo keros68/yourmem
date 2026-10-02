@@ -90,24 +90,27 @@ impl Targets {
     /// 真机格式读取，不能把“都是 JSON”误当成相同 schema。
     fn registered_mcp_command(&self, agent: &str) -> Option<String> {
         match agent {
-            "claude" => json_registered_command(&self.claude_json, "/mcpServers/yourmem/command"),
-            "zcode" => json_registered_command(&self.zcode_config, "/mcp/servers/yourmem/command"),
-            "kimi" => json_registered_command(&self.kimi_mcp, "/mcpServers/yourmem/command"),
-            "gemini" => json_registered_command(&self.gemini_settings, "/mcpServers/yourmem/command"),
-            "cursor" => json_registered_command(&self.cursor_mcp, "/mcpServers/yourmem/command"),
-            "hermes" => hermes_registered_command(&std::fs::read_to_string(&self.hermes_config).unwrap_or_default()),
+            "hermes" => hermes_block_value(&std::fs::read_to_string(&self.hermes_config).unwrap_or_default(), "command"),
             "codex" => codex_registered_command(&std::fs::read_to_string(&self.codex_config).unwrap_or_default()),
-            _ => None,
+            _ => json_registered_command(self.mcp_path(agent), &format!("{}/command", json_mcp_pointer(agent)?)),
+        }
+    }
+
+    /// 各 agent 的 MCP 配置文件。
+    fn mcp_path(&self, agent: &str) -> &Path {
+        match agent {
+            "claude" => &self.claude_json,
+            "codex" => &self.codex_config,
+            "zcode" => &self.zcode_config,
+            "kimi" => &self.kimi_mcp,
+            "gemini" => &self.gemini_settings,
+            "cursor" => &self.cursor_mcp,
+            _ => &self.hermes_config,
         }
     }
 
     fn mcp_entry_present(&self, agent: &str) -> bool {
         match agent {
-            "claude" => json_pointer_present(&self.claude_json, "/mcpServers/yourmem"),
-            "zcode" => json_pointer_present(&self.zcode_config, "/mcp/servers/yourmem"),
-            "kimi" => json_pointer_present(&self.kimi_mcp, "/mcpServers/yourmem"),
-            "gemini" => json_pointer_present(&self.gemini_settings, "/mcpServers/yourmem"),
-            "cursor" => json_pointer_present(&self.cursor_mcp, "/mcpServers/yourmem"),
             "codex" => std::fs::read_to_string(&self.codex_config)
                 .map(|s| s.lines().any(|line| {
                     let h = line.trim().split('#').next().unwrap_or("").trim();
@@ -115,10 +118,19 @@ impl Targets {
                 }))
                 .unwrap_or(false),
             "hermes" => std::fs::read_to_string(&self.hermes_config)
-                .map(|s| hermes_has_yourmem_block(&s))
+                .map(|s| hermes_block_range(&s.lines().collect::<Vec<_>>()).is_some())
                 .unwrap_or(false),
-            _ => false,
+            _ => json_mcp_pointer(agent).is_some_and(|p| json_pointer_present(self.mcp_path(agent), p)),
         }
+    }
+}
+
+/// JSON 型配置里 yourmem 条目的位置（claude/kimi/gemini/cursor 同为 mcpServers）。
+fn json_mcp_pointer(agent: &str) -> Option<&'static str> {
+    match agent {
+        "zcode" => Some("/mcp/servers/yourmem"),
+        "claude" | "kimi" | "gemini" | "cursor" => Some("/mcpServers/yourmem"),
+        _ => None,
     }
 }
 
@@ -130,19 +142,6 @@ fn json_pointer_present(path: &Path, pointer: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn hermes_has_yourmem_block(content: &str) -> bool {
-    let mut in_servers = false;
-    for line in content.lines() {
-        let indent = line.len() - line.trim_start().len();
-        if indent == 0 && !line.trim().is_empty() {
-            in_servers = line.trim() == "mcp_servers:";
-        } else if in_servers && indent == 2 && line.trim() == "yourmem:" {
-            return true;
-        }
-    }
-    false
-}
-
 fn json_registered_command(path: &Path, pointer: &str) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -151,39 +150,36 @@ fn json_registered_command(path: &Path, pointer: &str) -> Option<String> {
         .and_then(|v| v.as_str().map(str::to_string))
 }
 
-/// 从 config.yaml 文本里找 mcp_servers 段下 `  yourmem:` 块的 command 值
-/// （不引 YAML 解析器——hermes 的 config.yaml 有注释与手排结构，不能整体重写）。
-/// 层级按缩进识别：段键在列 0，会话名在 2 空格，属性在 4 空格。
-fn hermes_registered_command(content: &str) -> Option<String> {
+/// mcp_servers 段内 `  yourmem:` 块的行区间 [start, end)：段键在列 0，会话名在
+/// 2 空格，属性在 4 空格；段外同名键不算（不引 YAML 解析器——hermes 的
+/// config.yaml 有注释与手排结构，不能整体重写）。
+fn hermes_block_range<S: AsRef<str>>(lines: &[S]) -> Option<(usize, usize)> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let ms = lines.iter().position(|l| l.as_ref().starts_with("mcp_servers:"))?;
+    let section_end = (ms + 1..lines.len())
+        .find(|&i| {
+            let l = lines[i].as_ref();
+            indent(l) == 0 && !l.trim().is_empty() && !l.starts_with('#')
+        })
+        .unwrap_or(lines.len());
+    let start = (ms + 1..section_end)
+        .find(|&i| indent(lines[i].as_ref()) == 2 && lines[i].as_ref().trim() == "yourmem:")?;
+    let end = (start + 1..section_end)
+        .find(|&i| !lines[i].as_ref().trim().is_empty() && indent(lines[i].as_ref()) <= 2)
+        .unwrap_or(section_end);
+    Some((start, end))
+}
+
+/// yourmem 块里某个属性的值（去行尾注释与引号）。
+fn hermes_block_value(content: &str, key: &str) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
-    let ms = lines.iter().position(|l| {
-        !l.trim_start().starts_with('#') && l.starts_with("mcp_servers:")
-    })?;
-    let mut in_block = false;
-    for l in &lines[ms + 1..] {
-        let indent = l.len() - l.trim_start().len();
-        if l.trim().is_empty() {
-            continue;
-        }
-        if indent <= 2 {
-            // 回到段键或下一个同级键：yourmem 块结束
-            if in_block {
-                return None;
-            }
-            in_block = l.trim() == "yourmem:" && indent == 2;
-            continue;
-        }
-        if in_block && indent >= 4 {
-            if let Some((k, v)) = l.trim().split_once(':') {
-                if k.trim() == "command" {
-                    return Some(
-                        v.split('#').next().unwrap_or("").trim().trim_matches('"').trim_matches('\'').to_string(),
-                    );
-                }
-            }
-        }
-    }
-    None
+    let (s, e) = hermes_block_range(&lines)?;
+    lines[s + 1..e].iter().find_map(|l| {
+        let (k, v) = l.trim().split_once(':')?;
+        (k.trim() == key).then(|| {
+            v.split('#').next().unwrap_or("").trim().trim_matches('"').trim_matches('\'').to_string()
+        })
+    })
 }
 
 /// 表头识别容忍行尾注释：`[mcp_servers.yourmem] # 注释` 也是命中
@@ -266,15 +262,6 @@ fn mcp_status(cmd: Option<String>) -> (&'static str, Value) {
     }
 }
 
-/// 当前 exe 是否是 GUI app 本体：路径在 `.app/Contents/MacOS` 内，
-/// 或文件名主干是 `yourmem-app`（Tauri debug 产物名；NSIS 安装包主程序名
-/// 是 productName `yourmem.exe`，与 CLI 同名，无法靠文件名区分——见下）。
-#[allow(dead_code)]
-fn is_gui_bundle_exe(path: &Path) -> bool {
-    path.file_stem().map(|n| n == "yourmem-app").unwrap_or(false)
-        || path.to_string_lossy().contains(".app/Contents/MacOS")
-}
-
 /// 解析要注册进各 agent MCP 配置的二进制路径。
 /// 0.4.6 起桌面 app 本体直接兼任 agent 端点（main.rs 参数路由：`mcp` 进
 /// stdio 服务、`--version` 打印即退），所以任何场景下 current_exe 都是合法
@@ -286,7 +273,7 @@ pub fn resolve_cli_exe() -> Result<PathBuf> {
 }
 
 /// 门控要素 1：预览。返回每个 agent 的每个动作及其当前状态（done/todo/skip）。
-const SETUP_AGENTS: [&str; 7] = ["claude", "codex", "zcode", "kimi", "gemini", "cursor", "hermes"];
+pub const SETUP_AGENTS: [&str; 7] = ["claude", "codex", "zcode", "kimi", "gemini", "cursor", "hermes"];
 
 pub fn detected_setup_agents(targets: &Targets) -> Vec<Value> {
     SETUP_AGENTS
@@ -315,13 +302,7 @@ pub fn plan_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
         // 发现与覆盖规则未逐一验证，不在 setup 中猜路径写入。
         if matches!(agent, "zcode" | "kimi" | "gemini" | "cursor" | "hermes") {
             let (st, detail) = mcp_status(targets.registered_mcp_command(agent));
-            let path = match agent {
-                "zcode" => &targets.zcode_config,
-                "kimi" => &targets.kimi_mcp,
-                "gemini" => &targets.gemini_settings,
-                "cursor" => &targets.cursor_mcp,
-                _ => &targets.hermes_config,
-            };
+            let path = targets.mcp_path(agent);
             agents.push(json!({
                 "agent": agent,
                 "status": "detected",
@@ -333,16 +314,8 @@ pub fn plan_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
             }));
             continue;
         }
-        let (mcp_path, mcp_status_val) = match agent {
-            "claude" => {
-                let (st, detail) = mcp_status(targets.registered_mcp_command("claude"));
-                (targets.claude_json.clone(), json!({ "status": st, "detail": detail }))
-            }
-            _ => {
-                let (st, detail) = mcp_status(targets.registered_mcp_command("codex"));
-                (targets.codex_config.clone(), json!({ "status": st, "detail": detail }))
-            }
-        };
+        let mcp_path = targets.mcp_path(agent);
+        let (st, detail) = mcp_status(targets.registered_mcp_command(agent));
         let (md_path, md_status) = match agent {
             "claude" => (
                 targets.claude_md.clone(),
@@ -358,7 +331,7 @@ pub fn plan_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
             "status": "detected",
             "actions": [
                 { "kind": "register_mcp", "path": mcp_path,
-                  "status": mcp_status_val["status"], "detail": mcp_status_val["detail"] },
+                  "status": st, "detail": detail },
                 { "kind": "global_instructions", "path": md_path, "status": md_status,
                   "detail": if md_status == "stale" { json!("指令块是旧版本，重放会原位替换并保留你的其他内容") } else { Value::Null } },
             ],
@@ -396,9 +369,8 @@ pub fn execute_selected(targets: &Targets, selected: &[String]) -> Result<Value>
             let path = PathBuf::from(action["path"].as_str().unwrap_or_default());
             let kind = action["kind"].as_str().unwrap_or_default();
             match kind {
-                "register_mcp" if name == "claude" => register_claude_mcp(&path, &exe)?,
                 "register_mcp" if name == "zcode" => register_zcode_mcp(&path, &exe)?,
-                "register_mcp" if matches!(name.as_str(), "kimi" | "gemini" | "cursor") => register_mcp_servers_json(&path, &exe)?,
+                "register_mcp" if matches!(name.as_str(), "claude" | "kimi" | "gemini" | "cursor") => register_mcp_servers_json(&path, &exe)?,
                 "register_mcp" if name == "hermes" => register_hermes_mcp(&path, &exe)?,
                 "register_mcp" => register_codex_mcp(&path, &exe)?,
                 _ => write_instructions(&path)?,
@@ -431,16 +403,7 @@ pub fn remove_plan_selected(targets: &Targets, selected: &[String]) -> Result<Va
         }
         let mut actions = Vec::new();
         if targets.mcp_entry_present(agent) {
-            let path = match agent {
-                "claude" => &targets.claude_json,
-                "codex" => &targets.codex_config,
-                "zcode" => &targets.zcode_config,
-                "kimi" => &targets.kimi_mcp,
-                "gemini" => &targets.gemini_settings,
-                "cursor" => &targets.cursor_mcp,
-                _ => &targets.hermes_config,
-            };
-            actions.push(json!({"kind":"remove_mcp","path":path}));
+            actions.push(json!({"kind":"remove_mcp","path":targets.mcp_path(agent)}));
         }
         if agent == "claude" && instruction_block_present(&targets.claude_md) {
             actions.push(json!({"kind":"remove_instructions","path":targets.claude_md}));
@@ -572,15 +535,6 @@ fn remove_instructions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 追加式后缀，完整保留原文件名（`foo.md` → `foo.md.bak-…`）。
-/// 不能用 `with_extension`：它是替换最后一个扩展名，会把 `.md` 吃掉。
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".");
-    name.push(suffix);
-    path.with_file_name(name)
-}
-
 /// 写前备份 + 写 tmp 再 rename。返回 .bak 路径（若原件存在）。
 fn backup_then_write(path: &Path, content: &[u8]) -> Result<Option<PathBuf>> {
     let bak = if path.is_file() {
@@ -593,7 +547,7 @@ fn backup_then_write(path: &Path, content: &[u8]) -> Result<Option<PathBuf>> {
         }
         None
     };
-    let tmp = with_suffix(path, &format!("yourmem-tmp.{}", std::process::id()));
+    let tmp = crate::with_suffix(path, &format!("yourmem-tmp.{}", std::process::id()));
     std::fs::write(&tmp, content)?;
     std::fs::rename(&tmp, path)?;
     Ok(bak)
@@ -602,24 +556,6 @@ fn backup_then_write(path: &Path, content: &[u8]) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gui_bundle_exe_detection() {
-        // .app bundle 内路径
-        assert!(is_gui_bundle_exe(Path::new(
-            "/Applications/yourmem.app/Contents/MacOS/yourmem-app"
-        )));
-        assert!(is_gui_bundle_exe(Path::new(
-            "/Users/x/Applications/yourmem.app/Contents/MacOS/yourmem"
-        )));
-        // 文件名是 yourmem-app（即使不在 bundle 路径里也判 GUI）
-        assert!(is_gui_bundle_exe(Path::new("/usr/local/bin/yourmem-app")));
-        // 普通 CLI 路径
-        assert!(!is_gui_bundle_exe(Path::new("/usr/local/bin/yourmem")));
-        assert!(!is_gui_bundle_exe(Path::new(
-            "/Users/x/youmem/target/debug/yourmem"
-        )));
-    }
 
     #[test]
     fn instruction_marker_in_prose_is_not_a_block() {
@@ -640,19 +576,31 @@ mod tests {
     }
 
     #[test]
+    fn stale_block_upgrade_keeps_following_top_level_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("AGENTS.md");
+        std::fs::write(&p, format!("# 工作方式\nA\n\n## {INSTRUCTION_MARKER}\n旧版\n# 专项规则\n- foo\n")).unwrap();
+        write_instructions(&p).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(!out.contains("旧版"), "旧块被替换:\n{out}");
+        assert!(out.contains("# 专项规则\n- foo"), "其后的一级段落保留:\n{out}");
+        assert!(out.contains("# 工作方式\nA"), "{out}");
+    }
+
+    #[test]
     fn bak_and_tmp_names_keep_original_extension() {
         let p = Path::new("/tmp/x/foo.md");
         assert_eq!(
-            with_suffix(p, "bak-20260823-235959"),
+            crate::with_suffix(p, "bak-20260823-235959"),
             PathBuf::from("/tmp/x/foo.md.bak-20260823-235959")
         );
         assert_eq!(
-            with_suffix(p, "yourmem-tmp.123"),
+            crate::with_suffix(p, "yourmem-tmp.123"),
             PathBuf::from("/tmp/x/foo.md.yourmem-tmp.123")
         );
         // 无扩展名文件名同样完整保留
         assert_eq!(
-            with_suffix(Path::new("/tmp/x/session-abc"), "bak-1"),
+            crate::with_suffix(Path::new("/tmp/x/session-abc"), "bak-1"),
             PathBuf::from("/tmp/x/session-abc.bak-1")
         );
     }
@@ -674,6 +622,18 @@ mod tests {
     }
 
     #[test]
+    fn hermes_yourmem_key_outside_section_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.yaml");
+        std::fs::write(&p, "mcp_servers:\n  a:\n    command: x\nother:\n  yourmem:\n    foo: 1\n").unwrap();
+        assert_eq!(hermes_block_value(&std::fs::read_to_string(&p).unwrap(), "foo"), None);
+        register_hermes_mcp(&p, "/bin/yourmem").unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(out.contains("other:\n  yourmem:\n    foo: 1"), "段外键不动:\n{out}");
+        assert_eq!(hermes_block_value(&out, "command").as_deref(), Some("/bin/yourmem"));
+    }
+
+    #[test]
     fn hermes_mcp_appends_when_section_missing_and_replaces_stale() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.yaml");
@@ -683,7 +643,7 @@ mod tests {
         let out = std::fs::read_to_string(&p).unwrap();
         assert!(out.contains("mcp_servers:\n  yourmem:\n    command: /opt/homebrew/bin/yourmem"), "追加段缺失:\n{out}");
         assert!(out.starts_with("profile_name: default"), "用户原有内容不动:\n{out}");
-        assert_eq!(hermes_registered_command(&out).as_deref(), Some("/opt/homebrew/bin/yourmem"));
+        assert_eq!(hermes_block_value(&out, "command").as_deref(), Some("/opt/homebrew/bin/yourmem"));
 
         // 场景二：已有段与 stale 的 yourmem 块 → 原位替换，邻居完好
         std::fs::write(
@@ -696,7 +656,7 @@ mod tests {
         assert!(!out.contains("/old/yourmem-0.1.0"), "旧块应被替换:\n{out}");
         assert!(out.contains("chrome-devtools:") && out.contains("scansci-pdf:"), "邻居保留:\n{out}");
         assert!(out.contains("  scansci-pdf:"), "后邻块不得被吞:\n{out}");
-        assert_eq!(hermes_registered_command(&out).as_deref(), Some("/opt/homebrew/bin/yourmem"));
+        assert_eq!(hermes_block_value(&out, "command").as_deref(), Some("/opt/homebrew/bin/yourmem"));
 
         // 场景三：段存在但无 yourmem → 插入段键之后，不碰其他键
         std::fs::write(
@@ -840,14 +800,6 @@ fn read_json_config(path: &Path) -> Result<Value> {
     Ok(value)
 }
 
-/// Claude Code user-scope MCP 注册表：~/.claude.json 的 mcpServers。
-fn register_claude_mcp(path: &Path, exe: &str) -> Result<()> {
-    let mut v = read_json_config(path)?;
-    v["mcpServers"]["yourmem"] = json!({ "command": exe, "args": ["mcp"] });
-    backup_then_write(path, serde_json::to_string_pretty(&v)?.as_bytes())?;
-    Ok(())
-}
-
 /// ZCode 0.16.5：~/.zcode/cli/config.json 的 mcp.servers，stdio 需显式 type。
 fn register_zcode_mcp(path: &Path, exe: &str) -> Result<()> {
     let mut v = read_json_config(path)?;
@@ -861,7 +813,7 @@ fn register_zcode_mcp(path: &Path, exe: &str) -> Result<()> {
     Ok(())
 }
 
-/// Kimi Code、Gemini CLI 与 Cursor 的用户级 JSON 配置均使用 mcpServers。
+/// Claude Code（~/.claude.json）、Kimi Code、Gemini CLI 与 Cursor 的用户级 JSON 配置均使用 mcpServers。
 fn register_mcp_servers_json(path: &Path, exe: &str) -> Result<()> {
     let mut v = read_json_config(path)?;
     v["mcpServers"]["yourmem"] = json!({ "command": exe, "args": ["mcp"] });
@@ -911,7 +863,7 @@ fn register_codex_mcp(path: &Path, exe: &str) -> Result<()> {
 fn register_hermes_mcp(path: &Path, exe: &str) -> Result<()> {
     let content = std::fs::read_to_string(path).unwrap_or_default();
     // 旧块里是否有关闭的 enabled：保留用户意图
-    let enabled = hermes_registered_enabled(&content).unwrap_or(true);
+    let enabled = hermes_block_value(&content, "enabled").map_or(true, |v| v == "true");
     let block = format!(
         "  yourmem:\n    command: {exe}\n    args:\n      - mcp\n    enabled: {enabled}"
     );
@@ -942,10 +894,7 @@ fn register_hermes_mcp(path: &Path, exe: &str) -> Result<()> {
             s
         }
         Some(ms) => {
-            match lines.iter().position(|l| {
-                let indent = l.len() - l.trim_start().len();
-                !l.trim().is_empty() && indent == 2 && l.trim() == "yourmem:"
-            }) {
+            match hermes_block_range(&lines) {
                 None => {
                     // 段存在、yourmem 未注册：插在段键之后（她的子键排前面也没关系，
                     // YAML 映射无序）
@@ -958,16 +907,8 @@ fn register_hermes_mcp(path: &Path, exe: &str) -> Result<()> {
                     }
                     out.join("\n") + "\n"
                 }
-                Some(pos) => {
-                    // yourmem 已在：原位替换到下一个 ≤2 空格缩进的非空行（或 EOF）
-                    let mut end = lines.len();
-                    for (i, l) in lines.iter().enumerate().skip(pos + 1) {
-                        let indent = l.len() - l.trim_start().len();
-                        if !l.trim().is_empty() && indent <= 2 {
-                            end = i;
-                            break;
-                        }
-                    }
+                Some((pos, end)) => {
+                    // yourmem 已在：原位替换到下一个 ≤2 空格缩进的非空行（或段尾）
                     lines.splice(pos..end, block.lines().map(str::to_string).collect::<Vec<_>>());
                     lines.join("\n") + "\n"
                 }
@@ -976,36 +917,6 @@ fn register_hermes_mcp(path: &Path, exe: &str) -> Result<()> {
     };
     backup_then_write(path, new_content.as_bytes())?;
     Ok(())
-}
-
-/// 读 yourmem 块里现有的 enabled 值（true/false）；没有或读不出 → None（调用方默认 true）。
-fn hermes_registered_enabled(content: &str) -> Option<bool> {
-    let lines: Vec<&str> = content.lines().collect();
-    let ms = lines.iter().position(|l| {
-        !l.trim_start().starts_with('#') && l.starts_with("mcp_servers:")
-    })?;
-    let mut in_block = false;
-    for l in &lines[ms + 1..] {
-        let indent = l.len() - l.trim_start().len();
-        if l.trim().is_empty() {
-            continue;
-        }
-        if indent <= 2 {
-            if in_block {
-                return None;
-            }
-            in_block = l.trim() == "yourmem:" && indent == 2;
-            continue;
-        }
-        if in_block && indent >= 4 {
-            if let Some((k, v)) = l.trim().split_once(':') {
-                if k.trim() == "enabled" {
-                    return Some(v.split('#').next().unwrap_or("").trim() == "true");
-                }
-            }
-        }
-    }
-    None
 }
 
 /// 写全局指令块：无 marker 追加；有 marker 但非当前全文（stale）→ 旧块整体
@@ -1020,9 +931,12 @@ fn write_instructions(path: &Path) -> Result<()> {
         .find(|&s| content[s..].starts_with("## "));
     let out = match block_line {
         Some(start) if !content.contains(INSTRUCTION_BLOCK.trim()) => {
-            let end = content[start..]
-                .find("\n## ")
-                .map(|i| start + i)
+            // 块止于下一个同级或更高级标题（`# ` 也算，否则会吞掉用户的一级段落）
+            let first = content[start..].find('\n').map_or(content.len(), |i| start + i);
+            let end = content[first..]
+                .match_indices('\n')
+                .map(|(i, _)| first + i)
+                .find(|&i| heading_level(&content[i + 1..]).is_some_and(|n| n <= 2))
                 .unwrap_or(content.len());
             let mut s = String::with_capacity(content.len() + INSTRUCTION_BLOCK.len());
             s.push_str(&content[..start]);
