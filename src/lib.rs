@@ -21,6 +21,7 @@ pub mod memfiles;
 pub mod models;
 pub mod restore;
 pub mod recall_status;
+pub mod project_docs;
 pub mod project_review;
 pub mod setup;
 pub mod snapshots;

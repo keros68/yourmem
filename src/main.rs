@@ -101,6 +101,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MemoryFilesCmd,
     },
+    /// 项目文档跟踪（CLAUDE.md / AGENTS.md / PROGRESS.md / HANDOFF.md / MEMORY.md + 手动登记）：
+    /// 无子命令 = 查看最后更新、写过它的对话与过时提示。
+    Docs {
+        #[command(subcommand)]
+        cmd: Option<DocsCmd>,
+        /// Project name or path fragment (default: current directory's project).
+        #[arg(long, global = true)]
+        project: Option<String>,
+    },
     /// Files produced by sessions (from file-writing tool calls).
     Artifacts {
         #[arg(long)]
@@ -354,6 +363,14 @@ enum MemoryFilesCmd {
 }
 
 #[derive(Subcommand)]
+enum DocsCmd {
+    /// 登记一个项目内文件为进度文档（相对项目根目录的路径，或项目内的绝对路径）。
+    Track { path: String },
+    /// 取消登记。已备份的修订保留。
+    Untrack { path: String },
+}
+
+#[derive(Subcommand)]
 enum HandoffCmd {
     Create {
         #[arg(long)]
@@ -524,6 +541,7 @@ fn main() -> Result<()> {
         Cmd::Digest { .. } => "digest",
         Cmd::Memory { .. } => "memory",
         Cmd::MemoryFiles { .. } => "memory-files",
+        Cmd::Docs { .. } => "docs",
         Cmd::Artifacts { .. } => "artifacts",
         Cmd::Handoff { .. } => "handoff",
         Cmd::Backup { .. } => "backup",
@@ -625,6 +643,7 @@ fn main() -> Result<()> {
             let (pid, ..) = db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
             let mut d = db::project_context(&conn, pid)?;
             d["source_review"] = yourmem::project_review::status(&conn, &home, pid)?;
+            d["project_docs"] = yourmem::project_docs::attach(&conn, &home, pid);
             if markdown {
                 write_stdout(&yourmem::dossier::render_context_markdown(&d));
             } else {
@@ -636,7 +655,8 @@ fn main() -> Result<()> {
             let conn = db::open(&home)?;
             let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
             let (pid, ..) = db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
-            let d = yourmem::dossier::project_dossier(&conn, pid)?;
+            let mut d = yourmem::dossier::project_dossier(&conn, pid)?;
+            d["project_docs"] = yourmem::project_docs::attach(&conn, &home, pid);
             if markdown || out.is_some() {
                 let md = yourmem::dossier::render_markdown(&d);
                 match out {
@@ -646,6 +666,17 @@ fn main() -> Result<()> {
             } else {
                 print_json(&d);
             }
+        }
+
+        Cmd::Docs { cmd, project } => {
+            let conn = db::open(&home)?;
+            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+            let (pid, ..) = db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
+            print_json(&match cmd {
+                None => yourmem::project_docs::status(&conn, &home, pid)?,
+                Some(DocsCmd::Track { path }) => yourmem::project_docs::track(&conn, &home, pid, &path)?,
+                Some(DocsCmd::Untrack { path }) => yourmem::project_docs::untrack(&conn, &home, pid, &path)?,
+            });
         }
 
         Cmd::Digest { day, markdown } => {

@@ -189,7 +189,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_uuid ON messages(uuid) WHERE uuid IS NOT
 -- rewritten in place, so the vault object stores the file's full bytes.
 CREATE TABLE IF NOT EXISTS memory_files (
   id INTEGER PRIMARY KEY,
-  agent TEXT NOT NULL,                  -- claude / codex / manual
+  agent TEXT NOT NULL,                  -- claude / codex / doc（项目进度文档）
   scope TEXT NOT NULL DEFAULT 'global', -- global | project:<project root>
   path TEXT NOT NULL,                   -- absolute path of the live file
   current_hash TEXT NOT NULL,
@@ -562,7 +562,7 @@ const PATH_KEY_SQL: &str = if cfg!(windows) {
     "path"
 };
 
-fn path_key(path: &str) -> String {
+pub fn path_key(path: &str) -> String {
     if cfg!(windows) {
         // 与 SQLite lower() 一致：只转 ASCII 字母
         path.trim_end_matches(['/', '\\']).replace('/', "\\").to_ascii_lowercase()
@@ -952,9 +952,10 @@ pub fn set_tool_index(home: &Path, conn: &Connection, full: bool) -> Result<Valu
         disable_tool_index(conn)?;
         conn.execute_batch("VACUUM")?;
     }
-    let mut cfg = crate::ingest::read_config(home);
-    cfg[CFG_TOOL_INDEX] = json!(full);
-    crate::ingest::write_config(home, &cfg)?;
+    crate::ingest::update_config(home, |cfg| {
+        cfg[CFG_TOOL_INDEX] = json!(full);
+        Ok(())
+    })?;
     index_status(conn)
 }
 

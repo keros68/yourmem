@@ -5,7 +5,8 @@
 //! session JSONL these are small files rewritten in place, so we snapshot the
 //! whole file into the vault and keep a revision history. Backup only — the
 //! semantic layer never parses them, and they are presented separately from
-//! the curated `memories` table.
+//! the curated `memories` table. Project-root progress documents (PROGRESS.md,
+//! HANDOFF.md…, see `project_docs`) are backed up through the same path.
 
 use std::path::{Path, PathBuf};
 
@@ -65,7 +66,7 @@ fn claude_project_encodings(cwd: &str) -> Vec<String> {
 /// discovered from imported sessions' cwd (never a proactive disk scan).
 /// OpenCode: 本机实测其配置目录只有 json 配置、无 markdown 形态的 memory/
 /// instruction 文件，无可备份对象，暂不监控（DESIGN-0.3 §2.2 "实施时确认"的结论）。
-fn discover_targets(conn: &Connection, dirs: &SourceDirs) -> Result<Vec<(String, String, PathBuf)>> {
+fn discover_targets(conn: &Connection, home: &Path, dirs: &SourceDirs) -> Result<Vec<(String, String, PathBuf)>> {
     let mut targets: Vec<(String, String, PathBuf)> = Vec::new(); // (agent, scope, path)
 
     for (agent, path) in [
@@ -85,18 +86,22 @@ fn discover_targets(conn: &Connection, dirs: &SourceDirs) -> Result<Vec<(String,
     let cwds: Vec<String> = stmt
         .query_map([], |r| r.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut roots: Vec<String> = Vec::new();
     for cwd in cwds {
         let (root, _) = db::project_root_for(&cwd);
         let scope = format!("project:{root}");
+        if !roots.iter().any(|r| db::path_key(r) == db::path_key(&root)) {
+            roots.push(root.clone());
+        }
 
         let project_claude_md = Path::new(&cwd).join("CLAUDE.md");
-        if project_claude_md.is_file() {
+        if project_claude_md.is_file() && crate::project_docs::inside_root(Path::new(&cwd), &project_claude_md) {
             targets.push((crate::adapters::AGENT_CLAUDE.to_string(), scope.clone(), project_claude_md));
         }
 
         // Codex project instructions use AGENTS.md, independently of CLAUDE.md.
         let project_agents = Path::new(&cwd).join("AGENTS.md");
-        if project_agents.is_file() {
+        if project_agents.is_file() && crate::project_docs::inside_root(Path::new(&cwd), &project_agents) {
             targets.push((crate::adapters::AGENT_CODEX.to_string(), scope.clone(), project_agents));
         }
 
@@ -117,6 +122,29 @@ fn discover_targets(conn: &Connection, dirs: &SourceDirs) -> Result<Vec<(String,
         }
     }
 
+    // 项目根目录：在子目录里开的对话也要覆盖根目录的指令与进度文档；
+    // 手动登记的文档不依赖对话 cwd，按登记的项目路径直接加入。
+    // 手动添加、尚无对话的项目同样覆盖。
+    let tracked = crate::project_docs::tracked(home);
+    let mut stmt = conn.prepare("SELECT path FROM projects WHERE archived_at IS NULL")?;
+    let project_paths: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for project in project_paths.into_iter().chain(tracked.iter().map(|(p, _)| p.clone())) {
+        if !roots.iter().any(|r| db::path_key(r) == db::path_key(&project)) {
+            roots.push(project);
+        }
+    }
+    for root in roots {
+        let scope = format!("project:{root}");
+        for (agent, path, _) in crate::project_docs::root_candidates(&tracked, &root) {
+            if path.is_file() {
+                targets.push((agent, scope.clone(), path));
+            }
+        }
+    }
+
+    // 按原路径串去重：库里同一文件若已有不同拼写的多行，各行照常更新，不让某一行停在旧内容
     targets.sort_by(|a, b| a.2.cmp(&b.2));
     targets.dedup_by(|a, b| a.2 == b.2);
     Ok(targets)
@@ -127,10 +155,17 @@ fn discover_targets(conn: &Connection, dirs: &SourceDirs) -> Result<Vec<(String,
 /// maintaining mtime/size state — simpler and immune to mtime games.
 pub fn collect(conn: &Connection, home: &Path, dirs: &SourceDirs) -> Result<MemfilesOutcome> {
     let mut out = MemfilesOutcome::default();
-    // 停用的 agent 不再采集任何内容，包括它的原生记忆文件
     let off = crate::ingest::disabled_agents(home);
-    for (agent, scope, path) in discover_targets(conn, dirs)? {
-        if off.iter().any(|a| *a == agent) {
+    for (agent, scope, path) in discover_targets(conn, home, dirs)? {
+        // 项目目录里的文档（CLAUDE.md、AGENTS.md、进度文档）由多个 agent 共用，
+        // 不随单个 agent 停用而停止备份；停用只影响全局文件与 agent 自己的记忆目录
+        // （~/.claude/projects 下的自动记忆）。项目本身位于 agent 配置目录内也按项目处理。
+        let in_project = scope.starts_with("project:") && !path.starts_with(dirs.claude.join("projects"));
+        if !in_project && off.iter().any(|a| *a == agent) {
+            continue;
+        }
+        if std::fs::metadata(&path).map_or(false, |m| m.len() > crate::project_docs::MAX_DOC_BYTES) {
+            eprintln!("yourmem memfiles: 跳过超过 1 MiB 的 {}", path.display());
             continue;
         }
         out.files_monitored += 1;

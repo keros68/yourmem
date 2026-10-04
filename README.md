@@ -102,6 +102,8 @@ yourmem watch --interval 5             # 持续采集
 yourmem search "关键词"                 # 跨来源全文搜索
 yourmem context [项目名]                # 读取项目上下文
 yourmem dossier [项目名] --markdown     # 导出项目卷宗
+yourmem docs [--project 项目名]         # 查看项目文档的更新情况与过时提示
+yourmem docs track docs/plan.md         # 跟踪其他进度文档
 yourmem session trash                  # 查看回收站
 yourmem memory add --type decision --content "结论"
 yourmem backup db                      # 创建数据库快照

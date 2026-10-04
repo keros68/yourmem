@@ -120,14 +120,29 @@ fn open_in_finder(path: String, reveal: Option<bool>) -> Result<Value, String> {
 
 #[tauri::command]
 fn context(project_id: i64) -> Result<Value, String> {
-    db::project_context(&open()?, project_id).map_err(|e| e.to_string())
+    let conn = open()?;
+    let mut d = db::project_context(&conn, project_id).map_err(|e| e.to_string())?;
+    d["project_docs"] = yourmem::project_docs::attach(&conn, &data_home(), project_id);
+    Ok(d)
 }
 
 #[tauri::command]
 fn project_dossier(project_id: i64) -> Result<Value, String> {
     let conn = open()?;
     let _ = db::log_usage(&conn, "app", "dossier");
-    yourmem::dossier::project_dossier(&conn, project_id).map_err(|e| e.to_string())
+    let mut d = yourmem::dossier::project_dossier(&conn, project_id).map_err(|e| e.to_string())?;
+    d["project_docs"] = yourmem::project_docs::attach(&conn, &data_home(), project_id);
+    Ok(d)
+}
+
+#[tauri::command]
+fn project_doc_track(project_id: i64, path: String) -> Result<Value, String> {
+    yourmem::project_docs::track(&open()?, &data_home(), project_id, &path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn project_doc_untrack(project_id: i64, path: String) -> Result<Value, String> {
+    yourmem::project_docs::untrack(&open()?, &data_home(), project_id, &path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -436,9 +451,10 @@ fn auto_purge_get() -> Result<Value, String> {
 #[tauri::command]
 fn auto_purge_set(enabled: bool) -> Result<Value, String> {
     let home = data_home();
-    let mut cfg = yourmem::ingest::read_config(&home);
-    cfg["auto_purge_trash"] = json!(enabled);
-    yourmem::ingest::write_config(&home, &cfg).map_err(|e| e.to_string())?;
+    yourmem::ingest::update_config(&home, |cfg| {
+        cfg["auto_purge_trash"] = json!(enabled);
+        Ok(())
+    }).map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true, "auto_purge_trash": enabled }))
 }
 
@@ -1237,7 +1253,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            session_window, message_content, maintenance_status, collect_progress, memory_add, stats, projects, context, project_dossier, daily_digest, daily_digest_export, sessions,
+            session_window, message_content, maintenance_status, collect_progress, memory_add, stats, projects, context, project_dossier, project_doc_track, project_doc_untrack, daily_digest, daily_digest_export, sessions,
             ai_settings_get, ai_settings_save, ai_organize_day, ai_summary_save,
             project_add, project_archive, project_restore, open_in_finder,
             session_proof, session_verify, session_export, session_writeback_plan,

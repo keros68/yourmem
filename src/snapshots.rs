@@ -508,11 +508,12 @@ pub fn cleanup(home: &Path, recent: usize, monthly: usize, token: &str) -> Resul
         "备份已变化，请重新预览清理计划"
     );
     let result = apply_plan(&repo, &p)?;
-    let mut cfg = crate::ingest::read_config(home);
-    cfg["snapshot_keep_recent"] = json!(recent);
-    cfg["snapshot_keep_monthly"] = json!(monthly);
-    cfg["snapshot_auto_cleanup"] = json!(true);
-    crate::ingest::write_config(home, &cfg)?;
+    crate::ingest::update_config(home, |cfg| {
+        cfg["snapshot_keep_recent"] = json!(recent);
+        cfg["snapshot_keep_monthly"] = json!(monthly);
+        cfg["snapshot_auto_cleanup"] = json!(true);
+        Ok(())
+    })?;
     Ok(result)
 }
 

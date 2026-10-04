@@ -439,12 +439,40 @@ async function showProject(pid) {
   const handoffRows = (d.handoffs || []).map((h) => `
     <div class="memcard"><div class="content"><b>${esc(h.title)}</b>${h.next_steps ? `<br>下一步：${esc(h.next_steps)}` : ""}</div>
     <div class="meta">${fmtTime(h.created_at)} ${srcLink(h.session_id)}</div></div>`).join("");
+  // 项目文档：最后更新、写过它的对话与过时提示（只提示，不改文档）
+  const pdocs = d.project_docs || { docs: [] };
+  const docRows = pdocs.docs.map((doc) => {
+    const edited = doc.edited_by.length
+      ? `写入对话 ${doc.edited_by.map((e) => `<span class="src" data-src="${esc(e.session_id)}" title="${esc(e.session_id)}">${fmtTime(e.at)} ↗</span>`).join(" ")}${doc.edited_by_total > doc.edited_by.length ? ` 等 ${doc.edited_by_total} 段` : ""}`
+      : "暂无对应对话";
+    const state = doc.exists
+      ? `最后更新 ${fmtTime(doc.last_updated)} · 此后 ${doc.sessions_since} 段对话`
+      : "文件不存在";
+    const backup = doc.too_large
+      ? "<span>文件超过 1 MiB，不备份</span>"
+      : doc.file_id != null
+        ? `<span class="src" data-mfid="${doc.file_id}">修订 ${doc.revisions} ↗</span>`
+        : "<span>下次采集后开始备份</span>";
+    // .content 保留空白换行，标签之间不能留模板缩进
+    const tags = [
+      doc.stale ? '<span class="pill stale" title="此后对话较多或长期未更新">可能已过时</span>' : "",
+      doc.manual ? `<button class="btn small" data-doc-untrack="${esc(doc.name)}">取消跟踪</button>` : "",
+    ].filter(Boolean).join(" ");
+    return `<div class="memcard"><div class="content"><code>${esc(doc.name)}</code>${tags ? ` ${tags}` : ""}</div>`
+      + `<div class="meta"><span>${state}</span> ${backup} <span>${edited}</span></div></div>`;
+  }).join("");
   openDrawer(`
     <h1 style="font-size:16px">卷宗 · ${esc(d.project)}</h1>
     <div class="lineage">${esc(d.path)} · 活跃 ${fmtTime(o.first_activity)} → ${fmtTime(o.last_activity)} ·
       ${o.sessions} 对话 · ${o.messages} 消息 · ${o.agents} 种 agent</div>
     <h2>继续工作</h2><div id="project-continuation">加载中…</div>
     <h2>来源复查</h2><div class="memcard" id="project-review">检测中…</div>
+    <h2>项目文档（${pdocs.docs.length}）</h2>
+    <div class="scrollbox tight">${docRows || '<div class="empty">暂无项目文档</div>'}</div>
+    <div style="display:flex;margin-top:6px;gap:6px">
+      <input type="text" class="filter-input" id="doc-track-path" style="flex:1;min-width:0" placeholder="跟踪其他文件：输入相对项目目录的路径，如 docs/plan.md" />
+      <button class="btn small" id="doc-track">跟踪</button>
+    </div>
     <h2>决策板（活跃 ${decs.filter((m) => m.status === "confirmed").length} / 历史 ${decs.length}）</h2>
     <div class="scrollbox">${decisionRows + orphanSuperseded || '<div class="empty">暂无决策/规则记忆</div>'}</div>
     <h2>时间线（${(d.timeline || []).length}）</h2>
@@ -460,6 +488,21 @@ async function showProject(pid) {
   `, request);
   document.querySelectorAll("#drawer-content tr[data-sid]").forEach((tr) => {
     tr.onclick = () => showSession(tr.dataset.sid);
+  });
+  document.querySelectorAll("#drawer-content [data-mfid]").forEach((el) => {
+    el.onclick = () => showMemoryFile(+el.dataset.mfid);
+  });
+  const trackDoc = async (cmd, path) => {
+    try {
+      await invoke(cmd, { projectId: pid, path });
+      toast(cmd === "project_doc_track" ? "已跟踪，下次采集后开始备份" : "已取消跟踪");
+      showProject(pid);
+    } catch (e) { toast(String(e)); }
+  };
+  $("#doc-track").onclick = () => trackDoc("project_doc_track", $("#doc-track-path").value);
+  $("#doc-track-path").onkeydown = (e) => { if (e.key === "Enter") $("#doc-track").click(); };
+  document.querySelectorAll("#drawer-content [data-doc-untrack]").forEach((b) => {
+    b.onclick = () => trackDoc("project_doc_untrack", b.dataset.docUntrack);
   });
   // 谱系图节点可点（跨项目父节点 .ext 只有 id，无数据不可点）+ 当前节点滚入视口
   afterGraphRender("#drawer-content");

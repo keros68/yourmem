@@ -134,12 +134,15 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
             let (pid, ..) = db::require_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?;
             let mut context = db::project_context(&conn, pid)?;
             context["source_review"] = crate::project_review::status(&conn, home, pid)?;
+            context["project_docs"] = crate::project_docs::attach(&conn, home, pid);
             Ok(context)
         }
 
         "get_dossier" => {
             let (pid, ..) = db::require_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?;
-            crate::dossier::project_dossier(&conn, pid)
+            let mut d = crate::dossier::project_dossier(&conn, pid)?;
+            d["project_docs"] = crate::project_docs::attach(&conn, home, pid);
+            Ok(d)
         }
 
         "search_history" => {

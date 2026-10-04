@@ -166,6 +166,28 @@ pub fn write_config(home: &Path, cfg: &Value) -> Result<()> {
     Ok(())
 }
 
+/// 修改 config.json 的唯一入口：持配置锁（跨进程互斥，防桌面端与 CLI 并发改写时
+/// 丢更新）→ 严格读取（文件存在但不是合法 JSON 对象时报错，不拿空对象覆盖用户设置）
+/// → 修改 → tmp+rename 写回。首次创建（无文件）按空对象起步。
+pub fn update_config<T>(home: &Path, f: impl FnOnce(&mut Value) -> Result<T>) -> Result<T> {
+    std::fs::create_dir_all(home)?;
+    let _lock = ImportLockTx::acquire_file(&home.join(".config.lock.db"), std::time::Duration::from_secs(5))?;
+    let path = home.join("config.json");
+    let mut cfg = match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let v: Value = serde_json::from_str(&text)
+                .map_err(|e| anyhow::anyhow!("config.json 无法解析，未写入（请修复或删除该文件）：{e}"))?;
+            anyhow::ensure!(v.is_object(), "config.json 不是 JSON 对象，未写入（请修复或删除该文件）");
+            v
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(e.into()),
+    };
+    let out = f(&mut cfg)?;
+    write_config(home, &cfg)?;
+    Ok(out)
+}
+
 /// config.json 里登记的自定义根（agent, path）。文件缺失/损坏按空处理。
 pub fn extra_roots(home: &Path) -> Vec<(String, PathBuf)> {
     read_config(home)["extra_roots"].as_array().cloned().unwrap_or_default()
@@ -201,18 +223,20 @@ pub fn set_agent_disabled(home: &Path, agent: &str, disabled: bool) -> Result<Va
         is_file_agent(agent) || [adapters::opencode::AGENT_OPENCODE, adapters::hermes::AGENT_HERMES].contains(&agent),
         "unknown agent: {agent}"
     );
-    let mut cfg = read_config(home);
-    let mut list: Vec<String> = disabled_agents(home);
-    if disabled {
-        if !list.iter().any(|a| a == agent) {
-            list.push(agent.to_string());
+    update_config(home, |cfg| {
+        let mut list: Vec<String> = cfg["disabled_agents"].as_array().cloned().unwrap_or_default()
+            .into_iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        if disabled {
+            if !list.iter().any(|a| a == agent) {
+                list.push(agent.to_string());
+            }
+        } else {
+            list.retain(|a| a != agent);
         }
-    } else {
-        list.retain(|a| a != agent);
-    }
-    list.sort();
-    cfg["disabled_agents"] = json!(list);
-    write_config(home, &cfg)?;
+        list.sort();
+        cfg["disabled_agents"] = json!(list);
+        Ok(())
+    })?;
     Ok(json!({ "ok": true, "agent": agent, "disabled": disabled }))
 }
 
@@ -233,28 +257,29 @@ pub fn add_extra_root(home: &Path, agent: &str, path: &Path) -> Result<Value> {
     anyhow::ensure!(is_file_agent(agent),
         "unsupported agent for extra root: {agent}（opencode 是单库源，用 YOUMEM_OPENCODE_DB 覆盖）");
     anyhow::ensure!(path.is_dir(), "not a directory: {}", path.display());
-    let mut cfg = read_config(home);
-    let mut roots = cfg["extra_roots"].as_array().cloned().unwrap_or_default();
     let p = path.to_string_lossy().to_string();
-    anyhow::ensure!(!roots.iter().any(|r| r["agent"] == agent && r["path"] == p),
-        "extra root already registered: {agent} {p}");
-    roots.push(json!({ "agent": agent, "path": p }));
-    cfg["extra_roots"] = Value::Array(roots);
-    write_config(home, &cfg)?;
-    Ok(json!({ "ok": true, "extra_roots": cfg["extra_roots"] }))
+    let roots = update_config(home, |cfg| {
+        let mut roots = cfg["extra_roots"].as_array().cloned().unwrap_or_default();
+        anyhow::ensure!(!roots.iter().any(|r| r["agent"] == agent && r["path"] == p),
+            "extra root already registered: {agent} {p}");
+        roots.push(json!({ "agent": agent, "path": p }));
+        cfg["extra_roots"] = Value::Array(roots);
+        Ok(cfg["extra_roots"].clone())
+    })?;
+    Ok(json!({ "ok": true, "extra_roots": roots }))
 }
 
 pub fn remove_extra_root(home: &Path, agent: &str, path: &Path) -> Result<Value> {
-    let mut cfg = read_config(home);
-    let roots = cfg["extra_roots"].as_array().cloned().unwrap_or_default();
     let p = path.to_string_lossy().to_string();
-    let kept: Vec<Value> = roots.into_iter()
-        .filter(|r| !(r["agent"] == agent && r["path"] == p)).collect();
-    anyhow::ensure!(kept.len() < cfg["extra_roots"].as_array().map_or(0, Vec::len),
-        "extra root not found: {agent} {p}");
-    cfg["extra_roots"] = Value::Array(kept);
-    write_config(home, &cfg)?;
-    Ok(json!({ "ok": true, "extra_roots": cfg["extra_roots"] }))
+    let roots = update_config(home, |cfg| {
+        let roots = cfg["extra_roots"].as_array().cloned().unwrap_or_default();
+        let kept: Vec<Value> = roots.iter()
+            .filter(|r| !(r["agent"] == agent && r["path"] == p)).cloned().collect();
+        anyhow::ensure!(kept.len() < roots.len(), "extra root not found: {agent} {p}");
+        cfg["extra_roots"] = Value::Array(kept);
+        Ok(cfg["extra_roots"].clone())
+    })?;
+    Ok(json!({ "ok": true, "extra_roots": roots }))
 }
 
 /// 七源检测（app 设置页 / `agents` CLI）：默认根是否存在、库里各 agent 的
@@ -746,8 +771,12 @@ pub struct ImportLockTx {
 
 impl ImportLockTx {
     pub fn acquire(home: &Path, max_wait: std::time::Duration) -> Result<ImportLockTx> {
-        let lock_db = home.join(".import.lock.db");
-        let conn = rusqlite::Connection::open(&lock_db)?;
+        Self::acquire_file(&home.join(".import.lock.db"), max_wait)
+    }
+
+    /// 同一机制的其他锁（如配置锁）用独立锁库，互不阻塞。
+    pub fn acquire_file(lock_db: &Path, max_wait: std::time::Duration) -> Result<ImportLockTx> {
+        let conn = rusqlite::Connection::open(lock_db)?;
         conn.busy_timeout(max_wait)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS import_lock(x INTEGER)",
@@ -862,5 +891,29 @@ mod tests {
         // 释放后可立即获取（drop 回滚写事务，锁即时释放——无残留清理）
         drop(g);
         assert!(ImportLockTx::acquire(home.path(), std::time::Duration::from_millis(200)).is_ok());
+    }
+
+    #[test]
+    fn update_config_refuses_corrupt_file_and_keeps_concurrent_updates() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.json"), "{ broken").unwrap();
+        assert!(set_agent_disabled(home.path(), "codex", true).is_err());
+        assert_eq!(std::fs::read_to_string(home.path().join("config.json")).unwrap(), "{ broken");
+
+        std::fs::remove_file(home.path().join("config.json")).unwrap();
+        let threads: Vec<_> = (0..8).map(|i| {
+            let h = home.path().to_path_buf();
+            std::thread::spawn(move || {
+                update_config(&h, |cfg| {
+                    cfg[format!("k{i}")] = json!(i);
+                    Ok(())
+                }).unwrap();
+            })
+        }).collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let cfg = read_config(home.path());
+        assert_eq!(cfg.as_object().unwrap().len(), 8, "{cfg}");
     }
 }

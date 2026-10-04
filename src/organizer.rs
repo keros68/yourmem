@@ -57,9 +57,11 @@ pub fn validate_settings(settings: &AiSettings) -> Result<()> {
 
 pub fn save_settings(home: &Path, settings: &AiSettings) -> Result<()> {
     validate_settings(settings)?;
-    let mut cfg = ingest::read_config(home);
-    cfg["ai"] = serde_json::to_value(settings)?;
-    ingest::write_config(home, &cfg)
+    let ai = serde_json::to_value(settings)?;
+    ingest::update_config(home, |cfg| {
+        cfg["ai"] = ai;
+        Ok(())
+    })
 }
 
 pub fn settings_json(home: &Path) -> Value {

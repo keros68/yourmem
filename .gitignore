@@ -14,3 +14,6 @@ AGENTS.md
 
 # Local-only sensitive terms used by privacy tests
 /.privacy-deny.json
+
+# Local-only agent skills (desktop run/verify helpers)
+/.claude/

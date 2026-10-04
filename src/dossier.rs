@@ -708,6 +708,7 @@ pub fn render_markdown(d: &Value) -> String {
     if hos.is_empty() {
         let _ = writeln!(s, "（暂无）");
     }
+    write_project_docs(&mut s, d);
     s
 }
 
@@ -783,7 +784,30 @@ pub fn render_context_markdown(d: &Value) -> String {
             }
         }
     }
+    write_project_docs(&mut s, d);
     s
+}
+
+/// 项目文档一节（context / 卷宗 markdown 共用）：只在调用方附带了 project_docs 时输出。
+fn write_project_docs(s: &mut String, d: &Value) {
+    let docs = d["project_docs"]["docs"].as_array().cloned().unwrap_or_default();
+    if docs.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "
+## 项目文档
+");
+    for doc in &docs {
+        let name = doc["name"].as_str().unwrap_or("");
+        if !doc["exists"].as_bool().unwrap_or(false) {
+            let _ = writeln!(s, "- `{name}`：文件不存在");
+            continue;
+        }
+        let since = doc["sessions_since"].as_i64().unwrap_or(0);
+        let mark = if doc["stale"].as_bool().unwrap_or(false) { "，可能已过时" } else { "" };
+        let _ = writeln!(s, "- `{name}`：最后更新 {}，此后 {since} 段对话{mark}",
+            short(doc["last_updated"].as_str()));
+    }
 }
 
 /// 会话压缩前备份导出（0.3.8）：read_session(before_compact=true) 的 JSON 转可读

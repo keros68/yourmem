@@ -175,15 +175,16 @@ fn dir_stats(path: &Path) -> Result<CopyStats> {
 }
 
 fn save_config(home: &Path, raw: &str) -> Result<()> {
-    let mut cfg = crate::ingest::read_config(home);
-    if raw.is_empty() {
-        if let Some(obj) = cfg.as_object_mut() {
-            obj.remove("backup_dir");
+    crate::ingest::update_config(home, |cfg| {
+        if raw.is_empty() {
+            if let Some(obj) = cfg.as_object_mut() {
+                obj.remove("backup_dir");
+            }
+        } else {
+            cfg["backup_dir"] = json!(raw);
         }
-    } else {
-        cfg["backup_dir"] = json!(raw);
-    }
-    crate::ingest::write_config(home, &cfg)
+        Ok(())
+    })
 }
 
 fn normalized(path: &Path) -> String {
