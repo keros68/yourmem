@@ -1,147 +1,66 @@
+<div align="center">
+
+<img src="src-tauri/icons/128x128@2x.png" width="112" alt="yourmem 图标">
+
 # yourmem
 
-yourmem 在本机统一归档、搜索和管理 Claude Code、Codex、OpenCode、ZCode、Kimi、Hermes、pi 与 Antigravity CLI 的聊天记录和项目记忆，也可以通过 MCP 把项目上下文提供给其他 AI 编程助手。
+[English](README_en.md) · [下载](https://github.com/keros68/yourmem/releases/latest) · [快速开始](#快速开始) · [使用说明](docs/guide.md) · [开发说明](docs/development.md) · [许可证](#许可证)
 
-这些内容原本散落在各个工具中。yourmem 保留原文和来源，让用户可以自行保存、恢复和迁移自己的聊天与记忆。
+**在本机归档和搜索多个 AI 编程 Agent 的对话，保存项目记忆，并通过 MCP 交给下一个 Agent。**
 
-## 主要功能
+</div>
 
-不同数据源可读取的内容有所区别，实际支持情况见桌面端设置页的「能力矩阵」。
+yourmem 是基于 Tauri 2 的桌面应用，支持 Windows 与 macOS。对话从各 Agent 的本地记录增量采集，原文与来源一并保存；不需要云端账号，不上传聊天和记忆。
 
-### 把不同 AI 编程助手的对话收在一起
+<p align="center">
+  <img src="docs/images/search.png" alt="yourmem 搜索页：跨 Agent 检索对话与工具调用">
+</p>
 
-- 自动发现并采集本机已有对话，之后按增量更新。
-- 按项目、AI 编程助手和消息类型浏览，也可以跨来源全文搜索中文和英文。
-- 保存原始记录。即使原工具删除了历史文件，已经归档的内容仍可校验、导出和恢复。
-- 识别会话之间的继续、分支、压缩和子任务关系，用谱系图查看一个任务是怎样延续的。
-- 显示原生会话 ID 和续聊命令，需要回到原工具时可以直接复制。
+## 功能
 
-### 保存两类记忆
+- **统一归档**：自动发现本机已有对话并增量采集，按项目、Agent 和消息类型浏览，跨来源全文搜索中英文。原工具删除历史文件后，已归档的内容仍可校验、导出和恢复。
+- **对话谱系**：识别续聊、分支、压缩和子任务关系，用谱系图查看任务的延续过程；对话压缩后仍可取回压缩点之前的原文。
+- **两类记忆**：备份 `MEMORY.md`、`AGENTS.md` 等原生记忆文件的历史版本；把决定、规则、经验和偏好整理成项目记忆，保留来源对话，支持确认、取代和归档。
+- **项目进度**：项目卷宗汇总时间线、决定、产出文件、任务状态和进度文档；「今天」页按日期、项目和 Agent 查看活动并导出日报。可选的 BYOK API 整理先预览、确认后才写入记忆。
+- **MCP 接入**：一键接入 Claude Code、Codex、ZCode、Kimi Code、Gemini CLI、Cursor 和 Hermes，Agent 可直接检索历史、读取项目上下文和写入交接；其他 stdio MCP 客户端可手动配置 `yourmem mcp`。
+- **备份与迁移**：回收站、每周增量快照、完整备份打包与校验，可恢复到另一台电脑或与已有资料库合并；核心数据和备份可分别放在非系统盘。
 
-- **AI 编程助手自己的记忆文件**：备份 `MEMORY.md`、`AGENTS.md` 等文件的历史版本，可以查看修订记录和差异。
-- **yourmem 项目记忆**：把决定、规则、经验和偏好整理成长期记忆，保留来源对话和消息位置。
+## 快速开始
 
-项目记忆支持确认、取代和归档。新的结论可以接替旧结论，不必把相互冲突的版本一直堆在一起。
+1. 打开 [Releases](https://github.com/keros68/yourmem/releases/latest)，按系统下载安装包：Windows x64 选 `yourmem_*_x64-setup.exe`，macOS Apple Silicon 选 `yourmem_*_aarch64.dmg`，Intel 选 `yourmem_*_x64.dmg`。
+2. 安装并运行。安装包尚未签名，首次运行需按系统提示手动放行。
+3. 首次启动分别选择核心数据和备份位置，并勾选要接入的 Agent（默认均不接入）。之后 yourmem 每 60 秒在后台增量采集一次。
+4. 在「搜索」中查找历史，或让已接入的 Agent 调用 yourmem，例如：「用 yourmem 读取这个项目的上下文」「查找以前处理这个错误的对话」。
 
-### 找回项目进度
+接入、备份、多机合并、命令行与数据位置见[使用说明](docs/guide.md)。
 
-- 项目上下文汇总最近对话、已确认记忆和最新交接。
-- 项目卷宗整理时间线、决定、产出文件和任务状态。
-- 「今天」上方是当天概况，下方可按日期、项目和 AI 编程助手查看活动、任务、产物和交接明细并导出日报，每项可返回来源对话。
-- 可选的 BYOK API 整理会生成带来源的项目摘要；结果先预览，确认后才写入项目记忆。今天页不依赖 API。
-- 对话压缩后仍可取回压缩点之前的原文。
+## 支持的 Agent
 
-### 管理和迁移自己的数据
+| Agent | 对话来源 | 续聊命令 | 写回原工具 |
+| --- | --- | --- | --- |
+| Claude Code | `~/.claude/projects` | ✅ | ✅ |
+| Codex | `~/.codex/sessions` | ✅ | ✅ |
+| OpenCode | `~/.local/share/opencode/opencode.db` | ✅ | ❌ |
+| ZCode | `~/.zcode/cli/rollout` | ❌ | ❌ |
+| Kimi Code | `~/.kimi-code/sessions` | 主对话 | ❌ |
+| Hermes | `~/.hermes/state.db` | ✅ | ❌ |
+| pi | `~/.pi/agent/sessions` | ✅ | ❌ |
+| Antigravity CLI | `~/.gemini/antigravity-cli/brain` | ❌ | ❌ |
 
-- 删除的对话先进入回收站，可以恢复；彻底删除需要再次确认。
-- 数据库快照和备份目录可以放到其他磁盘。
-- 整个资料库可以打包、校验并恢复到另一台电脑，也可以与已有资料库合并。
-- 本地自检会检查数据库、搜索索引和归档对象是否完整。
+各来源可读取的内容有所区别，详见桌面端「设置 → 能力矩阵」。Trae 的本地数据已加密，暂不支持。
 
-### 让 AI 编程助手直接调用
+## 从源码构建
 
-yourmem 提供标准 stdio MCP 接口。一键接入支持 Claude Code、Codex、ZCode、Kimi Code、Gemini CLI、Cursor 和 Hermes；其他兼容 stdio MCP 的客户端也可以手动配置 `yourmem mcp`。接入后，可以直接检索历史、读取项目上下文、查看旧记忆或写入交接，例如：
-
-> 用 yourmem 读取这个项目的上下文。
-
-> 查找以前处理这个错误的对话。
-
-> 为当前项目保存一条交接。
-
-## 安装
-
-目前提供 Windows x64 安装包，以及适用于 Apple Silicon 和 Intel 芯片的 macOS 安装包。从 [Releases](../../releases) 下载最新版本。安装包暂未签名，Windows 可能显示未知发布者提示；macOS 首次打开时可能需要在系统设置的“隐私与安全性”中确认。
-
-1.1.9 起可在“设置 → 通用”中直接下载并安装后续更新。1.1.8 及更早版本需要先手动安装一次 1.1.9。
-
-首次启动必须分别选择核心数据和备份位置，保存后才创建资料库。向导会列出检测到的 Agent，默认均不接入；只修改用户主动勾选的 Agent，之后也可在设置中补充。建议把两个存储目录放在空间充足的非系统盘。
-
-## 开始使用
-
-1. 启动 yourmem。
-2. 打开「设置 → 接入」，点击「检测并预览」。查看计划后，点击「确认执行接入」修改 AI 编程助手的 MCP 配置；原配置会自动备份。
-3. 启动后 yourmem 会在后台每 60 秒增量采集一次；点击侧栏「采集新对话」，也可以立即采集。本机已有对话会进入资料库，之后只采集新增内容。
-4. 在「搜索」中查找历史，或者让已接入的 AI 编程助手通过 MCP 读取项目上下文。
-
-关闭窗口后，yourmem 会隐藏到系统托盘并继续后台采集。左键点击托盘图标可重新打开窗口，右键菜单可选择打开或退出；选择退出后后台采集停止。
-
-### 在两台电脑之间合并资料库
-
-这是一次手动合并流程，不会持续同步两台电脑的数据：
-
-1. 两台电脑分别打开「设置 → 备份」，创建 `.tar.gz` 完整备份。主电脑在合并前先备份当前资料库。
-2. 将两台电脑的备份文件放在主电脑可访问的位置。通常每台电脑选择最新的一份快照；较早的备份只用于找回历史，合并后可能使已删除的对话重新出现。
-3. 在主电脑的「设置 → 备份」中填写另一份 `.tar.gz` 路径，点击「校验」。校验通过后点击「合并恢复」，查看预览，再点击「确认合并」。
-
-合并时，同 ID 对话以消息较多的一侧为准，消息数相等时保留目标库版本；同 ID 项目记忆保留目标库版本。两台电脑的项目路径不同，可能会被识别为两个项目。
-
-## 数据保存在哪里
-
-桌面版首次启动会保存一个很小的位置指针 `~/.yourmem-location`，核心数据实际写入向导选择的目录；`YOUMEM_HOME` 仍可用于命令行或受管环境覆盖该选择。备份目录单独选择。会话原文集中保存在核心数据目录的对象库文件 `objects.db` 中并透明压缩；早期版本逐个文件保存的原文由桌面端在后台分批迁入，也可运行 `yourmem backup migrate` 一次完成。数据库只保留大型工具输出的首尾预览，完整内容仍可从归档还原。
-
-设置 → 备份中的“日常增量快照”在备份目录的 `snapshots-v1` 中保存压缩数据库与原件。桌面端每周自动创建一份（`config.json` 的 `snapshot_interval_days` 可调整，设为 0 关闭），不同日期共享相同原件，每次只复制新增部分；默认保留最近 3 份和最近 3 个月的月度快照，并在创建后自动清理更早数据。手动修改保留规则仍需先预览再确认。迁移或恢复时，选择快照导出独立完整备份，再执行校验与恢复。
-
-1.1.0 起创建及导出的完整备份采用 v2 格式，省略可重建的搜索索引，恢复时重建。恢复新包需要 1.1.0 或更新版本；原有 v1 备份仍可恢复。已有备份不会自动转换或删除。
-
-yourmem 日常只读取各 AI 编程助手的原始数据。只有以下操作会写入原工具的数据目录或配置：
-
-- 一键接入；
-- 把已归档的对话写回原工具。
-
-这两类操作都会先显示计划，由用户确认，并在修改前备份原文件。设置 → 接入提供“解除接入与卸载”：统一移除 Claude Code、Codex、ZCode、Kimi Code、Gemini CLI、Cursor 和 Hermes 中的 yourmem 项，可选择同时永久删除核心数据与备份；各 agent 自己的原始会话不会删除。
-
-yourmem 不需要云端账号，也不会把聊天和记忆上传到服务端。当前不提供多设备实时同步、数据加密或基于 embedding 的语义搜索。
-
-## 命令行
-
-桌面端覆盖日常使用，命令行适合脚本、诊断和批量操作。除显式选择 Markdown 的导出外，命令结果均为 JSON。
+依赖 Rust（stable）；桌面端另需 Tauri 2 的系统依赖。
 
 ```bash
-yourmem import                         # 采集一次
-yourmem watch --interval 5             # 持续采集
-yourmem search "关键词"                 # 跨来源全文搜索
-yourmem context [项目名]                # 读取项目上下文
-yourmem dossier [项目名] --markdown     # 导出项目卷宗
-yourmem docs [--project 项目名]         # 查看项目文档的更新情况与过时提示
-yourmem docs track docs/plan.md         # 跟踪其他进度文档
-yourmem session trash                  # 查看回收站
-yourmem memory add --type decision --content "结论"
-yourmem backup db                      # 创建数据库快照
-yourmem backup migrate                 # 把早期版本的原文文件迁入对象库
-yourmem bundle create -o yourmem.tar.gz
-yourmem snapshot create                # 创建日常增量快照
-yourmem snapshot list                  # 查看快照及仓库占用
-yourmem snapshot export <ID> -o move.tar.gz
-yourmem snapshot plan --keep-recent 3 --keep-monthly 3
-yourmem doctor                         # 本地自检（桌面端每天在后台运行）
-yourmem teardown                       # 解除全部 agent 接入
-yourmem teardown --delete-data         # 再删除核心数据
-yourmem teardown --delete-data --delete-backups
-```
-
-按项目导出（`bundle create --project 项目名`）仅包含所选项目的记忆与原生记忆修订，全局记忆不随包携带。
-
-恢复先校验数据库、版本和引用对象，再写入完整对象并提交数据库。对象复制失败时可排除磁盘或权限问题后重试；已完整复制的对象会被复用。
-
-搜索默认采用轻量索引，工具输出正文的长关键词可能无法命中；设置中可开启工具输出全文索引。每条消息最多检索前 20 万字符，完整原文可从对话详情导出。
-
-全部命令和参数见 `yourmem --help`。
-
-## 项目文档
-
-- [Windows 支持与实测记录](docs/WINDOWS.md)
-
-## 构建与测试
-
-核心程序使用 Rust，桌面端使用 Tauri 2，数据保存在 SQLite 和本地归档对象中。
-
-```bash
-cargo build
+cargo build              # 命令行 yourmem
 cargo test
+cd src-tauri && cargo run  # 桌面端开发模式
 ```
 
-桌面端开发入口位于 `src-tauri/`，静态前端位于 `ui/`。
+目录结构与测试说明见[开发说明](docs/development.md)。
 
-## License
+## 许可证
 
-[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
+[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)，Copyright © 2026 yourmem contributors。
