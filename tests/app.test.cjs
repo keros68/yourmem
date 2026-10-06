@@ -20,7 +20,7 @@ function app() {
   const ui = (name) => fs.readFileSync(path.join(__dirname, '../ui', name), 'utf8');
   vm.runInContext(ui('session-drawer.js').replace('export function', 'function'), context);
   vm.runInContext(ui('project-recall.js').replace('export async function', 'async function'), context);
-  vm.runInContext(ui('graph-layout.js').replace('export function', 'function'), context);
+  vm.runInContext(ui('graph-layout.js').replaceAll('export function', 'function'), context);
   const bundleCode = ui('app.js').slice(ui('app.js').indexOf('  let bundleBusy = false'), ui('app.js').indexOf('  $("#auto-purge").onchange'));
   vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, renderToday, foldSubtasks, bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
   return { ...context.testApp, context, get, lists, requests, notices };

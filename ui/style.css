@@ -681,7 +681,7 @@ svg.lgraph-edges text { fill: var(--faint); font-size: 10.5px; }
 .gnode.ext { opacity: 0.55; cursor: default; font-family: ui-monospace, monospace; font-size: 11px; justify-content: center; }
 .gnode.ext:hover { border-color: var(--border-strong); }
 /* 节点标题（首条用户消息，进度树口径）：两行截断 */
-.gnode-title { font-size: 12px; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; padding-right: 44px; }
+.gnode-title { font-size: 12px; line-height: 1.3; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; padding-right: 44px; }
 .gnode-sub { font-size: 10.5px; color: var(--faint); white-space: nowrap; }
 .gnode .pill { position: absolute; top: 4px; right: 6px; font-size: 10px; }
 
@@ -708,3 +708,13 @@ svg.lgraph-edges text { fill: var(--faint); font-size: 10.5px; }
 tr.sub-row td { background: rgba(255, 255, 255, 0.02); }
 .sub-mark { color: var(--faint); }
 .activity-subs { margin-right: 6px; padding: 1px 6px; border: 1px solid var(--border); border-radius: 8px; color: var(--dim); font-size: 11px; font-style: normal; font-weight: 400; }
+/* 谱系图关系类型：线型区分，图例说明（不在每条线上写字） */
+svg.lgraph-edges path.lt-subagent { stroke-dasharray: 5 4; }
+svg.lgraph-edges path.lt-fork { stroke-dasharray: 2 3; }
+svg.lgraph-edges path.lt-compact { stroke-opacity: 0.3; }
+.lgraph-legend { display: inline-flex; gap: 12px; margin-left: 10px; font-size: 11px; font-weight: 400; color: var(--faint); vertical-align: middle; }
+.lgraph-legend > span { display: inline-flex; align-items: center; gap: 5px; }
+.lgraph-legend i { width: 18px; border-top: 1.5px solid var(--accent); opacity: 0.7; }
+.lgraph-legend .lt-subagent i { border-top-style: dashed; }
+.lgraph-legend .lt-fork i { border-top-style: dotted; }
+.lgraph-legend .lt-compact i { opacity: 0.35; }

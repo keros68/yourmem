@@ -212,6 +212,9 @@ fn validate_result(result: &Value, source: &Value) -> Result<Value> {
     Ok(json!({"overview": overview, "projects": projects}))
 }
 
+// 非流式请求要等全部生成完才返回响应头；慢模型整理多个项目实测 70–90 秒以上
+const RESPONSE_TIMEOUT_SECS: u64 = 300;
+
 pub fn organize_with_api(settings: &AiSettings, api_key: &str, activity: &Value) -> Result<Value> {
     validate_settings(settings)?;
     anyhow::ensure!(!api_key.trim().is_empty(), "尚未配置 API Key");
@@ -228,9 +231,14 @@ pub fn organize_with_api(settings: &AiSettings, api_key: &str, activity: &Value)
         ]
     });
     let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(90)).build()?;
+        .connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(RESPONSE_TIMEOUT_SECS)).build()?;
     let response = client.post(chat_url(&settings.base_url))
-        .bearer_auth(api_key.trim()).json(&body).send().context("连接 AI API 失败")?;
+        .bearer_auth(api_key.trim()).json(&body).send()
+        .map_err(|e| if e.is_timeout() {
+            anyhow::anyhow!("AI API 在 {RESPONSE_TIMEOUT_SECS} 秒内未返回结果，可减少当天整理范围或换用更快的模型")
+        } else {
+            anyhow::Error::new(e).context("连接 AI API 失败")
+        })?;
     let status = response.status();
     let raw = response.text().context("读取 AI API 响应失败")?;
     if !status.is_success() {

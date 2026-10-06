@@ -21,3 +21,26 @@ export function graphDepths(ids, edges) {
   for (const id of unresolved) depth.set(id, 0);
   return { depth, unresolved };
 }
+
+// 树形排位：每个节点挂在深度恰好少一层的首个父节点下，叶子依次占位，父节点居中于子树，
+// 同层节点间隔至少一个位。多父边仍照画，只是不参与排位。order 为同层兄弟的先后比较函数。
+export function treeSlots(ids, edges, depth, order) {
+  const primary = new Map();
+  for (const [from, to] of edges) {
+    if (primary.has(to) || !depth.has(from) || !depth.has(to)) continue;
+    if (depth.get(from) === depth.get(to) - 1) primary.set(to, from);
+  }
+  const kids = new Map(ids.map(id => [id, []]));
+  for (const [c, p] of primary) kids.get(p).push(c);
+  for (const list of kids.values()) list.sort(order);
+  const slot = new Map();
+  let next = 0;
+  const place = (id) => {
+    const cs = kids.get(id);
+    if (!cs.length) { slot.set(id, next++); return; }
+    cs.forEach(place);
+    slot.set(id, (slot.get(cs[0]) + slot.get(cs[cs.length - 1])) / 2);
+  };
+  ids.filter(id => !primary.has(id)).sort(order).forEach(place);
+  return { slot, width: next };
+}

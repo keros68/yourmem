@@ -1,5 +1,5 @@
 import { loadProjectRecall } from "./project-recall.js";
-import { graphDepths } from "./graph-layout.js";
+import { graphDepths, treeSlots } from "./graph-layout.js";
 import { createSessionDrawer } from "./session-drawer.js";
 import { snapshotPanelHtml, bindSnapshotPanel } from "./snapshot-panel.js";
 import { activityPageHtml, aiSummaryHtml } from "./workbench.js";
@@ -172,7 +172,7 @@ async function showActivityAi(digest) {
   ov.id = "activity-ai-overlay";
   ov.innerHTML = `<section><header><div><h2>AI 整理 · ${esc(digest.day)}</h2><p>这是预览，不会自动写入记忆。</p></div><button id="activity-ai-close" title="关闭"><img src="icons/x.svg" alt=""></button></header>
     <div class="activity-ai-note">单次仅发送对话标题、末条 Agent 回复、任务、产物路径和交接摘要，不发送完整对话、文件内容或 API Key。</div>
-    <div id="activity-ai-result"><div class="state loading">正在发送精简工作记录并等待结果…</div></div></section>`;
+    <div id="activity-ai-result"><div class="state loading">加载中</div></div></section>`;
   document.body.appendChild(ov);
   $("#activity-ai-close").onclick = closeActivityAi;
   ov.onclick = (e) => { if (e.target === ov) closeActivityAi(); };
@@ -187,7 +187,11 @@ async function showActivityAi(digest) {
 
 function paintActivity() {
   const root = $("#page-today");
+  // 重画会清掉项目栏的内部滚动；保留它，点下部项目不跳顶
+  const listTop = document.querySelector(".activity-project-list")?.scrollTop || 0;
   root.innerHTML = maintenanceNoticeHtml(maintState) + activityPageHtml(activityDigest, { ...activityState, today: localDay(new Date()) });
+  const list = document.querySelector(".activity-project-list");
+  if (list) list.scrollTop = listTop;
   const maintOpen = $("#maint-open");
   if (maintOpen) maintOpen.onclick = () => { settingsTab = "general"; document.querySelector('.nav[data-page="settings"]').click(); };
   root.querySelectorAll("[data-work-session]").forEach((b) => { b.onclick = () => showSession(b.dataset.workSession); });
@@ -2186,11 +2190,13 @@ document.addEventListener("keydown", (e) => {
 // nodes: [{session_id, agent, started_at, messages, title, tail, ext, deleted}]；edges: [{p, c, lt}]。
 // 确定性布局：层 = 父链深度，层内按 started_at 排序——不做力导向，
 // 同一份数据永远画出同一张图（与 mermaid 导出同纪律：只画链上节点）。
-// 横排 = root 在左代际向右；竖排 = root 在上代际向下（2026-09-01 用户反馈竖排
-// 更直观，默认竖排可切换，drawer/卷宗/全屏覆盖层三处共享 graphVertical）。
+// graphVertical = root 在上代际向下（默认），否则 root 在左代际向右；drawer/卷宗/全屏覆盖层
+// 三处共享。按钮显示点击后切换到的排法，按节点铺开方向称呼：代际向下时同层横向铺开，
+// 称「横排」，所以此时按钮写「竖排」。
 // 节点标题化（2026-08-31 用户反馈"要进度树不要 id 链"）：title=首条用户消息
 // （这段对话要干什么，无 LLM 摘要口径），tail=末条 assistant（停在哪）进 tooltip。
 let graphVertical = true;
+const LINK_TYPE_NAMES = { continuation: "续接", fork: "分叉", compact: "压缩", subagent: "子任务" };
 let lastGraphArgs = null; // 最近一次渲染参数 {nodes, edges, currentSid}，换向/覆盖层重渲染用
 function lineageGraphHtml(nodes, edges, currentSid = null) {
   if (!edges.length) return "";
@@ -2202,25 +2208,21 @@ function lineageGraphHtml(nodes, edges, currentSid = null) {
     if (!inGraph.has(e.p)) inGraph.set(e.p, byId.get(e.p) || null);
   }
   const { depth, unresolved } = graphDepths([...inGraph.keys()], edges.map(e => [e.p, e.c]));
-  const depthOf = id => depth.get(id);
-  const cols = new Map();
-  for (const sid of inGraph.keys()) {
-    const dd = depthOf(sid);
-    if (!cols.has(dd)) cols.set(dd, []);
-    cols.get(dd).push(sid);
-  }
-  cols.forEach((list) => list.sort((a, b) => {
-    const ta = inGraph.get(a), tb = inGraph.get(b);
-    return ((ta && ta.started_at) || a).localeCompare((tb && tb.started_at) || b);
-  }));
-  const CW = 220, RH = 84, NW = 196, NH = 66;
+  const startOf = (sid) => (inGraph.get(sid) && inGraph.get(sid).started_at) || sid;
+  const { slot, width } = treeSlots([...inGraph.keys()], edges.map(e => [e.p, e.c]), depth,
+    (p, q) => startOf(p).localeCompare(startOf(q)));
+  // 节点间留出连线空间：代际方向间距大，同层方向间距小
+  const NW = 196, NH = 66;
+  const CW = graphVertical ? NW + 24 : NW + 72, RH = graphVertical ? NH + 56 : NH + 16;
   const pos = new Map();
-  for (const [dd, list] of cols) list.forEach((sid, i) =>
-    pos.set(sid, graphVertical ? { x: i * CW, y: dd * RH } : { x: dd * CW, y: i * RH }));
-  const maxDepth = Math.max(...cols.keys());
-  const maxLen = Math.max(...[...cols.values()].map((l) => l.length));
-  const W = graphVertical ? maxLen * CW : (maxDepth + 1) * CW;
-  const H = graphVertical ? (maxDepth + 1) * RH : maxLen * RH;
+  for (const sid of inGraph.keys()) {
+    const s = slot.get(sid), dd = depth.get(sid);
+    pos.set(sid, graphVertical ? { x: s * CW, y: dd * RH } : { x: dd * CW, y: s * RH });
+  }
+  const maxDepth = Math.max(...depth.values());
+  const W = graphVertical ? width * CW : (maxDepth + 1) * CW;
+  const H = graphVertical ? (maxDepth + 1) * RH : width * RH;
+  const linkTypes = [...new Set(edges.map((e) => e.lt))];
 
   const nodeHtml = [...inGraph.entries()].map(([sid, t]) => {
     const { x, y } = pos.get(sid);
@@ -2241,18 +2243,17 @@ function lineageGraphHtml(nodes, edges, currentSid = null) {
     if (graphVertical) {
       const x1 = a.x + NW / 2, y1 = a.y + NH, x2 = b.x + NW / 2, y2 = b.y;
       const my = (y1 + y2) / 2;
-      return `<path d="M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}" marker-end="url(#lg-arrow)"/>
-        <text x="${Math.min(x1, x2) + 6}" y="${my - 3}">${esc(e.lt)}</text>`;
+      return `<path class="lt-${esc(e.lt)}" d="M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}" marker-end="url(#lg-arrow)"/>`;
     }
     const x1 = a.x + NW, y1 = a.y + NH / 2, x2 = b.x, y2 = b.y + NH / 2;
     const mx = (x1 + x2) / 2;
-    return `<path d="M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}" marker-end="url(#lg-arrow)"/>
-      <text x="${mx}" y="${(y1 + y2) / 2 - 4}" text-anchor="middle">${esc(e.lt)}</text>`;
+    return `<path class="lt-${esc(e.lt)}" d="M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}" marker-end="url(#lg-arrow)"/>`;
   }).join("");
 
   return `<div class="lgraph-wrap">${unresolved.length ? `<div class="meta">部分历史关系包含环路，未按演变顺序排列</div>` : ""}<h2>谱系图（${inGraph.size} 节点 / ${edges.length} 边）
-      <button class="btn small graph-orient">${graphVertical ? "横排" : "竖排"}</button>
-      <button class="btn small graph-zoom">放大</button></h2>
+      <button class="btn small graph-orient">${graphVertical ? "竖排" : "横排"}</button>
+      <button class="btn small graph-zoom">放大</button>
+      <span class="lgraph-legend">${linkTypes.map((t) => `<span class="lt-${esc(t)}"><i></i>${esc(LINK_TYPE_NAMES[t] || t)}</span>`).join("")}</span></h2>
     <div class="scrollbox lgraph-scroll"><div class="lgraph" style="width:${W}px;height:${H}px">
       <svg class="lgraph-edges" width="${W}" height="${H}">
         <defs><marker id="lg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/></marker></defs>
@@ -2389,10 +2390,11 @@ function openGraphOverlay(graphEl, title) {
   ov.innerHTML = `
     <div class="go-bar">
       <span class="go-title">${esc(title || "谱系图 · 滚轮/触控板滚动查看，节点可点跳转，悬停看最新进展")}</span>
+      ${graphEl.closest(".lgraph-wrap")?.querySelector(".lgraph-legend")?.outerHTML || ""}
       <button class="btn small" data-gz="out">−</button>
       <button class="btn small" data-gz="reset">100%</button>
       <button class="btn small" data-gz="in">＋</button>
-      ${graphEl.querySelector(".gnode:not(.mnode-g)") ? `<button class="btn small graph-orient">${graphVertical ? "横排" : "竖排"}</button>` : ""}
+      ${graphEl.querySelector(".gnode:not(.mnode-g)") ? `<button class="btn small graph-orient">${graphVertical ? "竖排" : "横排"}</button>` : ""}
       <button class="btn small" data-gz="close">关闭（Esc）</button>
     </div>
     <div class="go-scroll"><div class="go-canvas">${graphEl.outerHTML.replaceAll("lg-arrow", "lg-arrow-z")}</div></div>`;
@@ -2444,7 +2446,7 @@ document.addEventListener("click", (e) => {
     const g = tmp.querySelector(".lgraph");
     if (g) canvas.innerHTML = g.outerHTML.replaceAll("lg-arrow", "lg-arrow-z");
     const bar = document.querySelector("#graph-overlay .graph-orient");
-    if (bar) bar.textContent = graphVertical ? "横排" : "竖排";
+    if (bar) bar.textContent = graphVertical ? "竖排" : "横排";
     const cur = canvas.querySelector(".gnode.cur");
     if (cur) cur.scrollIntoView({ inline: "center", block: "center" });
   }

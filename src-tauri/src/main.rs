@@ -247,7 +247,7 @@ async fn ai_organize_day(day: Option<String>) -> Result<Value, String> {
         let conn = db::open(&home).map_err(|e| e.to_string())?;
         let activity = yourmem::dossier::daily_digest(&conn, &day).map_err(|e| e.to_string())?;
         let mut out = yourmem::organizer::organize_with_api(&settings, &key, &activity)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{e:#}"))?;
         out["day"] = json!(day);
         let _ = db::log_usage(&conn, "app", "ai_organize_day");
         Ok(out)
