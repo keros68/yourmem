@@ -57,6 +57,10 @@ cargo test
 cd src-tauri && cargo run  # desktop app in development mode
 ```
 
+## Related projects
+
+- [Metrik](https://github.com/keros68/metrik): shows remaining quota, reset times, and token usage for each agent. yourmem does not track usage; use Metrik to check quota.
+
 ## License
 
 [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), Copyright © 2026 yourmem contributors.

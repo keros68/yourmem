@@ -61,6 +61,10 @@ cd src-tauri && cargo run  # 桌面端开发模式
 
 目录结构与测试说明见[开发说明](docs/development.md)。
 
+## 相关项目
+
+- [Metrik](https://github.com/keros68/metrik)：查看各 Agent 的剩余额度、重置时间和 Token 用量。yourmem 不统计用量，需要看额度时使用 Metrik。
+
 ## 许可证
 
 [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)，Copyright © 2026 yourmem contributors。
