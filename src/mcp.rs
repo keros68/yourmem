@@ -4,14 +4,25 @@
 //! Agents launch `yourmem mcp`; the server's cwd is inherited from the
 //! agent process, which is how project auto-detection works.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
 use crate::db::{self, HandoffFields, SearchOpts};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// get_project_context 的增量游标（多窗口共享看板裁定：每个窗口记自己上次
+/// 看到的版本，只补"自你上次读取以来的变化"）。一个 MCP 进程对应一个 agent
+/// 窗口，游标按 (home, project) 存进程内存——窗口重开即重新全量读取，
+/// 不持久化也不跨窗口共享，避免一个窗口的读取吃掉另一个窗口的增量。
+fn context_cursors() -> &'static Mutex<HashMap<(String, i64), String>> {
+    static CURSORS: OnceLock<Mutex<HashMap<(String, i64), String>>> = OnceLock::new();
+    CURSORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 pub fn serve(home: &Path) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
@@ -132,9 +143,18 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
 
         "get_project_context" => {
             let (pid, ..) = db::require_project(&conn, arg_str("project").as_deref(), cwd.as_deref())?;
+            // 先取时间再查询：查询窗口内落下的写入会在下次增量里再报（宁多勿漏）
+            let generated_at = crate::now_iso();
             let mut context = db::project_context(&conn, pid)?;
             context["source_review"] = crate::project_review::status(&conn, home, pid)?;
             context["project_docs"] = crate::project_docs::attach(&conn, home, pid);
+            context["generated_at"] = json!(generated_at);
+            let key = (home.to_string_lossy().to_string(), pid);
+            let mut cursors = context_cursors().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(since) = cursors.get(&key).cloned() {
+                context["since_last_read"] = db::changes_since(&conn, pid, &since)?;
+            }
+            cursors.insert(key, generated_at);
             Ok(context)
         }
 
@@ -280,7 +300,7 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
             let action = arg_str("action")
                 .ok_or_else(|| anyhow::anyhow!("missing required argument: action (confirm|archive|supersede)"))?;
             let by = arg_str("superseded_by");
-            db::update_memory_status(&conn, &id, &action, by.as_deref())?;
+            db::update_memory_status_at(&conn, &id, &action, by.as_deref(), arg_str("expected_updated_at").as_deref())?;
             Ok(json!({ "memory_id": id, "action": action }))
         }
 
@@ -301,7 +321,7 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
 }
 
 fn tools_list() -> Value {
-    let project_prop = json!({ "type": "string", "description": "Project name or path fragment. Optional: defaults to the project matching the current working directory." });
+    let project_prop = json!({ "type": "string", "description": "Project name or path fragment (optional; defaults to the current working directory's project)." });
     json!({
         "tools": [
             {
@@ -311,12 +331,12 @@ fn tools_list() -> Value {
             },
             {
                 "name": "get_project_context",
-                "description": "Compact project recall: confirmed memories, unconfirmed suggestions, per-agent session counts, recent sessions and the latest handoff. Call this when starting or resuming work in a project instead of asking the user to re-explain context.",
+                "description": "Compact project recall: confirmed memories, unconfirmed suggestions, per-agent session counts, recent sessions and the latest handoff. Call this when starting or resuming work in a project instead of asking the user to re-explain context. Repeat calls in the same session include a since_last_read delta.",
                 "inputSchema": { "type": "object", "properties": { "project": project_prop } }
             },
             {
                 "name": "get_dossier",
-                "description": "Full project dossier: decision board with superseded history (how decisions were overturned), session timeline with lineage marks, all artifacts, handoff chain. Deeper than get_project_context; use when reviewing a project's evolution.",
+                "description": "Full project dossier: decision board with superseded history, session timeline with lineage marks, all artifacts, handoff chain. Deeper than get_project_context; use when reviewing a project's evolution.",
                 "inputSchema": { "type": "object", "properties": { "project": project_prop } }
             },
             {
@@ -336,7 +356,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "read_session",
-                "description": "Read one session's normalized transcript. Longer sessions return the LAST messages (current state); total_messages = full length. before_compact=true: only messages before the first context compaction (pre-compact backup).",
+                "description": "Read one session's normalized transcript. Long sessions return the LAST messages (current state); total_messages = full length. before_compact=true returns only the pre-compaction portion.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -350,7 +370,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "read_native_memory",
-                "description": "Read your own native memory files (MEMORY.md / AGENTS.md) as backed up by yourmem, with revision counts. Use when the user asks how a memory file evolved, or when you suspect your memory/instructions changed and want the previous content.",
+                "description": "Read your own native memory files (MEMORY.md / AGENTS.md) as backed up by yourmem, with revision counts. Use when you suspect your memory/instructions changed and want the previous content.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -391,7 +411,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "save_memory",
-                "description": "Save reusable knowledge. Decisions/rules default to suggested until user confirmation. Pass session_id and message_id for provenance. Check similar: supersede duplicates instead of accumulating copies. For lessons/preferences include scope, failed attempts, Why, How-to-apply and review conditions; keep observed results apart from inference. Do not duplicate git, code or AGENTS.md/CLAUDE.md.",
+                "description": "Save reusable knowledge. Decisions/rules default to suggested until user confirmation. Pass session_id and message_id for provenance. Check similar: supersede duplicates instead of accumulating copies. For lessons/preferences include scope, failed attempts, Why, How-to-apply; keep observed results apart from inference. Do not duplicate git, code or AGENTS.md/CLAUDE.md.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -440,20 +460,21 @@ fn tools_list() -> Value {
             },
             {
                 "name": "update_memory",
-                "description": "Change a memory's lifecycle state: confirm a suggestion, archive, or supersede it with a newer memory.",
+                "description": "Change a memory's lifecycle state: confirm, archive, or supersede with a newer memory. Pass expected_updated_at to reject writes based on a stale read.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "id": { "type": "string" },
                         "action": { "type": "string", "description": "confirm | archive | supersede" },
-                        "superseded_by": { "type": "string", "description": "Required for supersede: id of the replacing memory." }
+                        "superseded_by": { "type": "string", "description": "Required for supersede: id of the replacing memory." },
+                        "expected_updated_at": { "type": "string", "description": "updated_at from your last read; rejected if the memory changed since." }
                     },
                     "required": ["id", "action"]
                 }
             },
             {
                 "name": "list_artifacts",
-                "description": "List files produced by sessions (code, reports, notebooks…), e.g. 'that feature importance figure from last week'.",
+                "description": "List files produced by sessions (code, reports, notebooks…).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

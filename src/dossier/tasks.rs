@@ -358,6 +358,13 @@ mod tests {
         msg("kimi:s1", 1, r#"[TodoList] {"todos":[{"status":"in_progress","title":"任务A"},{"status":"pending","title":"任务B"}]}"#);
         msg("kimi:s1", 2, r#"[TodoList] {"todos":[{"status":"in_progress","title":"任务A"},{"status":"pending","title":"任务B"}]}"#);
         msg("kimi:s1", 3, r#"[TodoList] {"todos":[{"status":"done","title":"任务A"},{"status":"in_progress","title":"任务B"}]}"#);
+        // 证据分层：kimi 会话内有产物与 git commit 调用；claude 会话什么都没有
+        conn.execute(
+            "INSERT INTO session_artifacts(session_id, project_id, path, tool, created_at)
+             VALUES ('kimi:s1', 1, '/tmp/p/out.txt', 'Write', '2026-08-31T00:00:00Z')",
+            [],
+        ).unwrap();
+        msg("kimi:s1", 4, r#"Bash: {"command":"git commit -m wip"}"#);
         session("claude:s2", "claude");
         msg("claude:s2", 1, r#"TaskCreate: {"activeForm":"表单","description":"d","subject":"任务甲"}"#);
         msg("claude:s2", 2, r#"TaskUpdate: {"status":"completed","taskId":"1"}"#);
@@ -376,11 +383,18 @@ mod tests {
         let claude = tl.iter().find(|t| t["agent"] == "claude").unwrap();
         assert_eq!(claude["final"]["todos"][0]["status"], "completed");
         assert_eq!(claude["final"]["todos"][0]["id"], "1");
+        // 证据分层：自报状态必须带会话内佐证统计
+        assert_eq!(kimi["evidence"]["artifacts"], 1);
+        assert_eq!(kimi["evidence"]["commits"], 1);
+        assert_eq!(claude["evidence"]["artifacts"], 0);
+        assert_eq!(claude["evidence"]["commits"], 0);
 
         let md = super::super::render_markdown(&d);
         assert!(md.contains("## 任务状态"), "markdown 有任务状态章节\n{md}");
         assert!(md.contains("- [x] 任务A"), "checkbox 列表\n{md}");
         assert!(md.contains("任务B（进行中）"), "in_progress 标注\n{md}");
         assert!(!md.contains("任务X"), "codex 不误报\n{md}");
+        assert!(md.contains("佐证：产物×1、提交×1"), "有佐证的会话标注佐证\n{md}");
+        assert!(md.contains("自报，会话内未见产物或提交佐证"), "无佐证的会话如实标注\n{md}");
     }
 }

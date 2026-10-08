@@ -296,3 +296,36 @@ fn git_baseline_requires_explicit_review_and_does_not_change_memory_status() {
         "unavailable"
     );
 }
+
+#[test]
+fn stale_expected_updated_at_rejects_governance_write() {
+    // 共享看板版本号裁定：治理操作带上次读取到的 updated_at；不符即拒绝，
+    // 防止旧窗口拿着过期状态覆盖新状态。
+    let home = tempfile::tempdir().unwrap();
+    let c = db::open(home.path()).unwrap();
+    let id = memory(&c, "版本校验");
+
+    // 不带期望时间戳：照旧放行（向后兼容）
+    db::update_memory_status_at(&c, &id, "archive", None, None).unwrap();
+    let read_version = || {
+        c.query_row("SELECT updated_at FROM memories WHERE id=?1", [&id], |r| r
+            .get::<_, String>(0))
+            .unwrap()
+    };
+
+    // 过期的期望时间戳：拒绝且状态不变
+    let err = db::update_memory_status_at(&c, &id, "confirm", None, Some("2000-01-01T00:00:00.000Z"))
+        .unwrap_err();
+    assert!(err.to_string().contains("已被修改"), "{err}");
+    assert_eq!(
+        c.query_row("SELECT status FROM memories WHERE id=?1", [&id], |r| r.get::<_, String>(0)).unwrap(),
+        "archived",
+        "拒绝后状态必须保持原样"
+    );
+
+    // 上次读取到的时间戳：放行
+    db::update_memory_status_at(&c, &id, "confirm", None, Some(&read_version())).unwrap();
+
+    // 不存在的记忆：报 not found，不误判成过期
+    assert!(db::update_memory_status_at(&c, "mem_missing", "confirm", None, Some("2026-01-01T00:00:00.000Z")).is_err());
+}

@@ -209,6 +209,21 @@ pub fn project_dossier(conn: &Connection, project_id: i64) -> Result<Value> {
         let task_json = |t: &tasks::TaskItem| {
             json!({ "id": t.id, "content": t.content, "status": t.status })
         };
+        // 证据分层（共享看板裁定）：任务状态是 agent 自报，卷宗只附加会话内
+        // 可核对的佐证——本会话写过的文件（session_artifacts）与 git commit
+        // 调用次数。无佐证时如实标注，不把"自报完成"呈现成"已验证完成"。
+        let mut evidence: HashMap<String, Value> = HashMap::new();
+        for sid in per_session.keys() {
+            let artifacts: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM session_artifacts WHERE session_id = ?1",
+                [sid], |r| r.get(0),
+            )?;
+            let commits: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind = 'tool_call' AND content LIKE '%git commit%'",
+                [sid], |r| r.get(0),
+            )?;
+            evidence.insert(sid.clone(), json!({ "artifacts": artifacts, "commits": commits }));
+        }
         order
             .into_iter()
             .filter_map(|sid| {
@@ -219,6 +234,7 @@ pub fn project_dossier(conn: &Connection, project_id: i64) -> Result<Value> {
                     fin.todos.iter().map(&task_json).collect();
                 let total = fin.todos.len();
                 let done = fin.todos.iter().filter(|t| t.status == "completed").count();
+                let ev = evidence.get(&sid).cloned().unwrap_or_else(|| json!({ "artifacts": 0, "commits": 0 }));
                 Some(json!({
                     "session_id": sid,
                     "agent": agent,
@@ -234,6 +250,7 @@ pub fn project_dossier(conn: &Connection, project_id: i64) -> Result<Value> {
                     },
                     "done": done,
                     "total": total,
+                    "evidence": ev,
                 }))
             })
             .collect::<Vec<_>>()
@@ -658,13 +675,21 @@ pub fn render_markdown(d: &Value) -> String {
     // 任务状态（§7.7，0.4.3）：每会话一条最终状态的 checkbox 列表（GFM 渲染），
     // 来源指到最后一个变化点；演变全史在 JSON 的 task_timeline.changes 里
     let _ = writeln!(s, "\n## 任务状态\n");
+    let _ = writeln!(s, "任务状态是 Agent 自报；佐证仅统计会话内可见的文件产物与 git commit 调用。\n");
     let tasks = d["task_timeline"].as_array().cloned().unwrap_or_default();
     for t in &tasks {
         let fin = &t["final"];
         let changes = t["changes"].as_array().map(Vec::len).unwrap_or(0);
+        let ev = &t["evidence"];
+        let (arts, commits) = (ev["artifacts"].as_i64().unwrap_or(0), ev["commits"].as_i64().unwrap_or(0));
+        let evidence_note = match (arts, commits) {
+            (0, 0) => "，自报，会话内未见产物或提交佐证".to_string(),
+            (a, 0) => format!("，佐证：产物×{a}"),
+            (a, c) => format!("，佐证：产物×{a}、提交×{c}"),
+        };
         let _ = writeln!(
             s,
-            "- `{}` `{}` 完成 {}/{}（{changes} 次变化，来源 {}）",
+            "- `{}` `{}` 完成 {}/{}（{changes} 次变化{evidence_note}，来源 {}）",
             t["agent"].as_str().unwrap_or(""),
             t["session_id"].as_str().unwrap_or(""),
             t["done"],

@@ -1457,3 +1457,51 @@ fn resolve_project_by_cwd_skips_archived_fallback() {
     let other = base.path().join("elsewhere");
     assert!(db::resolve_project(&conn, None, other.to_str()).unwrap().is_none());
 }
+
+#[test]
+fn mcp_project_context_reports_delta_since_last_read() {
+    // 共享看板"只在有变化时说话"裁定：同一 MCP 进程（= 一个 agent 窗口）内，
+    // get_project_context 自第二次调用起带 since_last_read 增量段；窗口重开
+    // （游标不持久化）即重新全量读取。
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let pid = db::upsert_project(&conn, "/tmp/delta-proj", "delta-proj").unwrap();
+    let call = |id: i64| {
+        let resp = yourmem::mcp::handle(home.path(), &serde_json::json!({
+            "jsonrpc":"2.0","id":id,"method":"tools/call",
+            "params":{"name":"get_project_context","arguments":{"project":"delta-proj"}}
+        })).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str::<serde_json::Value>(text).unwrap()
+    };
+
+    let first = call(1);
+    assert!(first.get("since_last_read").is_none(), "首次读取不带增量段");
+    assert!(first["generated_at"].is_string());
+
+    let second = call(2);
+    assert!(second["since_last_read"]["sessions"].as_array().unwrap().is_empty());
+    assert!(second["since_last_read"]["memories"].as_array().unwrap().is_empty());
+
+    // 另一个窗口落了新记忆与新会话（时间戳推到确定晚于游标的值：同毫秒比较
+    // 用严格大于，测试不能依赖真实时钟推进）
+    let mid = db::save_memory(&conn, &db::MemoryInput {
+        project_id: Some(pid),
+        scope: "project",
+        r#type: "task",
+        content: "增量段可见性",
+        status: None,
+        source_session_id: None,
+        source_message_id: None,
+    }).unwrap();
+    db::upsert_session(&conn, "claude:delta-new", "claude", "delta-new", Some(pid), "fixture",
+        &yourmem::models::SessionMetaPatch::default(), 1).unwrap();
+    conn.execute("UPDATE memories SET updated_at = '2999-01-01T00:00:00.000Z' WHERE id = ?1", [&mid]).unwrap();
+    conn.execute("UPDATE sessions SET updated_at = '2999-01-01T00:00:00.000Z' WHERE id = 'claude:delta-new'", []).unwrap();
+
+    let third = call(3);
+    assert!(third["since_last_read"]["memories"].as_array().unwrap().iter().any(|m| m["id"] == mid),
+        "增量段要带上新记忆");
+    assert!(third["since_last_read"]["sessions"].as_array().unwrap().iter().any(|s| s["session_id"] == "claude:delta-new"),
+        "增量段要带上新会话");
+}

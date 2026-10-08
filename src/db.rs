@@ -1251,6 +1251,65 @@ pub fn project_context(conn: &Connection, project_id: i64) -> Result<Value> {
     }))
 }
 
+/// get_project_context 的增量段（多窗口共享看板"只在有变化时说话"裁定）：
+/// 上次读取之后该项目发生的变化——有新消息的会话、新增/变更的记忆（含全局）、
+/// 新交接。调用方负责提供 since（上次响应的 generated_at）；时间戳全部出自
+/// now_iso（RFC3339 毫秒 Z），字典序比较有效。宁多报勿漏报：查询窗口内落下
+/// 的写入会在下一次增量里再出现。
+pub fn changes_since(conn: &Connection, project_id: i64, since: &str) -> Result<Value> {
+    let sessions = {
+        let mut stmt = conn.prepare(
+            "SELECT id, agent, ended_at, message_count, updated_at FROM sessions
+             WHERE project_id = ?1 AND deleted_at IS NULL AND updated_at > ?2
+             ORDER BY updated_at DESC LIMIT 10",
+        )?;
+        let rows = stmt.query_map(params![project_id, since], |r| {
+            Ok(json!({
+                "session_id": r.get::<_, String>(0)?,
+                "agent": r.get::<_, String>(1)?,
+                "ended_at": r.get::<_, Option<String>>(2)?,
+                "messages": r.get::<_, i64>(3)?,
+                "updated_at": r.get::<_, String>(4)?,
+            }))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let memories = {
+        let mut stmt = conn.prepare(
+            "SELECT m.id, p.name, m.type, m.status, substr(m.content, 1, 160), m.updated_at
+             FROM memories m LEFT JOIN projects p ON p.id = m.project_id
+             WHERE (m.project_id = ?1 OR m.project_id IS NULL) AND m.updated_at > ?2
+             ORDER BY m.updated_at DESC LIMIT 10",
+        )?;
+        let rows = stmt.query_map(params![project_id, since], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "project": r.get::<_, Option<String>>(1)?,
+                "type": r.get::<_, String>(2)?,
+                "status": r.get::<_, String>(3)?,
+                "content": r.get::<_, String>(4)?,
+                "updated_at": r.get::<_, String>(5)?,
+            }))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let handoffs = {
+        let mut stmt = conn.prepare(
+            "SELECT id, title, created_at FROM handoffs
+             WHERE project_id = ?1 AND created_at > ?2 ORDER BY id DESC LIMIT 5",
+        )?;
+        let rows = stmt.query_map(params![project_id, since], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "title": r.get::<_, String>(1)?,
+                "created_at": r.get::<_, String>(2)?,
+            }))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    Ok(json!({ "since": since, "sessions": sessions, "memories": memories, "handoffs": handoffs }))
+}
+
 // ---------------------------------------------------------------- handoffs
 
 #[derive(Default)]
@@ -1860,7 +1919,30 @@ pub fn find_similar(conn: &Connection, content: &str, project_id: Option<i64>, r
 }
 
 pub fn update_memory_status(conn: &Connection, id: &str, action: &str, superseded_by: Option<&str>) -> Result<()> {
+    update_memory_status_at(conn, id, action, superseded_by, None)
+}
+
+/// 乐观并发校验（多窗口共享看板的版本号裁定）：调用方带着 `expected_updated_at`
+/// （上次读取到的 updated_at）做治理操作时，现值不符即拒绝——旧窗口的过期
+/// 判断不许覆盖新状态，先重新读取再决定这次操作。
+pub fn update_memory_status_at(
+    conn: &Connection,
+    id: &str,
+    action: &str,
+    superseded_by: Option<&str>,
+    expected_updated_at: Option<&str>,
+) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
+    if let Some(expected) = expected_updated_at {
+        let current: Option<String> = tx
+            .query_row("SELECT updated_at FROM memories WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?;
+        let current = current.ok_or_else(|| anyhow::anyhow!("memory not found: {id}"))?;
+        anyhow::ensure!(
+            current == expected,
+            "memory {id} 在你读取后已被修改（当前 updated_at={current}，你基于 {expected}）：先重新读取该记忆，再决定这次操作"
+        );
+    }
     let new_status = match action {
         "confirm" => "confirmed",
         "archive" => "archived",
