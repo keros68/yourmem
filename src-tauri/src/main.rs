@@ -1073,13 +1073,20 @@ fn maintenance_status() -> Value {
 }
 
 /// 本地自检（UI-DESIGN §8.5）：只读对账，报告直接渲染在设置页。
+/// 结果与后台自检同权记入 maintenance.json——一次干净的自检立即清掉
+/// Today 的红条，不用等次日后台自检。
 #[tauri::command]
 async fn doctor() -> Result<Value, String> {
     run_blocking(|| {
         let home = data_home();
         let conn = open()?;
         let _ = db::log_usage(&conn, "app", "doctor");
-        yourmem::doctor::run(&conn, &home).map_err(|e| e.to_string())
+        yourmem::doctor::run(&conn, &home)
+            .map(|r| {
+                let _ = yourmem::maintenance::record_doctor(&home, &r);
+                r
+            })
+            .map_err(|e| e.to_string())
     })
     .await
 }

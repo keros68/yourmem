@@ -1534,9 +1534,10 @@ async function renderSettings() {
     $("#doctor-report").innerHTML = '<div class="meta">自检中…</div>';
     try {
       const r = await invoke("doctor");
-      const icon = (s) => s === "ok" ? '<span class="cap-yes">✓</span>' : s === "warn" ? '<span class="cap-partial">⚠</span>' : '<span class="proof-bad">✗</span>';
+      const icon = (s) => s === "ok" ? '<span class="cap-yes">✓</span>' : s === "warn" ? '<span class="cap-partial">⚠</span>' : s === "skip" ? '<span style="color:var(--faint)">—</span>' : '<span class="proof-bad">✗</span>';
+      const skipped = r.checks.filter((c) => c.status === "skip").length;
       $("#doctor-report").innerHTML = `
-        <div class="meta" style="margin-top:6px">${r.ok ? '<span class="cap-yes">✓ 全部通过</span>' : '<span class="proof-bad">✗ 有失败项</span>'} · ${fmtTime(r.checked_at)}</div>
+        <div class="meta" style="margin-top:6px">${r.ok ? '<span class="cap-yes">✓ 全部通过</span>' : '<span class="proof-bad">✗ 有失败项</span>'}${skipped ? ` · ${skipped} 项跳过` : ""} · ${fmtTime(r.checked_at)}</div>
         <table>${r.checks.map((c) => `<tr><td>${icon(c.status)}</td><td style="white-space:nowrap">${esc(DOCTOR_NAMES[c.name] || c.name)}</td><td style="color:var(--dim)">${esc(c.detail)}</td></tr>`).join("")}</table>`;
     } catch (e) { $("#doctor-report").innerHTML = `<div class="meta">✗ 自检失败：${esc(e)}</div>`; }
   };

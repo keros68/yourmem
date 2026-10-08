@@ -20,7 +20,7 @@ const LOCK_WAIT: Duration = Duration::from_secs(5);
 const BUSY_RETRY_SECS: u64 = 600;
 
 /// The database or repository was locked by another writer: not a failure.
-fn is_busy(e: &anyhow::Error) -> bool {
+pub(crate) fn is_busy(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         c.downcast_ref::<rusqlite::Error>().and_then(|e| e.sqlite_error_code()).is_some_and(|code| {
             matches!(code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
@@ -127,6 +127,37 @@ pub fn snapshot_now(home: &Path) -> Result<Value> {
     Ok(r)
 }
 
+/// Self-check findings worth surfacing: warn/fail. `skip` (the check stepped
+/// aside because collection was running) is neutral, and "no snapshot yet" is
+/// only a problem while automatic snapshots are on and one has succeeded.
+fn doctor_problems(report: &Value, snapshot_counts: bool) -> Vec<Value> {
+    report["checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["status"] != "ok" && c["status"] != "skip")
+        .filter(|c| c["name"] != "db_snapshot" || snapshot_counts)
+        .cloned()
+        .collect()
+}
+
+/// Record a manual self-check (settings page) as the latest result, on a par
+/// with the daily background one: a clean run clears stale problems — such as
+/// an orphan count that raced a collection — without waiting for tomorrow.
+pub fn record_doctor(home: &Path, report: &Value) -> Result<()> {
+    let snapshot_counts = snapshot_interval_days(home) > 0 && load(home)["snapshot"]["ok"] == true;
+    let tmp_removed = load(home)["doctor"]["tmp_removed"].as_u64().unwrap_or(0);
+    update(home, |state| {
+        state["doctor_attempt_at"] = json!(now_secs());
+        state["doctor"] = json!({
+            "ok": report["ok"],
+            "at": report["checked_at"],
+            "problems": doctor_problems(report, snapshot_counts),
+            "tmp_removed": tmp_removed,
+        });
+    })
+}
+
 /// Run whatever is due. Each task records its attempt time, so a failing task
 /// is retried on its next interval rather than on every collection pass.
 pub fn run_due(home: &Path) -> Result<Value> {
@@ -193,17 +224,12 @@ pub fn run_due(home: &Path) -> Result<Value> {
         let snapshot_ok = load(home)["snapshot"]["ok"] == true;
         let doctor = match report {
             Ok(r) => {
-                let problems: Vec<Value> = r["checks"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|c| c["status"] != "ok")
-                    // "快照过旧"只在曾成功创建过快照时才算问题：关闭自动快照或首份
-                    // 尚未完成时不提示，失败另有快照状态说明
-                    .filter(|c| c["name"] != "db_snapshot" || (interval_days > 0 && snapshot_ok))
-                    .cloned()
-                    .collect();
-                json!({"ok": r["ok"], "at": r["checked_at"], "problems": problems, "tmp_removed": tmp_removed})
+                json!({
+                    "ok": r["ok"],
+                    "at": r["checked_at"],
+                    "problems": doctor_problems(&r, interval_days > 0 && snapshot_ok),
+                    "tmp_removed": tmp_removed,
+                })
             }
             Err(e) => json!({
                 "ok": false,
@@ -323,5 +349,31 @@ mod tests {
         let r = run_due(home).unwrap();
         assert!(r["ran"].as_array().unwrap().contains(&json!("snapshot")), "立即重试：{r}");
         assert_eq!(status(home)["snapshot"]["ok"], true);
+    }
+
+    #[test]
+    fn a_clean_manual_doctor_clears_stale_problems() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        crate::db::open(home).unwrap();
+        crate::ingest::write_config(home, &json!({"snapshot_interval_days": 0})).unwrap();
+        // 后台自检留下的旧问题：撞上采集中间态的孤儿误报
+        update(home, |state| {
+            state["doctor_attempt_at"] = json!(now_secs());
+            state["doctor"] = json!({"ok": true, "at": "2026-10-08T09:27:31Z", "tmp_removed": 3,
+                "problems": [{"name": "orphan_objects", "status": "warn", "detail": "9 个对象无引用"}]});
+        }).unwrap();
+
+        // 手动自检撞上采集：孤儿检查让路（skip），整体仍干净
+        let report = json!({"ok": true, "checked_at": "2026-10-08T10:00:00Z", "checks": [
+            {"name": "orphan_objects", "status": "skip", "detail": "正在采集，本轮跳过"},
+            {"name": "fts", "status": "ok", "detail": "一致"}]});
+        record_doctor(home, &report).unwrap();
+
+        let st = status(home);
+        assert!(st["doctor"]["problems"].as_array().unwrap().is_empty(), "skip 与干净自检都清掉旧问题：{st}");
+        assert_eq!(st["doctor"]["tmp_removed"], 3, "手动自检不清 tmp，保留原计数");
+        // 与后台自检同权记为一次尝试：当期不再重复跑
+        assert_eq!(run_due(home).unwrap()["ran"], json!([]));
     }
 }

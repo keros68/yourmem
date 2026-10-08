@@ -108,19 +108,40 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
         check("vault_missing", "fail", format!("{missing} / {} 个引用对象磁盘缺失，备份不完整", referenced.len()))
     });
 
-    // 5. 盘上未被引用的对象（泄漏：既不属 vault_lines 也不属 memory_revisions）
-    let orphans = stored.difference(&referenced).count();
     let tmp_residue = vault::tmp_files(home).len();
     checks.push(if tmp_residue == 0 {
         check("tmp_residue", "ok", "无崩溃残留的 tmp 文件")
     } else {
         check("tmp_residue", "warn", format!("{tmp_residue} 个 .tmp 残留（可手动删除，不影响完整性）"))
     });
-    checks.push(if orphans == 0 {
-        check("orphan_objects", "ok", "磁盘无未被引用的对象")
+
+    // 5. 盘上未被引用的对象（泄漏：既不属 vault_lines 也不属 memory_revisions）。
+    // 对象库先于引用它的 vault_lines 提交（崩溃安全顺序），采集进行中自检会把
+    // 在途对象数成"无引用"（真机首例 2026-10-08：9 个，两分钟后自愈为 0）。
+    // 粗数非空时拿导入锁再复数定论：拿到锁 = 此刻无人采集，结果可信；拿不到 =
+    // 正有采集或整理在跑，报 skip 让路，下轮自检补查。
+    let candidates = stored.difference(&referenced).count();
+    if candidates == 0 {
+        checks.push(check("orphan_objects", "ok", "磁盘无未被引用的对象"));
     } else {
-        check("orphan_objects", "warn", format!("{orphans} 个对象无引用（GC 之外的泄漏；purge 归档在 backups/ 不计入）"))
-    });
+        match crate::ingest::ImportLockTx::acquire(home, std::time::Duration::from_secs(2)) {
+            Ok(_lock) => {
+                let stored: std::collections::HashSet<String> =
+                    store.inventory()?.into_iter().map(|(h, _)| h).collect();
+                let referenced = crate::bundle::referenced_hashes(conn)?;
+                let orphans = stored.difference(&referenced).count();
+                checks.push(if orphans == 0 {
+                    check("orphan_objects", "ok", "磁盘无未被引用的对象")
+                } else {
+                    check("orphan_objects", "warn", format!("{orphans} 个对象无引用（GC 之外的泄漏；purge 归档在 backups/ 不计入）"))
+                });
+            }
+            Err(e) if crate::maintenance::is_busy(&e) => {
+                checks.push(check("orphan_objects", "skip", "正在采集，本轮跳过未引用原件检查，下次自检再查"));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
     // 6. memory_files 当前修订的对象都在（current_hash 悬空 = 详情页打不开）
     let cur_missing = {
@@ -203,5 +224,28 @@ mod tests {
         assert_eq!(r["ok"], false);
         assert!(r["checks"].as_array().unwrap().iter()
             .any(|c| c["name"] == "vault_missing" && c["status"] == "fail"));
+    }
+
+    #[test]
+    fn orphan_check_steps_aside_while_collection_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(dir.path()).unwrap();
+        let store = vault::Store::open(dir.path()).unwrap();
+        let hashes = store.put_many([b"unreferenced object".as_slice()]).unwrap();
+        assert_eq!(hashes.len(), 1);
+        let status_of = |r: &Value| {
+            r["checks"].as_array().unwrap().iter()
+                .find(|c| c["name"] == "orphan_objects").unwrap()["status"].clone()
+        };
+
+        // 无人采集：真泄漏如实上报
+        assert_eq!(status_of(&run(&conn, dir.path()).unwrap()), json!("warn"));
+
+        // 有采集持锁（对象库先于引用提交，此时计数必然虚高）：让路不拉假警报
+        let _import =
+            crate::ingest::ImportLockTx::acquire(dir.path(), std::time::Duration::from_secs(1)).unwrap();
+        let r = run(&conn, dir.path()).unwrap();
+        assert_eq!(status_of(&r), json!("skip"));
+        assert_eq!(r["ok"], true, "skip 是中性结果，不算失败：{r}");
     }
 }
