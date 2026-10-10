@@ -356,7 +356,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "read_session",
-                "description": "Read one session's normalized transcript. Long sessions return the LAST messages (current state); total_messages = full length. before_compact=true returns only the pre-compaction portion.",
+                "description": "Read one session's normalized transcript. Long sessions return the LAST messages (current state); total_messages = full length. before_compact=true returns only the pre-compaction portion. If the id is from your own agent and your harness has a native session-read tool, prefer that.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -411,7 +411,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "save_memory",
-                "description": "Save reusable knowledge. Decisions/rules default to suggested until user confirmation. Pass session_id and message_id for provenance. Check similar: supersede duplicates instead of accumulating copies. For lessons/preferences include scope, failed attempts, Why, How-to-apply; keep observed results apart from inference. Do not duplicate git, code or AGENTS.md/CLAUDE.md.",
+                "description": "Save reusable knowledge. Decisions/rules default to suggested until user confirmation. Pass session_id and message_id for provenance. Check similar: supersede duplicates instead of accumulating copies. For decisions record the problem, rejected alternatives and consequences. For lessons/preferences include scope, failed attempts, Why, How-to-apply; keep observed results apart from inference. Do not duplicate git, code or AGENTS.md/CLAUDE.md.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

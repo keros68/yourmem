@@ -892,7 +892,7 @@ async function renderMemory() {
           </select>
           <select id="mem-add-project"><option value="">全局</option></select>
         </div>
-        <textarea id="mem-add-content" rows="7" placeholder="${esc(EXPERIENCE_TEMPLATE)}"></textarea>
+        <textarea id="mem-add-content" rows="7" placeholder="${esc(DECISION_TEMPLATE)}"></textarea>
         <div class="meta">按实际证据填写，未验证的内容注明待验证。决策和规则保存后为待确认，可在列表中确认。</div>
         <button class="btn small primary" id="mem-add-save">保存</button>
       </div>
@@ -915,6 +915,7 @@ async function renderMemory() {
     } catch (e) { toast(`保存失败：${e}`); }
     finally { btn.disabled = false; }
   };
+  $("#mem-add-type").onchange = () => { $("#mem-add-content").placeholder = memoryTemplate($("#mem-add-type").value); };
   document.querySelectorAll("#page-memory .mem-aux").forEach((el) => {
     el.addEventListener("toggle", () => { if (el.open) memAuxOpen.add(el.dataset.aux); else memAuxOpen.delete(el.dataset.aux); });
   });
@@ -1074,6 +1075,12 @@ How to apply（做法）：
 验证方式与实际结果：
 来源：session_id / message_id 或文件与版本
 复查条件：`;
+const DECISION_TEMPLATE = `问题：要决定什么，当时的约束
+决定与理由：选了哪个，为什么
+被否方案：考虑过但否决的做法与原因（防止反复重新提出）
+后果：影响范围，何时复查
+来源：session_id / message_id 或文件与版本`;
+const memoryTemplate = (t) => (t === "decision" || t === "rule" ? DECISION_TEMPLATE : EXPERIENCE_TEMPLATE);
 
 async function renderSettings() {
   let aiSettingsError = "";
