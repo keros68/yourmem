@@ -566,6 +566,12 @@ pub fn path_key(path: &str) -> String {
     if cfg!(windows) {
         // 与 SQLite lower() 一致：只转 ASCII 字母
         path.trim_end_matches(['/', '\\']).replace('/', "\\").to_ascii_lowercase()
+    } else if cfg!(target_os = "macos") {
+        // macOS 默认文件系统大小写不敏感（保留大小写）：键同样折叠，否则
+        // "PROGRESS.md" 与自动发现的 "progress.md" 会被当成两个文件
+        // （project_docs 手动登记出重复项）。Linux 保持原样——常见文件系统
+        // 大小写敏感，折叠会把两个真实文件误判为同一个。
+        path.to_ascii_lowercase()
     } else {
         path.to_string()
     }

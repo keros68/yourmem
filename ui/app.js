@@ -1131,7 +1131,7 @@ async function renderSettings() {
         ${agentsInfo.agents.filter((a) => showDisabledSources || !a.disabled).map((a) => `<tr style="${a.disabled ? "opacity:.5" : ""}">
           <td><span class="pill ${esc(a.agent)}">${esc(a.agent)}</span></td>
           <td style="color:var(--dim);word-break:break-all">${esc(a.root)}</td>
-          <td>${a.detected ? "✓ 已检测到" : '<span style="color:var(--faint)">未发现</span>'}</td>
+          <td style="white-space:nowrap">${a.detected ? "✓ 已检测到" : '<span style="color:var(--faint)">未发现</span>'}</td>
           <td class="c-num">${a.sessions}</td>
           <td style="color:var(--dim);white-space:nowrap">${a.last_imported ? fmtTime(a.last_imported) : "—"}</td>
           <td>${(a.extra_roots || []).map((r) => `<div style="word-break:break-all">${esc(r)} <button class="btn small" data-rmroot="${esc(a.agent)}|${esc(r)}">移除</button></div>`).join("") || ""}</td>

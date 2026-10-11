@@ -37,9 +37,29 @@ fn organizer_calls_openai_compatible_endpoint_and_validates_sources() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buf = vec![0u8; 32_768];
-        let n = stream.read(&mut buf).unwrap();
-        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        // 按 Content-Length 读全请求：macOS 回环网卡单次 read 经常只交付
+        // 头部 + 部分 body，一次 read 就断言会把 "model" 误判为缺失。
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let n = stream.read(&mut chunk).unwrap();
+            assert!(n > 0, "client closed before sending the full request");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let body_len = head.lines()
+            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(str::to_string))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buf.len() < header_end + body_len {
+            let n = stream.read(&mut chunk).unwrap();
+            assert!(n > 0, "client closed mid-body");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let request = String::from_utf8_lossy(&buf).to_string();
         tx.send(request).unwrap();
         let content = json!({
             "overview": "今天推进了测试项目",

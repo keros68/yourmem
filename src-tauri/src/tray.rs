@@ -16,8 +16,16 @@ pub fn setup(app: &mut App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开 yourmem", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
+    // macOS 菜单栏惯例是单色 template 图标（系统按菜单栏深浅自动着色），
+    // 彩色应用图标缩到 18px 后深蓝底会糊进深色菜单栏；Windows 托盘保留彩色图标。
+    // tray-icon 的 template 标记仅 macOS 生效，其他平台传 false 即可。
     TrayIconBuilder::with_id("yourmem")
-        .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png"))?)
+        .icon(if cfg!(target_os = "macos") {
+            tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))?
+        } else {
+            tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png"))?
+        })
+        .icon_as_template(cfg!(target_os = "macos"))
         .tooltip("yourmem · 后台采集，每分钟检查一次")
         .menu(&menu)
         .show_menu_on_left_click(false)

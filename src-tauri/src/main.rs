@@ -466,7 +466,12 @@ fn auto_purge_set(enabled: bool) -> Result<Value, String> {
 fn first_run_state() -> Result<Value, String> {
     let home = data_home();
     let first_run = yourmem::is_first_run(&home);
-    let suggested_data = first_run.then(|| suggest_storage_dir("yourmem-data")).flatten();
+    // macOS 核心数据默认 ~/.yourmem 已是好默认值（向导预填 fr.home），不另给建议；
+    // 备份字段给家目录下独立文件夹的建议（suggest_storage_dir 的 macOS 分支）。
+    let suggested_data = first_run
+        .then(|| suggest_storage_dir("yourmem-data"))
+        .flatten()
+        .filter(|_| !cfg!(target_os = "macos"));
     let suggested_backup = first_run.then(|| suggest_storage_dir("yourmem-backup")).flatten();
     let agents = if first_run {
         yourmem::setup::detected_setup_agents(&yourmem::setup::Targets::default())
@@ -540,6 +545,13 @@ async fn first_run_configure(data_path: String, backup_path: String, agents: Vec
 /// 输出前缀随系统语言本地化（"Drives:"/"驱动器:"），解析按 token 形状匹配、
 /// 不认标签。注意子命令是 fsinfo——`fsutil fs drives` 在部分系统无效。
 fn suggest_storage_dir(name: &str) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        // 单盘系统，没有"非系统盘"概念：核心数据默认 ~/.yourmem 已合适，
+        // 这里只给备份一个家目录下独立文件夹的建议（快照/导出与数据物理分开）。
+        // 返回绝对路径（home_dir 展开后的原文），向导不做 ~ 展开。
+        let home = yourmem::home_dir().to_string_lossy().trim_end_matches('/').to_string();
+        return Some(format!("{home}/{name}"));
+    }
     if !cfg!(target_os = "windows") {
         return None;
     }
