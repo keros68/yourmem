@@ -3,7 +3,7 @@ use std::net::TcpListener;
 use std::sync::mpsc;
 
 use serde_json::json;
-use yourmem::{db, organizer};
+use yourmem::{db, dossier, organizer};
 
 fn settings(base_url: String) -> organizer::AiSettings {
     organizer::AiSettings {
@@ -135,4 +135,34 @@ fn saving_a_reviewed_project_summary_creates_confirmed_context_memory() {
     assert_eq!(kind, "context");
     assert!(content.contains("整理接口已完成"));
     assert!(content.contains("codex:s1"));
+}
+
+#[test]
+fn project_activity_is_bounded_and_contains_only_summary_fields() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let (pid, _) = db::add_project(&conn, "/tmp/research").unwrap();
+    for i in 0..101 {
+        conn.execute(
+            "INSERT INTO sessions(id,agent,native_id,project_id,file_path,started_at,ended_at,message_count,created_at,updated_at)
+             VALUES (?1,'codex',?2,?3,?4,'2026-10-24T01:00:00Z','2026-10-24T02:00:00Z',2,'2026-10-24T01:00:00Z','2026-10-24T02:00:00Z')",
+            rusqlite::params![format!("codex:s{i:03}"), format!("s{i:03}"), pid, format!("/tmp/s{i}.jsonl")],
+        ).unwrap();
+    }
+    conn.execute(
+        "INSERT INTO messages(session_id,line_no,ord,kind,content) VALUES
+         ('codex:s100',1,0,'user',?1),
+         ('codex:s100',2,0,'assistant',?2),
+         ('codex:s100',3,0,'tool_result','FULL_TOOL_OUTPUT_MUST_NOT_BE_SENT')",
+        rusqlite::params![format!("研究方法 {}", "x".repeat(300)) + "FULL_USER_SECRET", format!("分析结论 {}", "y".repeat(1800)) + "FULL_ASSISTANT_SECRET"],
+    ).unwrap();
+    let activity = dossier::project_activity(&conn, pid).unwrap();
+    let project = &activity["project_activity"][0];
+    assert_eq!(project["activities"].as_array().unwrap().len(), 100);
+    assert_eq!(activity["truncated"], true);
+    let serialized = activity.to_string();
+    assert!(!serialized.contains("FULL_USER_SECRET"));
+    assert!(!serialized.contains("FULL_ASSISTANT_SECRET"));
+    assert!(!serialized.contains("FULL_TOOL_OUTPUT_MUST_NOT_BE_SENT"));
+    assert_eq!(project["activities"][0]["session_id"], "codex:s100");
 }

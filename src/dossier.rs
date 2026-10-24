@@ -53,6 +53,12 @@ pub fn project_dossier(conn: &Connection, project_id: i64) -> Result<Value> {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     };
+    let confirmed_memories: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM memories WHERE project_id = ?1 AND status = 'confirmed'",
+        params![project_id], |r| r.get(0),
+    )?;
+    let memory_organize_suggested = overview["sessions"].as_i64().unwrap_or(0) >= 20
+        && confirmed_memories == 0;
 
     // 决策板数据（§7.2：confirmed 活跃；superseded 折叠为演变史——数据契约层就
     // 排除 suggested/archived，别让每个渲染端各自过滤）。行号 JOIN 必须同校验
@@ -262,12 +268,104 @@ pub fn project_dossier(conn: &Connection, project_id: i64) -> Result<Value> {
         "path": path,
         "overview": overview,
         "memory_counts": mem_counts,
+        "confirmed_memories": confirmed_memories,
+        "memory_organize_suggested": memory_organize_suggested,
         "decisions": decisions,
         "timeline": timeline,
         "lineage_edges": lineage_edges,
         "task_timeline": task_timeline,
         "artifacts": artifacts,
         "handoffs": handoffs,
+    }))
+}
+
+pub fn project_activity(conn: &Connection, project_id: i64) -> Result<Value> {
+    const SESSION_LIMIT: i64 = 100;
+    let tx = conn.unchecked_transaction()?;
+    let (name, path): (String, String) = tx.query_row(
+        "SELECT name,path FROM projects WHERE id=?1",
+        params![project_id], |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let visible = "s.deleted_at IS NULL AND s.message_count > 0";
+    let (session_count, message_count): (i64, i64) = tx.query_row(
+        &format!("SELECT COUNT(*),COALESCE(SUM(s.message_count),0) FROM sessions s WHERE s.project_id=?1 AND {visible}"),
+        params![project_id], |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let activities = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT s.id,s.agent,s.started_at,s.ended_at,s.message_count,
+                    (SELECT replace(substr(m.content,1,240),char(10),' ') FROM messages m
+                     WHERE m.session_id=s.id AND m.kind='user'
+                       AND substr(ltrim(m.content),1,1) NOT IN ('<','#')
+                     ORDER BY m.line_no,m.ord LIMIT 1),
+                    (SELECT substr(m.content,1,1600) FROM messages m
+                     WHERE m.session_id=s.id AND m.kind='assistant'
+                     ORDER BY m.line_no DESC,m.ord DESC LIMIT 1),
+                    (SELECT COUNT(*) FROM session_artifacts a WHERE a.session_id=s.id)
+             FROM sessions s WHERE s.project_id=?1 AND {visible}
+             ORDER BY COALESCE(s.ended_at,s.started_at) DESC,s.id DESC LIMIT {SESSION_LIMIT}"
+        ))?;
+        let rows = stmt.query_map(params![project_id], |r| Ok(json!({
+            "session_id": r.get::<_, String>(0)?,
+            "agent": r.get::<_, String>(1)?,
+            "started_at": r.get::<_, Option<String>>(2)?,
+            "ended_at": r.get::<_, Option<String>>(3)?,
+            "messages": r.get::<_, i64>(4)?,
+            "title": r.get::<_, Option<String>>(5)?,
+            "tail": r.get::<_, Option<String>>(6)?,
+            "artifact_count": r.get::<_, i64>(7)?,
+        })))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let agents = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT s.agent,COUNT(*),COALESCE(SUM(s.message_count),0) FROM sessions s
+             WHERE s.project_id=?1 AND {visible} GROUP BY s.agent ORDER BY COUNT(*) DESC,s.agent"
+        ))?;
+        let rows = stmt.query_map(params![project_id], |r| Ok(json!({
+            "agent": r.get::<_, String>(0)?,
+            "sessions": r.get::<_, i64>(1)?,
+            "messages": r.get::<_, i64>(2)?,
+        })))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let artifacts = {
+        let mut stmt = tx.prepare(
+            "SELECT a.path,a.tool,a.session_id,s.agent,a.created_at
+             FROM session_artifacts a JOIN sessions s ON s.id=a.session_id
+             WHERE a.project_id=?1 AND s.deleted_at IS NULL
+             ORDER BY a.created_at DESC,a.id DESC LIMIT 100",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| Ok(json!({
+            "path": r.get::<_, String>(0)?,
+            "tool": r.get::<_, Option<String>>(1)?,
+            "session_id": r.get::<_, String>(2)?,
+            "agent": r.get::<_, String>(3)?,
+            "created_at": r.get::<_, String>(4)?,
+        })))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let open_tasks = crate::db::open_tasks(&tx, Some(project_id))?;
+    let latest_handoff = crate::db::latest_handoff(&tx, project_id)?;
+    let truncated = session_count as usize > activities.len();
+    tx.commit()?;
+    Ok(json!({
+        "day": "项目卷宗",
+        "truncated": truncated,
+        "sessions": session_count,
+        "messages": message_count,
+        "project_activity": [{
+            "project_id": project_id,
+            "project": name,
+            "path": path,
+            "sessions": session_count,
+            "messages": message_count,
+            "agents": agents,
+            "activities": activities,
+            "artifacts": artifacts,
+            "open_tasks": open_tasks,
+            "latest_handoff": latest_handoff,
+        }],
     }))
 }
 

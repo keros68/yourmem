@@ -551,3 +551,44 @@ fn schema_v13_moves_imported_artifact_times_to_the_session_end() {
         "SELECT created_at FROM session_artifacts WHERE session_id = 'claude:dos1'", [], |r| r.get(0)).unwrap();
     assert!(at.starts_with("2026-08-23T09:01"), "{at}");
 }
+
+#[test]
+fn memory_organize_suggestion_requires_twenty_sessions_and_no_confirmed_project_memory() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let (pid, _) = db::add_project(&conn, "/tmp/research").unwrap();
+    let add_session = |i: usize| {
+        conn.execute(
+            "INSERT INTO sessions(id,agent,native_id,project_id,file_path,started_at,ended_at,message_count,created_at,updated_at)
+             VALUES (?1,'codex',?2,?3,?4,'2026-10-24T01:00:00Z','2026-10-24T02:00:00Z',1,'2026-10-24T01:00:00Z','2026-10-24T02:00:00Z')",
+            rusqlite::params![format!("codex:s{i}"), format!("s{i}"), pid, format!("/tmp/s{i}.jsonl")],
+        ).unwrap();
+    };
+    for i in 0..19 { add_session(i); }
+    assert_eq!(dossier::project_dossier(&conn, pid).unwrap()["memory_organize_suggested"], false);
+    add_session(19);
+    let d = dossier::project_dossier(&conn, pid).unwrap();
+    assert_eq!(d["memory_organize_suggested"], true);
+    assert_eq!(d["confirmed_memories"], 0);
+
+    conn.execute(
+        "INSERT INTO memories(id,project_id,scope,type,content,status,created_at,updated_at)
+         VALUES ('global',NULL,'global','context','全局记忆','confirmed','2026-10-24T03:00:00Z','2026-10-24T03:00:00Z')",
+        [],
+    ).unwrap();
+    assert_eq!(dossier::project_dossier(&conn, pid).unwrap()["memory_organize_suggested"], true);
+    conn.execute(
+        "INSERT INTO memories(id,project_id,scope,type,content,status,created_at,updated_at)
+         VALUES ('draft',?1,'project','decision','待确认','suggested','2026-10-24T03:00:00Z','2026-10-24T03:00:00Z')",
+        [pid],
+    ).unwrap();
+    assert_eq!(dossier::project_dossier(&conn, pid).unwrap()["memory_organize_suggested"], true);
+    conn.execute("UPDATE memories SET status='confirmed' WHERE id='draft'", []).unwrap();
+    let d = dossier::project_dossier(&conn, pid).unwrap();
+    assert_eq!(d["confirmed_memories"], 1);
+    assert_eq!(d["memory_organize_suggested"], false);
+
+    conn.execute("UPDATE memories SET status='archived' WHERE id='draft'", []).unwrap();
+    db::set_session_deleted(&conn, "codex:s19", true).unwrap();
+    assert_eq!(dossier::project_dossier(&conn, pid).unwrap()["memory_organize_suggested"], false);
+}

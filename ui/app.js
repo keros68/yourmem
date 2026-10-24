@@ -130,7 +130,7 @@ function showAiSetupReminder() {
   const ov = document.createElement("div");
   ov.id = "activity-ai-overlay";
   ov.innerHTML = `<section class="ai-setup-reminder"><header><div><h2>需要先配置 AI</h2><p>AI 整理是可选功能，不影响本地动态与日报。</p></div><button id="activity-ai-close" title="关闭"><img src="icons/x.svg" alt=""></button></header>
-    <div class="ai-setup-reminder-body"><p>请填写兼容 OpenAI 的 API 地址、模型名称和 API Key，保存后即可整理当天活动。</p>
+    <div class="ai-setup-reminder-body"><p>请填写兼容 OpenAI 的 API 地址、模型名称和 API Key，保存后即可整理对话记录。</p>
       <div class="activity-ai-actions"><button class="btn" id="activity-ai-later">稍后</button><button class="btn primary" id="activity-ai-settings">前往 AI 设置</button></div></div></section>`;
   document.body.appendChild(ov);
   const close = () => ov.remove();
@@ -144,7 +144,7 @@ function showAiSetupReminder() {
   ov.onclick = (e) => { if (e.target === ov) close(); };
 }
 
-function bindActivityAi(digest) {
+function bindActivityAi(fallbackDay) {
   const out = $("#activity-ai-result");
   out.innerHTML = aiSummaryHtml(activityAiResponse, activitySaved);
   out.querySelectorAll("[data-ai-source]").forEach((b) => { b.onclick = () => showSession(b.dataset.aiSource); });
@@ -153,14 +153,14 @@ function bindActivityAi(digest) {
       const i = Number(b.dataset.aiSave);
       b.disabled = true;
       try {
-        await invoke("ai_summary_save", { day: activityAiResponse.day || digest.day, summary: activityAiResponse.result.projects[i] });
-        activitySaved.add(i); bindActivityAi(digest); toast("已保存为项目记忆");
+        await invoke("ai_summary_save", { day: activityAiResponse.day || fallbackDay, summary: activityAiResponse.result.projects[i] });
+        activitySaved.add(i); bindActivityAi(fallbackDay); toast("已保存为项目记忆");
       } catch (e) { b.disabled = false; toast(String(e)); }
     };
   });
 }
 
-async function showActivityAi(digest) {
+async function showAiPreview({ title, day, command, args }) {
   let config = null;
   try { config = await invoke("ai_settings_get"); } catch (e) {}
   if (!config?.configured) {
@@ -170,19 +170,27 @@ async function showActivityAi(digest) {
   closeActivityAi();
   const ov = document.createElement("div");
   ov.id = "activity-ai-overlay";
-  ov.innerHTML = `<section><header><div><h2>AI 整理 · ${esc(digest.day)}</h2><p>这是预览，不会自动写入记忆。</p></div><button id="activity-ai-close" title="关闭"><img src="icons/x.svg" alt=""></button></header>
+  ov.innerHTML = `<section><header><div><h2>AI 整理 · ${esc(title)}</h2><p>这是预览，不会自动写入记忆。</p></div><button id="activity-ai-close" title="关闭"><img src="icons/x.svg" alt=""></button></header>
     <div class="activity-ai-note">单次仅发送对话标题、末条 Agent 回复、任务、产物路径和交接摘要，不发送完整对话、文件内容或 API Key。</div>
     <div id="activity-ai-result"><div class="state loading">加载中</div></div></section>`;
   document.body.appendChild(ov);
   $("#activity-ai-close").onclick = closeActivityAi;
   ov.onclick = (e) => { if (e.target === ov) closeActivityAi(); };
   try {
-    activityAiResponse = await invoke("ai_organize_day", { day: digest.day });
+    activityAiResponse = await invoke(command, args);
     if (!document.getElementById("activity-ai-result")) return;
-    activitySaved.clear(); bindActivityAi(digest);
+    activitySaved.clear(); bindActivityAi(day);
   } catch (e) {
     if ($("#activity-ai-result")) $("#activity-ai-result").innerHTML = `<div class="state error">AI 整理失败：${esc(String(e))}</div>`;
   }
+}
+
+function showActivityAi(digest) {
+  return showAiPreview({ title: digest.day, day: digest.day, command: "ai_organize_day", args: { day: digest.day } });
+}
+
+function showProjectAi(pid, project) {
+  return showAiPreview({ title: project, day: "项目卷宗", command: "ai_organize_project", args: { projectId: pid } });
 }
 
 function paintActivity() {
@@ -526,6 +534,7 @@ async function showProject(pid) {
     <h1 style="font-size:16px">卷宗 · ${esc(d.project)}</h1>
     <div class="lineage">${esc(d.path)} · 活跃 ${fmtTime(o.first_activity)} → ${fmtTime(o.last_activity)} ·
       ${o.sessions} 对话 · ${o.messages} 消息 · ${o.agents} 种 agent</div>
+    ${d.memory_organize_suggested ? `<div class="memcard"><div class="content">${o.sessions} 段对话，暂无已确认记忆。</div><div class="meta"><button class="btn small primary" id="project-ai">从对话整理记忆</button></div></div>` : ""}
     <h2>继续工作</h2><div id="project-continuation">加载中…</div>
     <h2>来源复查</h2><div class="memcard" id="project-review">检测中…</div>
     <h2>项目文档（${pdocs.docs.length}）</h2>
@@ -565,6 +574,8 @@ async function showProject(pid) {
   document.querySelectorAll("#drawer-content [data-doc-untrack]").forEach((b) => {
     b.onclick = () => trackDoc("project_doc_untrack", b.dataset.docUntrack);
   });
+  const projectAi = $("#project-ai");
+  if (projectAi) projectAi.onclick = () => showProjectAi(pid, d.project);
   // 谱系图节点可点（跨项目父节点 .ext 只有 id，无数据不可点）+ 当前节点滚入视口
   afterGraphRender("#drawer-content");
   loadProjectRecall({ invoke, drawer, request, pid, $, esc, fmtTime, showSession, toast });

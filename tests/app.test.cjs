@@ -22,7 +22,7 @@ function app() {
   vm.runInContext(ui('project-recall.js').replace('export async function', 'async function'), context);
   vm.runInContext(ui('graph-layout.js').replaceAll('export function', 'function'), context);
   const bundleCode = ui('app.js').slice(ui('app.js').indexOf('  let bundleBusy = false'), ui('app.js').indexOf('  $("#auto-purge").onchange'));
-  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, renderToday, foldSubtasks, bindBundleForTest, renderSearch, renderMemory, renderProjects, projectMergeSummary, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
+  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, renderToday, foldSubtasks, bindBundleForTest, renderSearch, renderMemory, renderProjects, projectMergeSummary, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, showProjectAi, setMemoryView: v => { memView = v; } };', context);
   return { ...context.testApp, context, get, lists, requests, notices };
 }
 
@@ -231,6 +231,24 @@ test('AI organization explains missing configuration and offers a direct setting
   assert.match(html, /需要先配置 AI/);
   assert.match(html, /AI 整理是可选功能，不影响本地动态与日报/);
   assert.match(html, /前往 AI 设置/);
+});
+
+test('project dossier organization uses the project preview command', async () => {
+  const f = app();
+  const pending = f.showProjectAi(7, '科研项目');
+  assert.equal(f.requests.at(-1).command, 'ai_settings_get');
+  f.requests.at(-1).resolve({ configured: true });
+  await new Promise(setImmediate);
+  const request = f.requests.at(-1);
+  assert.equal(request.command, 'ai_organize_project');
+  assert.equal(request.args.projectId, 7);
+  assert.match(f.notices.at(-1).innerHTML, /AI 整理 · 科研项目/);
+  assert.match(f.notices.at(-1).innerHTML, /这是预览，不会自动写入记忆/);
+  request.resolve({ day: '项目卷宗', result: { projects: [] } });
+  await pending;
+  const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
+  assert.match(source, /d\.memory_organize_suggested \?/);
+  assert.match(source, /从对话整理记忆/);
 });
 
 test('update controls install in app and retain GitHub only as a failure fallback', () => {

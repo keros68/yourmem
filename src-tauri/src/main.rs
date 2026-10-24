@@ -265,6 +265,21 @@ async fn ai_organize_day(day: Option<String>) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn ai_organize_project(project_id: i64) -> Result<Value, String> {
+    run_blocking(move || {
+        let home = data_home();
+        let settings = yourmem::organizer::load_settings(&home);
+        let (key, _) = ai_key_from_store()?.ok_or_else(|| "尚未配置 API Key".to_string())?;
+        let conn = db::open(&home).map_err(|e| e.to_string())?;
+        let activity = yourmem::dossier::project_activity(&conn, project_id).map_err(|e| e.to_string())?;
+        let out = yourmem::organizer::organize_with_api(&settings, &key, &activity)
+            .map_err(|e| format!("{e:#}"))?;
+        let _ = db::log_usage(&conn, "app", "ai_organize_project");
+        Ok(out)
+    }).await
+}
+
+#[tauri::command]
 fn ai_summary_save(day: String, summary: Value) -> Result<Value, String> {
     let conn = open()?;
     let out = yourmem::organizer::save_project_summary(&conn, &day, &summary)
@@ -1283,7 +1298,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             session_window, message_content, maintenance_status, collect_progress, memory_add, stats, projects, context, project_dossier, project_doc_track, project_doc_untrack, daily_digest, daily_digest_export, sessions,
-            ai_settings_get, ai_settings_save, ai_organize_day, ai_summary_save,
+            ai_settings_get, ai_settings_save, ai_organize_day, ai_organize_project, ai_summary_save,
             project_add, project_archive, project_restore, project_merge_plan, project_merge, open_in_finder,
             session_proof, session_verify, session_export, session_writeback_plan,
             session_writeback, capability_matrix,
