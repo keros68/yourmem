@@ -642,9 +642,11 @@ fn active_project_ancestors(conn: &Connection, cwd: &str) -> Result<Vec<(i64, St
 
 /// Resolve a cwd using the git root first. Outside a repository, the nearest
 /// active registered ancestor wins; otherwise the cwd remains the project root.
+/// 运行现场（临时目录、ai-cross、.dispatch、子代理工作树）不做上级归属：
+/// 它们建即归档、各自独立，不能并入宿主或被审项目。
 pub fn project_root_for_conn(conn: &Connection, cwd: &str) -> Result<(String, String)> {
     let (root, name) = project_root_for(cwd);
-    if Path::new(&root).join(".git").exists() {
+    if crate::is_scratch_path(cwd) || Path::new(&root).join(".git").exists() {
         return Ok((root, name));
     }
     if let Some((_, name, path)) = active_project_ancestors(conn, cwd)?.into_iter().next() {
@@ -1301,7 +1303,7 @@ pub fn resolve_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>
         return Ok(row);
     }
     if let Some(cwd) = cwd {
-        // 非 git 目录与导入共用归属规则；已废弃项目只能按 ident 显式解析。
+        // 非 git 目录与导入共用归属规则。
         let (root, _) = project_root_for_conn(conn, cwd)?;
         let sep = if cfg!(windows) { "\\" } else { "/" };
         let ancestor_match = if Path::new(&root).join(".git").exists() {
@@ -1326,6 +1328,28 @@ pub fn resolve_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>
             .optional()?;
         if row.is_some() {
             return Ok(row);
+        }
+        // cwd 落在已废弃项目（含其子目录）时返回该项目本身，不落"最近活跃"兜底——
+        // 盲审等运行现场目录的上下文不应串到被审项目。
+        let archived = conn
+            .query_row(
+                &format!(
+                    "SELECT id, name, path FROM projects
+                     WHERE archived_at IS NOT NULL
+                       AND ({PATH_KEY_SQL} = ?1 OR substr(?1, 1, length({PATH_KEY_SQL}) + 1) = {PATH_KEY_SQL} || ?2)
+                     ORDER BY LENGTH(path) DESC LIMIT 1"
+                ),
+                params![path_key(cwd), sep],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if archived.is_some() {
+            return Ok(archived);
+        }
+        // 未登记为项目的运行现场目录同样不落兜底：没有命中就是无项目，
+        // 不能把盲审/运行目录的上下文串到最近活跃项目。
+        if crate::is_scratch_path(cwd) {
+            return Ok(None);
         }
     }
     // fall back to the single most recently active project（不含已废弃项目：

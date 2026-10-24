@@ -1437,10 +1437,10 @@ fn memory_with_double_quotes_saves() {
 fn resolve_project_by_cwd_skips_archived_fallback() {
     let home = tempfile::tempdir().unwrap();
     let conn = db::open(home.path()).unwrap();
-    let base = tempfile::tempdir().unwrap();
-    let proj = base.path().join("proj");
+    // 用虚构的非临时目录：临时目录属运行现场，不参与上级归属
+    let base = std::path::PathBuf::from("/work/resolve-cwd-test");
+    let proj = base.join("proj");
     let sub = proj.join("sub");
-    std::fs::create_dir_all(&sub).unwrap();
     let (pid, _) = db::add_project(&conn, proj.to_str().unwrap()).unwrap();
     // 子目录（非 git）按前缀命中所在项目
     let hit = db::resolve_project(&conn, None, sub.to_str()).unwrap().unwrap();
@@ -1454,7 +1454,7 @@ fn resolve_project_by_cwd_skips_archived_fallback() {
     }
     // 兜底不选已废弃项目
     db::set_project_archived(&conn, pid, true).unwrap();
-    let other = base.path().join("elsewhere");
+    let other = base.join("elsewhere");
     assert!(db::resolve_project(&conn, None, other.to_str()).unwrap().is_none());
 }
 

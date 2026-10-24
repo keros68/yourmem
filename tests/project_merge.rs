@@ -10,11 +10,11 @@ fn text(path: &Path) -> &str {
 fn non_git_cwd_uses_nearest_active_project_and_its_context() {
     let home = tempfile::tempdir().unwrap();
     let conn = db::open(home.path()).unwrap();
-    let base = tempfile::tempdir().unwrap();
-    let root = base.path().join("research");
+    // 用虚构的非临时目录：临时目录属运行现场，不参与上级归属
+    let base = std::path::PathBuf::from("/work/pm-non-git");
+    let root = base.join("research");
     let nested = root.join("drafts");
     let cwd = nested.join("current").join("figures");
-    std::fs::create_dir_all(&cwd).unwrap();
     let (root_id, _) = db::add_project(&conn, text(&root)).unwrap();
     let (nested_id, _) = db::add_project(&conn, text(&nested)).unwrap();
 
@@ -80,10 +80,9 @@ fn home_temp_and_filesystem_root_cannot_capture_descendants() {
 fn windows_ancestor_matching_ignores_case_and_separators() {
     let home = tempfile::tempdir().unwrap();
     let conn = db::open(home.path()).unwrap();
-    let base = tempfile::tempdir().unwrap();
-    let parent = base.path().join("Research");
+    let base = std::path::PathBuf::from("/work/pm-win-case");
+    let parent = base.join("Research");
     let cwd = parent.join("Drafts").join("Current");
-    std::fs::create_dir_all(&cwd).unwrap();
     let (pid, _) = db::add_project(&conn, text(&parent)).unwrap();
     let variant = text(&cwd).replace('\\', "/").to_uppercase();
 
@@ -95,10 +94,9 @@ fn windows_ancestor_matching_ignores_case_and_separators() {
 fn merge_previews_and_moves_all_assets_then_archives_without_revival() {
     let home = tempfile::tempdir().unwrap();
     let conn = db::open(home.path()).unwrap();
-    let base = tempfile::tempdir().unwrap();
-    let parent = base.path().join("research");
+    let base = std::path::PathBuf::from("/work/pm-merge");
+    let parent = base.join("research");
     let child = parent.join("current");
-    std::fs::create_dir_all(&child).unwrap();
     let (parent_id, _) = db::add_project(&conn, text(&parent)).unwrap();
     let (child_id, _) = db::add_project(&conn, text(&child)).unwrap();
     conn.execute(
@@ -155,4 +153,60 @@ fn merge_previews_and_moves_all_assets_then_archives_without_revival() {
     assert!(still_archived.is_some());
     assert_eq!(db::project_root_for_conn(&conn, text(&child)).unwrap().0, text(&parent));
     assert_eq!(db::resolve_project(&conn, None, Some(text(&child))).unwrap().unwrap().0, parent_id);
+}
+
+#[test]
+fn archived_scratch_cwd_never_falls_back_to_most_active_project() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    // 最近活跃的普通项目：旧的"最近活跃"兜底会把它返回给任何未命中的 cwd
+    let active_id = db::upsert_project(&conn, "/work/reviewed-project", "reviewed-project").unwrap();
+    let scratch = yourmem::home_dir()
+        .join(".aicross")
+        .join("scratch")
+        .join("20261024-101010-blind")
+        .join("codex.openai");
+    let scratch = text(&scratch);
+    let scratch_id = db::upsert_project(&conn, scratch, "codex.openai").unwrap();
+    let archived: Option<String> = conn
+        .query_row("SELECT archived_at FROM projects WHERE id = ?1", [scratch_id], |r| r.get(0))
+        .unwrap();
+    assert!(archived.is_some(), "盲审目录新建即归档");
+
+    for cwd in [scratch.to_string(), Path::new(scratch).join("notes").to_string_lossy().to_string()] {
+        let hit = db::resolve_project(&conn, None, Some(&cwd)).unwrap().unwrap();
+        assert_eq!(hit.0, scratch_id, "{cwd} 应命中已归档项目本身");
+        assert_ne!(hit.0, active_id, "{cwd} 不得落到最近活跃项目");
+    }
+    // 未登记为项目的盲审目录：返回 None，同样不落兜底
+    let unregistered = yourmem::home_dir()
+        .join(".aicross")
+        .join("scratch")
+        .join("20261016-103711-blind")
+        .join("agy.google");
+    assert!(db::resolve_project(&conn, None, Some(text(&unregistered))).unwrap().is_none());
+}
+
+#[test]
+fn dispatch_dirs_under_non_git_project_stay_independent_archived_projects() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let parent_id = db::upsert_project(&conn, "/work/research-non-git", "research-non-git").unwrap();
+    for cwd in [
+        "/work/research-non-git/.dispatch/runtime/runs/x",
+        "/work/research-non-git/.dispatch/20261024-blind",
+    ] {
+        let (root, _) = db::project_root_for_conn(&conn, cwd).unwrap();
+        assert_eq!(root, cwd, "运行现场不做上级归属");
+        let id = db::upsert_project(&conn, &root, "run").unwrap();
+        assert_ne!(id, parent_id);
+        let archived: Option<String> = conn
+            .query_row("SELECT archived_at FROM projects WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert!(archived.is_some(), "{cwd} 仍新建为已归档项目");
+    }
+    let parent_archived: Option<String> = conn
+        .query_row("SELECT archived_at FROM projects WHERE id = ?1", [parent_id], |r| r.get(0))
+        .unwrap();
+    assert!(parent_archived.is_none(), "所在项目本身保持活跃");
 }

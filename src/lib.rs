@@ -196,10 +196,11 @@ fn is_run_site_path_in(path: &str, roots: &[PathBuf]) -> bool {
         .any(|r| is_under_dir(path, &r.join("runs")) || is_under_dir(path, &r.join("scratch")))
 }
 
-/// 项目内的派工运行目录（`<项目>/.dispatch/runtime/runs/...`）与 Claude Code 为子代理
-/// 建的工作树（`<项目>/.claude/worktrees/...`）：同属运行现场，只认这两段之下的目录。
+/// 项目内的派工现场（`<项目>/.dispatch/` 之下的目录：运行目录、盲审/执行工作目录
+/// 等）与 Claude Code 为子代理建的工作树（`<项目>/.claude/worktrees/...`）：
+/// 同属运行现场，只认这两段之下的目录，`.dispatch` 本身不算。
 pub fn is_dispatch_site_path(path: &str) -> bool {
-    const MARKERS: [&[&str]; 2] = [&[".dispatch", "runtime", "runs"], &[".claude", "worktrees"]];
+    const MARKERS: [&[&str]; 2] = [&[".dispatch"], &[".claude", "worktrees"]];
     let path = path.replace('\\', "/");
     let parts: Vec<String> = path
         .split('/')
@@ -213,7 +214,7 @@ pub fn is_dispatch_site_path(path: &str) -> bool {
     })
 }
 
-/// 运行现场（临时目录、ai-cross 运行与盲审目录、项目内派工运行目录与子代理工作树）：
+/// 运行现场（临时目录、ai-cross 运行与盲审目录、项目内 .dispatch 派工目录与子代理工作树）：
 /// 会话照常采集，项目归入已废弃项目。
 pub fn is_scratch_path(path: &str) -> bool {
     is_temp_path(path) || is_run_site_path(path) || is_dispatch_site_path(path)
@@ -375,11 +376,18 @@ mod tests {
     #[test]
     fn dispatch_runs_and_worktrees_are_run_sites() {
         assert!(is_dispatch_site_path(r"D:\work\p5b\.dispatch\runtime\runs\task-1\arb-kimi"));
+        // .dispatch 之下的任意子目录都算运行现场，不只 runtime/runs
+        assert!(is_dispatch_site_path(r"D:\work\p5b\.dispatch\runtime\runs\task-1"));
+        assert!(is_dispatch_site_path("/work/agentteam/.dispatch/kimi-ui-20260831"));
+        assert!(is_dispatch_site_path("/work/agentteam/.dispatch/traces/blind-1"));
         assert!(is_dispatch_site_path("/work/poket/.claude/worktrees/agent-a065"));
         assert!(!is_dispatch_site_path("/work/poket/.claude/worktrees"), "目录本身不算");
         assert!(!is_dispatch_site_path("/work/poket/.claude"));
+        assert!(!is_dispatch_site_path("/work/p5b/.dispatch"), ".dispatch 本身不算");
+        assert!(!is_dispatch_site_path("/work/p5b"));
         assert!(!is_dispatch_site_path("/work/runtime/runs/x"));
         assert!(!is_dispatch_site_path("/work/real-project"));
+        assert!(!is_dispatch_site_path("/work/p5b/dispatch/x"), "没有点前缀的不算");
     }
 
     #[test]
