@@ -145,7 +145,7 @@ fn import_session(
 
     let project_id = match sess.directory.as_deref() {
         Some(dir) => {
-            let (root, name) = db::project_root_for(dir);
+            let (root, name) = db::project_root_for_conn(conn, dir)?;
             Some(db::upsert_project(conn, &root, &name)?)
         }
         None => None,

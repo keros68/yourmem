@@ -150,8 +150,8 @@ table.fixed th.c-name, table.fixed td.c-name { width: 150px; }
 table.fixed th.c-agents, table.fixed td.c-agents { width: 230px; }
 #projects-table td.c-agents { white-space: normal; }
 #projects-table .pill { font-size: 11px; padding: 2px 7px; }
-/* Projects 页行内单按钮操作列：回收站的双按钮 150px 在这里会把 fixed 表挤爆 */
-#projects-table th.c-act, #projects-table td.c-act { width: 56px; }
+/* Projects 页并入上级与废弃双按钮 */
+#projects-table th.c-act, #projects-table td.c-act { width: 150px; }
 table.fixed td { overflow: hidden; text-overflow: ellipsis; }
 /* 摘要列不定宽，吃掉其余列之外的全部宽度；数字列完整显示，不加省略号 */
 table.fixed td.c-num { text-overflow: clip; white-space: nowrap; }

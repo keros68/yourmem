@@ -584,6 +584,50 @@ pub fn path_key(path: &str) -> String {
     }
 }
 
+fn same_dir(a: &str, b: &Path) -> bool {
+    crate::is_under_dir(a, b) && crate::is_under_dir(&b.to_string_lossy(), Path::new(a))
+}
+
+fn eligible_project_ancestor(path: &str, cwd: &str) -> bool {
+    if !crate::is_under_dir(cwd, Path::new(path)) || same_dir(path, Path::new(cwd)) {
+        return false;
+    }
+    let candidate = Path::new(path);
+    if candidate.parent().is_none()
+        || same_dir(path, &crate::home_dir())
+        || same_dir(path, &std::env::temp_dir())
+    {
+        return false;
+    }
+    true
+}
+
+fn active_project_ancestors(conn: &Connection, cwd: &str) -> Result<Vec<(i64, String, String)>> {
+    let mut stmt = conn.prepare("SELECT id, name, path FROM projects WHERE archived_at IS NULL")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+    })?;
+    let mut projects = rows.collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, _, path)| eligible_project_ancestor(path, cwd))
+        .collect::<Vec<_>>();
+    projects.sort_by(|a, b| path_key(&b.2).len().cmp(&path_key(&a.2).len()).then(a.0.cmp(&b.0)));
+    Ok(projects)
+}
+
+/// Resolve a cwd using the git root first. Outside a repository, the nearest
+/// active registered ancestor wins; otherwise the cwd remains the project root.
+pub fn project_root_for_conn(conn: &Connection, cwd: &str) -> Result<(String, String)> {
+    let (root, name) = project_root_for(cwd);
+    if Path::new(&root).join(".git").exists() {
+        return Ok((root, name));
+    }
+    if let Some((_, name, path)) = active_project_ancestors(conn, cwd)?.into_iter().next() {
+        return Ok((path, name));
+    }
+    Ok((root, name))
+}
+
 fn archive_projects_where(conn: &Connection, matches: fn(&str) -> bool) -> Result<()> {
     let ids: Vec<i64> = {
         let mut stmt = conn.prepare("SELECT id, path FROM projects WHERE archived_at IS NULL")?;
@@ -1144,6 +1188,65 @@ pub fn set_project_archived(conn: &Connection, id: i64, archived: bool) -> Resul
     Ok(())
 }
 
+/// Preview moving every project asset to an active strict ancestor. With no
+/// explicit parent, the nearest eligible ancestor is the suggested target.
+pub fn project_merge_plan(conn: &Connection, child_id: i64, parent_id: Option<i64>) -> Result<Value> {
+    let (child_name, child_path): (String, String) = conn
+        .query_row(
+            "SELECT name, path FROM projects WHERE id = ?1 AND archived_at IS NULL",
+            params![child_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("project not found or already archived: {child_id}"))?;
+    let targets = active_project_ancestors(conn, &child_path)?;
+    let target = match parent_id {
+        Some(id) => targets.iter().find(|(target_id, _, _)| *target_id == id),
+        None => targets.first(),
+    }
+    .ok_or_else(|| anyhow::anyhow!("target must be an active, eligible strict ancestor"))?;
+    let count = |table: &str| -> Result<i64> {
+        Ok(conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE project_id = ?1"),
+            params![child_id],
+            |r| r.get(0),
+        )?)
+    };
+    let target_json = |(id, name, path): &(i64, String, String)| json!({
+        "id": id, "name": name, "path": path,
+    });
+    Ok(json!({
+        "child": { "id": child_id, "name": child_name, "path": child_path },
+        "parent": target_json(target),
+        "targets": targets.iter().map(target_json).collect::<Vec<_>>(),
+        "sessions": count("sessions")?,
+        "memories": count("memories")?,
+        "artifacts": count("session_artifacts")?,
+        "handoffs": count("handoffs")?,
+    }))
+}
+
+/// Execute a previously previewed merge atomically. Recompute the plan inside
+/// the transaction so changed counts or project states cannot bypass validation.
+pub fn merge_project(conn: &Connection, child_id: i64, parent_id: i64) -> Result<Value> {
+    let tx = conn.unchecked_transaction()?;
+    let mut plan = project_merge_plan(&tx, child_id, Some(parent_id))?;
+    for table in ["sessions", "handoffs", "memories", "session_artifacts"] {
+        tx.execute(
+            &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
+            params![parent_id, child_id],
+        )?;
+    }
+    tx.execute(
+        "UPDATE projects SET archived_at = ?2, updated_at = ?2 WHERE id = ?1",
+        params![child_id, now_iso()],
+    )?;
+    tx.commit()?;
+    plan["merged"] = json!(true);
+    plan["child"]["archived"] = json!(true);
+    Ok(plan)
+}
+
 /// `resolve_project`，找不到即报错。
 pub fn require_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>) -> Result<(i64, String, String)> {
     resolve_project(conn, ident, cwd)?
@@ -1172,17 +1275,26 @@ pub fn resolve_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>
         return Ok(row);
     }
     if let Some(cwd) = cwd {
-        // 与 upsert_project 同一身份键：Windows 下不同 agent 报来的路径大小写/分隔符不一
-        let (root, _) = project_root_for(cwd);
+        // 非 git 目录与导入共用归属规则；已废弃项目只能按 ident 显式解析。
+        let (root, _) = project_root_for_conn(conn, cwd)?;
         let sep = if cfg!(windows) { "\\" } else { "/" };
+        let ancestor_match = if Path::new(&root).join(".git").exists() {
+            format!("OR substr(?1, 1, length({PATH_KEY_SQL}) + 1) = {PATH_KEY_SQL} || ?2")
+        } else {
+            String::new()
+        };
+        let mut query_params = vec![path_key(&root)];
+        if !ancestor_match.is_empty() {
+            query_params.push(sep.to_string());
+        }
         let row = conn
             .query_row(
                 &format!(
                     "SELECT id, name, path FROM projects
-                     WHERE {PATH_KEY_SQL} = ?1 OR substr(?1, 1, length({PATH_KEY_SQL}) + 1) = {PATH_KEY_SQL} || ?2
+                     WHERE archived_at IS NULL AND ({PATH_KEY_SQL} = ?1 {ancestor_match})
                      ORDER BY LENGTH(path) DESC LIMIT 1"
                 ),
-                params![path_key(&root), sep],
+                rusqlite::params_from_iter(query_params),
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;

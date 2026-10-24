@@ -78,6 +78,16 @@ fn project_restore(id: i64) -> Result<Value, String> {
     Ok(json!({ "id": id, "archived": false }))
 }
 
+#[tauri::command]
+fn project_merge_plan(id: i64, parent_id: Option<i64>) -> Result<Value, String> {
+    db::project_merge_plan(&open()?, id, parent_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn project_merge(id: i64, parent_id: i64) -> Result<Value, String> {
+    db::merge_project(&open()?, id, parent_id).map_err(|e| e.to_string())
+}
+
 /// 在系统文件管理器中打开路径（右键菜单）：reveal=true 定位文件本身，false 打开目录。
 /// macOS 用 open（reveal 加 -R）；Windows 用 explorer（/select 逗号分隔无空格）；
 /// Linux 的 xdg-open 无 reveal 能力，退化为打开所在目录。
@@ -1274,7 +1284,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             session_window, message_content, maintenance_status, collect_progress, memory_add, stats, projects, context, project_dossier, project_doc_track, project_doc_untrack, daily_digest, daily_digest_export, sessions,
             ai_settings_get, ai_settings_save, ai_organize_day, ai_summary_save,
-            project_add, project_archive, project_restore, open_in_finder,
+            project_add, project_archive, project_restore, project_merge_plan, project_merge, open_in_finder,
             session_proof, session_verify, session_export, session_writeback_plan,
             session_writeback, capability_matrix,
             session_delete, session_restore, trash_list, trash_purge, trash_purge_selected,

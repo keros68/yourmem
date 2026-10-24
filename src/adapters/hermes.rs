@@ -156,7 +156,7 @@ fn import_session(
     let dir = sess.cwd.clone().or_else(|| sess.git_repo_root.clone());
     let project_id = match dir.as_deref() {
         Some(d) => {
-            let (root, name) = db::project_root_for(d);
+            let (root, name) = db::project_root_for_conn(conn, d)?;
             Some(db::upsert_project(conn, &root, &name)?)
         }
         None => None,

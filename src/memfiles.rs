@@ -88,7 +88,7 @@ fn discover_targets(conn: &Connection, home: &Path, dirs: &SourceDirs) -> Result
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut roots: Vec<String> = Vec::new();
     for cwd in cwds {
-        let (root, _) = db::project_root_for(&cwd);
+        let (root, _) = db::project_root_for_conn(conn, &cwd)?;
         let scope = format!("project:{root}");
         if !roots.iter().any(|r| db::path_key(r) == db::path_key(&root)) {
             roots.push(root.clone());

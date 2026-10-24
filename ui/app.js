@@ -293,6 +293,10 @@ let showArchivedProjects = false;
 // 展开全部 agent pill 的项目 id（跨重渲染保留，切页即重置）
 const projPillsOpen = new Set();
 
+function projectMergeSummary(plan) {
+  return `目标：${plan.parent.path}；将移动对话 ${plan.sessions}、记忆 ${plan.memories}、产出 ${plan.artifacts}、交接 ${plan.handoffs}`;
+}
+
 const agentCell = (p) => {
   const list = p.agents || [];
   if (list.length === 0) return "";
@@ -321,13 +325,19 @@ async function renderProjects() {
       <button class="btn primary small" id="proj-add-ok">添加</button>
       <button class="btn small" id="proj-add-cancel">取消</button>
     </div>
+    <div id="proj-merge-row" class="inline-add-row hidden">
+      <select id="proj-merge-target" title="选择未废弃的上级项目"></select>
+      <button class="btn primary small" id="proj-merge-ok" disabled>确认并入</button>
+      <button class="btn small" id="proj-merge-cancel">取消</button>
+    </div>
+    <div id="proj-merge-report" class="meta" style="margin:-6px 0 14px"></div>
     <div id="projects-table"><table class="fixed"><tr><th class="c-name">项目</th><th>路径</th><th class="c-agents">agent</th><th class="c-num">对话</th><th class="c-num">消息</th><th class="c-time">最近活动</th><th class="c-time">最近 Handoff</th><th class="c-act"></th></tr>
     ${d.projects.map((p) => `<tr class="clickable" data-pid="${p.id}" data-path="${esc(p.path)}">
       <td class="c-name" title="${esc(p.name)}"><b>${esc(p.name)}</b></td><td title="${esc(p.path)}" style="color:var(--dim)">${esc(p.display_path || p.path)}</td>
       <td class="c-agents">${agentCell(p)}</td>
       <td class="c-num">${p.sessions}</td><td class="c-num">${p.messages}</td>
       <td class="c-time">${fmtTimeCell(p.last_activity)}</td><td class="c-time">${fmtTimeCell(p.last_handoff)}</td>
-      <td class="c-act"><button class="btn small" data-arch="${p.id}">废弃</button></td></tr>`).join("")}
+      <td class="c-act"><div class="action-buttons"><button class="btn small" data-merge="${p.id}">并入上级</button><button class="btn small" data-arch="${p.id}">废弃</button></div></td></tr>`).join("")}
     </table></div>
     ${d.archived.length ? `
       <button class="chip" id="arch-toggle" style="margin-top:14px">${showArchivedProjects ? "隐藏已废弃项目" : `已废弃项目（${d.archived.length}）· 显示`}</button>
@@ -367,6 +377,53 @@ async function renderProjects() {
   $("#proj-add-input").onkeydown = (e) => {
     if (e.key === "Enter") submitAdd();
     if (e.key === "Escape") hideAdd();
+  };
+  const mergeRow = $("#proj-merge-row"), mergeTarget = $("#proj-merge-target"), mergeOk = $("#proj-merge-ok");
+  let mergeChild = null, mergePlan = null, mergeRequest = 0;
+  const loadMerge = async (id, parentId = null) => {
+    const request = ++mergeRequest;
+    mergeChild = id;
+    mergePlan = null;
+    mergeOk.disabled = true;
+    mergeRow.classList.remove("hidden");
+    $("#proj-merge-report").textContent = "读取预览…";
+    try {
+      const plan = await invoke("project_merge_plan", { id, parentId });
+      if (request !== mergeRequest) return;
+      mergePlan = plan;
+      mergeTarget.innerHTML = plan.targets.map((p) => `<option value="${p.id}">${esc(p.path)}</option>`).join("");
+      mergeTarget.value = String(plan.parent.id);
+      $("#proj-merge-report").textContent = projectMergeSummary(plan);
+      mergeOk.disabled = false;
+    } catch (e) {
+      if (request !== mergeRequest) return;
+      if (parentId === null) {
+        mergeRow.classList.add("hidden");
+        $("#proj-merge-report").textContent = "";
+        toast("没有可并入的未废弃上级项目");
+      } else {
+        $("#proj-merge-report").textContent = String(e);
+      }
+    }
+  };
+  document.querySelectorAll("#page-projects [data-merge]").forEach((b) => {
+    b.onclick = (ev) => { ev.stopPropagation(); loadMerge(+b.dataset.merge); };
+  });
+  mergeTarget.onchange = () => loadMerge(mergeChild, +mergeTarget.value);
+  mergeOk.onclick = async () => {
+    if (!mergePlan) return;
+    mergeOk.disabled = true;
+    try {
+      await invoke("project_merge", { id: mergePlan.child.id, parentId: mergePlan.parent.id });
+      toast("已并入上级项目");
+      renderProjects();
+    } catch (e) { mergeOk.disabled = false; toast(String(e)); }
+  };
+  $("#proj-merge-cancel").onclick = () => {
+    mergeRequest++;
+    mergePlan = null;
+    mergeRow.classList.add("hidden");
+    $("#proj-merge-report").textContent = "";
   };
   document.querySelectorAll("#page-projects [data-arch]").forEach((b) => {
     b.onclick = async (ev) => {

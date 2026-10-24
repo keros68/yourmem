@@ -556,7 +556,7 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
 
     let project_id = match meta.cwd.as_deref() {
         Some(cwd) => {
-            let (root, name) = db::project_root_for(cwd);
+            let (root, name) = db::project_root_for_conn(conn, cwd)?;
             Some(db::upsert_project(conn, &root, &name)?)
         }
         None => None,
@@ -812,7 +812,7 @@ fn backfill_kimi_cwd(conn: &Connection, path: &Path, session_id: &str) -> Result
         // 会话与 artifact 同一事务（codex 三审：两条自动提交语句中途失败会让
         // cwd 已写、artifact 仍空，且 cwd IS NULL 门槛让重试永久跳过）
         let tx = conn.unchecked_transaction()?;
-        let (root, name) = db::project_root_for(&cwd);
+        let (root, name) = db::project_root_for_conn(&tx, &cwd)?;
         let pid = db::upsert_project(&tx, &root, &name)?;
         tx.execute(
             "UPDATE sessions SET cwd = ?1, project_id = ?2 WHERE id = ?3",

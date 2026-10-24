@@ -335,6 +335,14 @@ enum ProjectsCmd {
     Archive { project: String },
     /// 恢复一个已废弃的项目。
     Restore { project: String },
+    /// 把子项目的对话、记忆、产出与交接并入未废弃的上级项目，随后废弃子项目。
+    Merge {
+        child: String,
+        parent: String,
+        /// 输出预览后跳过 stdin 确认。
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -633,6 +641,21 @@ fn main() -> Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("no matching project: {project}"))?;
                     db::set_project_archived(&conn, id, false)?;
                     print_json(&json!({ "id": id, "name": name, "archived": false }))
+                }
+                Some(ProjectsCmd::Merge { child, parent, yes }) => {
+                    let (child_id, ..) = db::resolve_project(&conn, Some(&child), None)?
+                        .ok_or_else(|| anyhow::anyhow!("no matching project: {child}"))?;
+                    let (parent_id, ..) = db::resolve_project(&conn, Some(&parent), None)?
+                        .ok_or_else(|| anyhow::anyhow!("no matching project: {parent}"))?;
+                    let plan = db::project_merge_plan(&conn, child_id, Some(parent_id))?;
+                    print_json(&plan);
+                    if !yes {
+                        eprint!("确认并入上级项目并废弃子项目？输入 y 继续: ");
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line)?;
+                        if line.trim() != "y" { anyhow::bail!("已取消"); }
+                    }
+                    print_json(&db::merge_project(&conn, child_id, parent_id)?);
                 }
             }
         }

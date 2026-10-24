@@ -22,7 +22,7 @@ function app() {
   vm.runInContext(ui('project-recall.js').replace('export async function', 'async function'), context);
   vm.runInContext(ui('graph-layout.js').replaceAll('export function', 'function'), context);
   const bundleCode = ui('app.js').slice(ui('app.js').indexOf('  let bundleBusy = false'), ui('app.js').indexOf('  $("#auto-purge").onchange'));
-  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, renderToday, foldSubtasks, bindBundleForTest, renderSearch, renderMemory, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
+  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, renderToday, foldSubtasks, bindBundleForTest, renderSearch, renderMemory, renderProjects, projectMergeSummary, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, setMemoryView: v => { memView = v; } };', context);
   return { ...context.testApp, context, get, lists, requests, notices };
 }
 
@@ -355,4 +355,41 @@ test('subtask conversations fold under their main conversation', () => {
   assert.equal(tops[0]._subs, 2);
   assert.ok(tops[0]._children.every((c) => c._child));
   assert.equal(tops[1]._subs, undefined, 'a subtask without a listed main conversation stands alone');
+});
+
+test('project merge previews the selected parent before moving assets', async () => {
+  const f = app(), mergeButton = { dataset: { merge: '2' } };
+  f.lists.set('#page-projects [data-merge]', [mergeButton]);
+  const rendering = f.renderProjects();
+  f.requests.at(-1).resolve({ projects: [{ id: 2, name: 'current', path: 'F:/research/current', agents: [], sessions: 1, messages: 3 }], archived: [] });
+  await rendering;
+  assert.match(f.get('#page-projects').innerHTML, /并入上级/);
+  mergeButton.onclick({ stopPropagation() {} });
+  const preview = f.requests.at(-1);
+  assert.equal(preview.command, 'project_merge_plan');
+  assert.deepEqual({ ...preview.args }, { id: 2, parentId: null });
+  const plan = {
+    child: { id: 2, path: 'F:/research/current' }, parent: { id: 1, path: 'F:/research' },
+    targets: [{ id: 1, path: 'F:/research' }, { id: 3, path: 'F:/' }],
+    sessions: 4, memories: 2, artifacts: 5, handoffs: 1,
+  };
+  preview.resolve(plan);
+  await new Promise(setImmediate);
+  assert.match(f.get('#proj-merge-report').textContent, /对话 4、记忆 2、产出 5、交接 1/);
+  assert.equal(f.get('#proj-merge-ok').disabled, false);
+  assert.ok(!f.requests.some(r => r.command === 'project_merge'));
+
+  f.get('#proj-merge-target').value = '3';
+  f.get('#proj-merge-target').onchange();
+  const changed = f.requests.at(-1);
+  assert.equal(changed.args.parentId, 3);
+  changed.resolve({ ...plan, parent: { id: 3, path: 'F:/' } });
+  await new Promise(setImmediate);
+  const executing = f.get('#proj-merge-ok').onclick();
+  const request = f.requests.at(-1);
+  assert.equal(request.command, 'project_merge');
+  assert.deepEqual({ ...request.args }, { id: 2, parentId: 3 });
+  request.resolve({ merged: true });
+  await executing;
+  assert.equal(f.notices.at(-1).textContent, '已并入上级项目');
 });
