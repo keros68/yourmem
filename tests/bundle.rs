@@ -80,6 +80,11 @@ fn bundle_roundtrip_fresh_home() {
 fn bundle_filter_prunes_to_one_agent_or_project() {
     let (home, _src) = make_src();
     let conn = db::open(home.path()).unwrap();
+    conn.execute(
+        "INSERT INTO cross_checks(project_id, run_id, path, header_hash, created_at, updated_at)
+         SELECT id, 'run-' || name, path || '/.dispatch/review.md', 'hash', '2026-08-01', '2026-08-01' FROM projects",
+        [],
+    ).unwrap();
     let bundle_path = home.path().join("only-x.tar.gz");
     let filter = bundle::BundleFilter { agent: None, project: Some("proj-x".into()) };
     bundle::create(&conn, home.path(), &bundle_path, &filter).unwrap();
@@ -96,6 +101,12 @@ fn bundle_filter_prunes_to_one_agent_or_project() {
     })
     .unwrap();
     assert_eq!(hits.len(), 0);
+    let checks: i64 = conn2.query_row("SELECT COUNT(*) FROM cross_checks", [], |r| r.get(0)).unwrap();
+    assert_eq!(checks, 1);
+    let project: String = conn2.query_row(
+        "SELECT p.path FROM cross_checks c JOIN projects p ON p.id = c.project_id", [], |r| r.get(0),
+    ).unwrap();
+    assert!(project.ends_with("proj-x"));
 }
 
 #[test]
@@ -262,6 +273,11 @@ fn bundle_merge_remaps_project_ids() {
             source_message_id: None,
         })
         .unwrap();
+        conn.execute(
+            "INSERT INTO cross_checks(project_id, run_id, path, role, model, vendor, header_hash, created_at, updated_at)
+             VALUES (?1, 'run-alpha', '/tmp/alpha/.dispatch/review.md', '盲审', 'model', 'vendor', 'hash', '2026-08-01', '2026-08-01')",
+            [alpha_id],
+        ).unwrap();
     }
     let bundle_path = home.path().join("all.tar.gz");
     {
@@ -276,6 +292,7 @@ fn bundle_merge_remaps_project_ids() {
 
     let r = bundle::restore(&bundle_path, target.path(), true).unwrap();
     assert_eq!(r["merged"]["memories_added"], 1);
+    assert_eq!(r["merged"]["cross_checks_added"], 1);
 
     let conn = db::open(target.path()).unwrap();
     let proj_path: String = conn
@@ -286,6 +303,10 @@ fn bundle_merge_remaps_project_ids() {
         )
         .unwrap();
     assert_eq!(proj_path, "/tmp/alpha", "memory 必须仍挂在 alpha 上");
+    let check_path: String = conn.query_row(
+        "SELECT p.path FROM cross_checks c JOIN projects p ON p.id = c.project_id", [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(check_path, "/tmp/alpha", "交叉核对必须仍挂在 alpha 上");
 }
 
 #[test]

@@ -22,7 +22,7 @@ function app() {
   vm.runInContext(ui('project-recall.js').replace('export async function', 'async function'), context);
   vm.runInContext(ui('graph-layout.js').replaceAll('export function', 'function'), context);
   const bundleCode = ui('app.js').slice(ui('app.js').indexOf('  let bundleBusy = false'), ui('app.js').indexOf('  $("#auto-purge").onchange'));
-  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, renderToday, foldSubtasks, bindBundleForTest, renderSearch, renderMemory, renderProjects, projectMergeSummary, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, showProjectAi, setMemoryView: v => { memView = v; } };', context);
+  vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, renderToday, foldSubtasks, bindBundleForTest, renderSearch, renderMemory, renderProjects, projectMergeSummary, crossChecksHtml, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, showProjectAi, setMemoryView: v => { memView = v; } };', context);
   return { ...context.testApp, context, get, lists, requests, notices };
 }
 
@@ -410,4 +410,23 @@ test('project merge previews the selected parent before moving assets', async ()
   request.resolve({ merged: true });
   await executing;
   assert.equal(f.notices.at(-1).textContent, '已并入上级项目');
+});
+
+test('cross-check records expose provenance without turning status into a verdict', () => {
+  const f = app();
+  const html = f.crossChecksHtml([{ run_id: 'run-1', checks: [{
+    role: '盲审', vendor: 'Example AI', model: 'model-x', visibility: '盲', isolation: '完整',
+    identity: 'example/model-x', status: 'identity_mismatch', started_at: '2026-10-24T01:00:00Z',
+    path: 'D:/research/.dispatch/review.md',
+  }, {
+    role: '执行', provider: 'provider-x', model: 'model-y', visibility: '共享', isolation: '部分',
+    identity: '', status: 'ok', path: 'D:/research/.dispatch/run.md',
+  }] }]);
+  assert.match(html, /run-1（2 路）/);
+  assert.match(html, /Example AI \/ model-x/);
+  assert.match(html, /盲 · 隔离完整 · 真身核对 example\/model-x · 状态 identity_mismatch/);
+  assert.match(html, /真身核对未记录/);
+  assert.equal((html.match(/定位文件/g) || []).length, 2);
+  assert.match(html, /data-check-path="D:\/research\/.dispatch\/review.md"/);
+  assert.doesNotMatch(html, /通过|不通过/);
 });

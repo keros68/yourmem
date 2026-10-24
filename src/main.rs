@@ -599,7 +599,9 @@ fn main() -> Result<()> {
                 match run_import(&home, None, None, None, None, None, None, None) {
                     Ok(outcome) if outcome.messages_added > 0
                         || outcome.lines_archived > 0
-                        || outcome.memory_revisions_added > 0 =>
+                        || outcome.memory_revisions_added > 0
+                        || outcome.cross_checks_updated > 0
+                        || outcome.cross_checks_removed > 0 =>
                     {
                         print_json(&ingest::outcome_json(&outcome));
                     }

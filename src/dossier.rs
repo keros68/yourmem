@@ -262,6 +262,7 @@ pub fn project_dossier(conn: &Connection, project_id: i64) -> Result<Value> {
             .collect::<Vec<_>>()
     };
 
+    let cross_checks = crate::cross_checks::for_project(&tx, project_id)?;
     tx.commit()?;
     Ok(json!({
         "project": name,
@@ -276,6 +277,7 @@ pub fn project_dossier(conn: &Connection, project_id: i64) -> Result<Value> {
         "task_timeline": task_timeline,
         "artifacts": artifacts,
         "handoffs": handoffs,
+        "cross_checks": cross_checks,
     }))
 }
 
@@ -831,6 +833,7 @@ pub fn render_markdown(d: &Value) -> String {
     if hos.is_empty() {
         let _ = writeln!(s, "（暂无）");
     }
+    write_cross_checks(&mut s, d);
     write_project_docs(&mut s, d);
     s
 }
@@ -909,6 +912,29 @@ pub fn render_context_markdown(d: &Value) -> String {
     }
     write_project_docs(&mut s, d);
     s
+}
+
+fn write_cross_checks(s: &mut String, d: &Value) {
+    let runs = d["cross_checks"].as_array().cloned().unwrap_or_default();
+    if runs.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "\n## 交叉核对\n");
+    for run in runs {
+        let _ = writeln!(s, "### {}\n", inline(run["run_id"].as_str().unwrap_or("")));
+        for check in run["checks"].as_array().cloned().unwrap_or_default() {
+            let identity = check["identity"].as_str().filter(|v| !v.is_empty()).unwrap_or("未记录");
+            let _ = writeln!(s, "- {}：{}，{} / {}，{}，隔离{}，真身核对 {}，状态 {}（`{}`）",
+                short(check["started_at"].as_str()),
+                inline(check["role"].as_str().unwrap_or("")),
+                inline(check["vendor"].as_str().unwrap_or("")),
+                inline(check["model"].as_str().unwrap_or("")),
+                inline(check["visibility"].as_str().unwrap_or("")),
+                inline(check["isolation"].as_str().unwrap_or("")),
+                inline(identity), inline(check["status"].as_str().unwrap_or("")),
+                check["path"].as_str().unwrap_or(""));
+        }
+    }
 }
 
 /// 项目文档一节（context / 卷宗 markdown 共用）：只在调用方附带了 project_docs 时输出。

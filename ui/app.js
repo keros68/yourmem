@@ -302,7 +302,7 @@ let showArchivedProjects = false;
 const projPillsOpen = new Set();
 
 function projectMergeSummary(plan) {
-  return `目标：${plan.parent.path}；将移动对话 ${plan.sessions}、记忆 ${plan.memories}、产出 ${plan.artifacts}、交接 ${plan.handoffs}`;
+  return `目标：${plan.parent.path}；将移动对话 ${plan.sessions}、记忆 ${plan.memories}、产出 ${plan.artifacts}、交接 ${plan.handoffs}、交叉核对 ${plan.cross_checks || 0}`;
 }
 
 const agentCell = (p) => {
@@ -457,6 +457,19 @@ async function renderProjects() {
   snapScrollboxTables($("#page-projects"));
 }
 
+function crossChecksHtml(groups) {
+  return groups.map((run) => {
+    const rows = run.checks.map((c) => {
+      const identity = c.identity ? `真身核对 ${esc(c.identity)}` : "真身核对未记录";
+      const details = [esc(c.visibility || ""), c.isolation && `隔离${esc(c.isolation)}`, identity, c.status && `状态 ${esc(c.status)}`]
+        .filter(Boolean).join(" · ");
+      return `<div class="memcard"><div class="content"><b>${esc(c.role || c.agent || "核对")}</b> · ${esc(c.vendor || c.provider || "厂商未记录")} / ${esc(c.model || "模型未记录")}</div>
+        <div class="meta"><span>${fmtTime(c.started_at || c.ended_at)}</span><span>${details}</span><button class="btn small" data-check-path="${esc(c.path)}">定位文件</button></div></div>`;
+    }).join("");
+    return `<h3>${esc(run.run_id)}（${run.checks.length} 路）</h3>${rows}`;
+  }).join("");
+}
+
 async function showProject(pid) {
   const request = drawer.begin();
   let d;
@@ -543,6 +556,8 @@ async function showProject(pid) {
       <input type="text" class="filter-input" id="doc-track-path" style="flex:1;min-width:0" placeholder="跟踪其他文件：输入相对项目目录的路径，如 docs/plan.md" />
       <button class="btn small" id="doc-track">跟踪</button>
     </div>
+    <h2>交叉核对（${(d.cross_checks || []).reduce((n, run) => n + run.checks.length, 0)}）</h2>
+    <div class="scrollbox">${crossChecksHtml(d.cross_checks || []) || '<div class="empty">暂无交叉核对记录</div>'}</div>
     <h2>决策板（活跃 ${decs.filter((m) => m.status === "confirmed").length} / 历史 ${decs.length}）</h2>
     <div class="scrollbox">${decisionRows + orphanSuperseded || '<div class="empty">暂无决策/规则记忆</div>'}</div>
     <h2>时间线（${(d.timeline || []).length}）</h2>
@@ -561,6 +576,9 @@ async function showProject(pid) {
   });
   document.querySelectorAll("#drawer-content [data-mfid]").forEach((el) => {
     el.onclick = () => showMemoryFile(+el.dataset.mfid);
+  });
+  document.querySelectorAll("#drawer-content [data-check-path]").forEach((button) => {
+    button.onclick = () => invoke("open_in_finder", { path: button.dataset.checkPath, reveal: true }).catch((e) => toast(String(e)));
   });
   const trackDoc = async (cmd, path) => {
     try {

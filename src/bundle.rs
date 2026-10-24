@@ -213,6 +213,10 @@ fn prune_snapshot(snap_path: &Path, filter: &BundleFilter) -> Result<Value> {
             params![proj],
         )?;
         conn.execute(
+            &format!("DELETE FROM cross_checks WHERE project_id NOT IN ({keep_proj})"),
+            params![proj],
+        )?;
+        conn.execute(
             "DELETE FROM projects WHERE NOT (name = ?1 OR path LIKE '%'||?1||'%')",
             params![proj],
         )?;
@@ -846,6 +850,43 @@ fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
                 )? as u64;
             }
         }
+        let mut cross_checks_added = 0u64;
+        if !src_columns(&tx, "cross_checks")?.is_empty() {
+            let mut stmt = tx.prepare(
+                "SELECT project_id, run_id, path, role, agent, provider, model, vendor,
+                        visibility, isolation, identity, status, started_at, ended_at,
+                        materials, header_hash, created_at, updated_at FROM src.cross_checks",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(json!({
+                    "project_id": r.get::<_, i64>(0)?, "run_id": r.get::<_, String>(1)?,
+                    "path": r.get::<_, String>(2)?, "role": r.get::<_, String>(3)?,
+                    "agent": r.get::<_, String>(4)?, "provider": r.get::<_, String>(5)?,
+                    "model": r.get::<_, String>(6)?, "vendor": r.get::<_, String>(7)?,
+                    "visibility": r.get::<_, String>(8)?, "isolation": r.get::<_, String>(9)?,
+                    "identity": r.get::<_, String>(10)?, "status": r.get::<_, String>(11)?,
+                    "started_at": r.get::<_, String>(12)?, "ended_at": r.get::<_, String>(13)?,
+                    "materials": r.get::<_, String>(14)?, "header_hash": r.get::<_, String>(15)?,
+                    "created_at": r.get::<_, String>(16)?, "updated_at": r.get::<_, String>(17)?,
+                }))
+            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            for c in rows {
+                let new_pid = c["project_id"].as_i64().and_then(|p| project_map.get(&p).copied());
+                let Some(new_pid) = new_pid else { continue };
+                cross_checks_added += tx.execute(
+                    "INSERT OR IGNORE INTO cross_checks(project_id, run_id, path, role, agent, provider,
+                            model, vendor, visibility, isolation, identity, status, started_at, ended_at,
+                            materials, header_hash, created_at, updated_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                    params![new_pid, c["run_id"].as_str(), c["path"].as_str(), c["role"].as_str(),
+                        c["agent"].as_str(), c["provider"].as_str(), c["model"].as_str(),
+                        c["vendor"].as_str(), c["visibility"].as_str(), c["isolation"].as_str(),
+                        c["identity"].as_str(), c["status"].as_str(), c["started_at"].as_str(),
+                        c["ended_at"].as_str(), c["materials"].as_str(), c["header_hash"].as_str(),
+                        c["created_at"].as_str(), c["updated_at"].as_str()],
+                )? as u64;
+            }
+        }
         let mut memories_added = 0u64;
         {
             let mut stmt = tx.prepare(
@@ -1050,6 +1091,7 @@ fn merge_db(target: &Connection, src_db: &Path, home: &Path) -> Result<Value> {
             "sessions_skipped": sessions_skipped,
             "messages_added": messages_added,
             "artifacts_added": artifacts_added,
+            "cross_checks_added": cross_checks_added,
             "memories_added": memories_added,
             "handoffs_added": handoffs_added,
             "memory_revisions_added": memory_revisions_added,

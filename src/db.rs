@@ -162,6 +162,31 @@ CREATE TABLE IF NOT EXISTS session_artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_project ON session_artifacts(project_id);
 
+-- ai-cross 留痕的 YAML 头元数据；正文仍只在项目原文件中，不入库、不入 FTS。
+CREATE TABLE IF NOT EXISTS cross_checks (
+  id          INTEGER PRIMARY KEY,
+  project_id  INTEGER NOT NULL REFERENCES projects(id),
+  run_id      TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  role        TEXT NOT NULL DEFAULT '',
+  agent       TEXT NOT NULL DEFAULT '',
+  provider    TEXT NOT NULL DEFAULT '',
+  model       TEXT NOT NULL DEFAULT '',
+  vendor      TEXT NOT NULL DEFAULT '',
+  visibility  TEXT NOT NULL DEFAULT '',
+  isolation   TEXT NOT NULL DEFAULT '',
+  identity    TEXT NOT NULL DEFAULT '',
+  status      TEXT NOT NULL DEFAULT '',
+  started_at  TEXT NOT NULL DEFAULT '',
+  ended_at    TEXT NOT NULL DEFAULT '',
+  materials   TEXT NOT NULL DEFAULT '[]',
+  header_hash TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  UNIQUE(project_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_cross_checks_project ON cross_checks(project_id, run_id);
+
 -- Session lineage: fork / continuation / compact / subagent edges.
 CREATE TABLE IF NOT EXISTS session_links (
   child_session_id  TEXT NOT NULL,
@@ -284,7 +309,7 @@ pub fn open(home: &Path) -> Result<Connection> {
 /// Current schema version, stamped into `PRAGMA user_version` by migrate().
 /// Bump this (and add a migration step below) whenever the schema changes;
 /// bundle manifests record it (DESIGN-0.3 §5.1 `schema_version`).
-pub const SCHEMA_VERSION: i32 = 17;
+pub const SCHEMA_VERSION: i32 = 18;
 
 /// Idempotent column additions for databases created by older versions.
 /// `user_version` drives the fast path: a database already stamped with the
@@ -511,7 +536,7 @@ fn merge_duplicate_projects(conn: &Connection) -> Result<()> {
             |r| r.get(0),
         )?;
         for dup in dups {
-            for table in ["sessions", "handoffs", "memories", "session_artifacts"] {
+            for table in ["sessions", "handoffs", "memories", "session_artifacts", "cross_checks"] {
                 conn.execute(&format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"), params![keep, dup])?;
             }
             conn.execute("DELETE FROM projects WHERE id = ?1", params![dup])?;
@@ -1223,6 +1248,7 @@ pub fn project_merge_plan(conn: &Connection, child_id: i64, parent_id: Option<i6
         "memories": count("memories")?,
         "artifacts": count("session_artifacts")?,
         "handoffs": count("handoffs")?,
+        "cross_checks": count("cross_checks")?,
     }))
 }
 
@@ -1231,7 +1257,7 @@ pub fn project_merge_plan(conn: &Connection, child_id: i64, parent_id: Option<i6
 pub fn merge_project(conn: &Connection, child_id: i64, parent_id: i64) -> Result<Value> {
     let tx = conn.unchecked_transaction()?;
     let mut plan = project_merge_plan(&tx, child_id, Some(parent_id))?;
-    for table in ["sessions", "handoffs", "memories", "session_artifacts"] {
+    for table in ["sessions", "handoffs", "memories", "session_artifacts", "cross_checks"] {
         tx.execute(
             &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
             params![parent_id, child_id],

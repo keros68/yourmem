@@ -10,6 +10,7 @@ pub mod adapters;
 pub mod backup_location;
 pub mod bundle;
 pub mod cleanup;
+pub mod cross_checks;
 pub mod db;
 pub mod doctor;
 pub mod dossier;

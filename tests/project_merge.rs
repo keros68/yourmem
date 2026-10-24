@@ -117,6 +117,11 @@ fn merge_previews_and_moves_all_assets_then_archives_without_revival() {
          VALUES ('claude:merge-test', ?1, 'draft.md', 'Write', '2026-10-24')",
         [child_id],
     ).unwrap();
+    conn.execute(
+        "INSERT INTO cross_checks(project_id, run_id, path, role, model, vendor, header_hash, created_at, updated_at)
+         VALUES (?1, 'run-merge', '.dispatch/review.md', '盲审', 'model', 'vendor', 'hash', '2026-10-24', '2026-10-24')",
+        [child_id],
+    ).unwrap();
 
     let plan = db::project_merge_plan(&conn, child_id, None).unwrap();
     assert_eq!(plan["parent"]["id"], parent_id);
@@ -124,11 +129,12 @@ fn merge_previews_and_moves_all_assets_then_archives_without_revival() {
     assert_eq!(plan["memories"], 1);
     assert_eq!(plan["artifacts"], 1);
     assert_eq!(plan["handoffs"], 1);
+    assert_eq!(plan["cross_checks"], 1);
     assert_eq!(plan["targets"].as_array().unwrap().len(), 1);
 
     let merged = db::merge_project(&conn, child_id, parent_id).unwrap();
     assert_eq!(merged["merged"], true);
-    for table in ["sessions", "memories", "session_artifacts", "handoffs"] {
+    for table in ["sessions", "memories", "session_artifacts", "handoffs", "cross_checks"] {
         let at_parent: i64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM {table} WHERE project_id = ?1"),
             [parent_id],

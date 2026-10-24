@@ -49,6 +49,9 @@ pub struct ImportOutcome {
     /// import_all never touch the real ~/.claude).
     pub memory_files_monitored: usize,
     pub memory_revisions_added: usize,
+    pub cross_checks_seen: usize,
+    pub cross_checks_updated: usize,
+    pub cross_checks_removed: usize,
 }
 
 impl ImportOutcome {
@@ -84,6 +87,10 @@ fn import_with_inner(home: &Path, roots: &[(&str, PathBuf)], opencode_db: Option
     let mf = crate::memfiles::collect(&conn, home, &crate::memfiles::SourceDirs::default())?;
     outcome.memory_files_monitored = mf.files_monitored;
     outcome.memory_revisions_added = mf.revisions_added;
+    let checks = crate::cross_checks::collect(&conn, home)?;
+    outcome.cross_checks_seen = checks.files_seen;
+    outcome.cross_checks_updated = checks.files_updated;
+    outcome.cross_checks_removed = checks.files_removed;
     let _ = std::fs::File::create(home.join(".last_import"));
     Ok(outcome)
 }
@@ -372,6 +379,9 @@ pub fn import_all(
         memory_sources_linked: 0,
         memory_files_monitored: 0,
         memory_revisions_added: 0,
+        cross_checks_seen: 0,
+        cross_checks_updated: 0,
+        cross_checks_removed: 0,
     };
     // 先列出全部文件得到总数，再逐个导入：界面据此显示进度
     let mut listed = Vec::new();
@@ -722,6 +732,9 @@ pub fn outcome_json(o: &ImportOutcome) -> Value {
         "memory_sources_linked": o.memory_sources_linked,
         "memory_files_monitored": o.memory_files_monitored,
         "memory_revisions_added": o.memory_revisions_added,
+        "cross_checks_seen": o.cross_checks_seen,
+        "cross_checks_updated": o.cross_checks_updated,
+        "cross_checks_removed": o.cross_checks_removed,
     })
 }
 
