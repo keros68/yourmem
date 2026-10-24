@@ -284,7 +284,7 @@ pub fn open(home: &Path) -> Result<Connection> {
 /// Current schema version, stamped into `PRAGMA user_version` by migrate().
 /// Bump this (and add a migration step below) whenever the schema changes;
 /// bundle manifests record it (DESIGN-0.3 §5.1 `schema_version`).
-pub const SCHEMA_VERSION: i32 = 16;
+pub const SCHEMA_VERSION: i32 = 17;
 
 /// Idempotent column additions for databases created by older versions.
 /// `user_version` drives the fast path: a database already stamped with the
@@ -472,6 +472,13 @@ fn migrate(conn: &Connection) -> Result<()> {
                AND session_id IN (SELECT id FROM sessions WHERE agent = 'claude');
              COMMIT;",
         )?;
+    }
+    if version < 17 {
+        // ai-cross 数据根由 AICROSS_HOME 决定、scratch 也属运行现场（1.4.x 起
+        // is_run_site_path 覆盖两者）：已登记的这类项目一次性归入已废弃项目，
+        // 口径同 v14/v15（只动 archived_at 为 NULL 的；此前用户恢复过的会被
+        // 重新归档，需再恢复一次）。
+        archive_projects_where(conn, crate::is_run_site_path)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())

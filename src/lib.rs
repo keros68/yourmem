@@ -168,11 +168,31 @@ pub fn is_temp_path(path: &str) -> bool {
     is_under_dir(path, &std::env::temp_dir())
 }
 
-/// ai-cross 编排的运行目录（`~/.aicross/runs/...`）：每次运行一个以 UUID 命名的
-/// 工作目录，与临时目录一样是运行现场。
+/// ai-cross 数据根：`AICROSS_HOME`（非空时）与 `~/.aicross` 都认——用户可能
+/// 中途改过位置，旧根之下的运行现场仍是运行现场。aicross 没有位置指针文件，
+/// 桌面端托盘进程读不到环境变量时回落到 `~/.aicross`，不另造约定。
+fn aicross_roots(get: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(dir) = get("AICROSS_HOME") {
+        roots.push(PathBuf::from(dir));
+    }
+    if let Some(home) = resolve_home(&get) {
+        roots.push(home.join(".aicross"));
+    }
+    roots
+}
+
+/// ai-cross 编排的运行现场：数据根下的 `runs`（引擎运行目录，UUID 命名）与
+/// `scratch`（盲审/执行目录，见 xiaoyu-skill dispatch.py）之下的目录。
 pub fn is_run_site_path(path: &str) -> bool {
-    resolve_home(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
-        .is_some_and(|home| is_under_dir(path, &home.join(".aicross").join("runs")))
+    let roots = aicross_roots(|k| std::env::var(k).ok().filter(|s| !s.is_empty()));
+    is_run_site_path_in(path, &roots)
+}
+
+fn is_run_site_path_in(path: &str, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|r| is_under_dir(path, &r.join("runs")) || is_under_dir(path, &r.join("scratch")))
 }
 
 /// 项目内的派工运行目录（`<项目>/.dispatch/runtime/runs/...`）与 Claude Code 为子代理
@@ -192,7 +212,7 @@ pub fn is_dispatch_site_path(path: &str) -> bool {
     })
 }
 
-/// 运行现场（临时目录、ai-cross 运行目录、项目内派工运行目录与子代理工作树）：
+/// 运行现场（临时目录、ai-cross 运行与盲审目录、项目内派工运行目录与子代理工作树）：
 /// 会话照常采集，项目归入已废弃项目。
 pub fn is_scratch_path(path: &str) -> bool {
     is_temp_path(path) || is_run_site_path(path) || is_dispatch_site_path(path)
@@ -359,6 +379,39 @@ mod tests {
         assert!(!is_dispatch_site_path("/work/poket/.claude"));
         assert!(!is_dispatch_site_path("/work/runtime/runs/x"));
         assert!(!is_dispatch_site_path("/work/real-project"));
+    }
+
+    #[test]
+    fn aicross_runs_and_scratch_are_run_sites() {
+        let roots = aicross_roots(resolver(&[("AICROSS_HOME", "/data/aicross"), ("HOME", "/u/a")]));
+        // AICROSS_HOME 指向的数据根：runs 与 scratch 都算
+        assert!(is_run_site_path_in("/data/aicross/runs/0fcfa01e-da43", &roots));
+        assert!(is_run_site_path_in("/data/aicross/scratch/20261016-103711-blind/kimi.moonshot", &roots));
+        // ~/.aicross 始终认（用户可能中途改过 AICROSS_HOME）
+        assert!(is_run_site_path_in("/u/a/.aicross/runs/x", &roots));
+        assert!(is_run_site_path_in("/u/a/.aicross/scratch/x", &roots));
+        // 数据根的其它子目录与根本身不算
+        assert!(!is_run_site_path_in("/data/aicross/cache/x", &roots));
+        assert!(!is_run_site_path_in("/data/aicross", &roots));
+        assert!(!is_run_site_path_in("/data/aicross-scratch/x", &roots));
+        // 未设 AICROSS_HOME（或为空）时只认 ~/.aicross
+        for vars in [&[("HOME", "/u/a")][..], &[("AICROSS_HOME", ""), ("HOME", "/u/a")][..]] {
+            let roots = aicross_roots(resolver(vars));
+            assert!(is_run_site_path_in("/u/a/.aicross/scratch/x", &roots));
+            assert!(!is_run_site_path_in("/data/aicross/scratch/x", &roots));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn run_site_matching_ignores_case_and_separators() {
+        let roots = aicross_roots(resolver(&[
+            ("AICROSS_HOME", r"D:\AICross-Data"),
+            ("USERPROFILE", r"C:\Users\a"),
+        ]));
+        assert!(is_run_site_path_in("d:/aicross-data/scratch/20261016-103711-blind", &roots));
+        assert!(is_run_site_path_in(r"D:\aicross-data\RUNS\x", &roots));
+        assert!(is_run_site_path_in(r"c:\USERS\a\.aicross\scratch\x", &roots));
     }
 
     #[test]
