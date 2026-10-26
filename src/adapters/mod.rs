@@ -24,10 +24,10 @@ pub const AGENT_CLAUDE: &str = "claude";
 pub const AGENT_CODEX: &str = "codex";
 pub const AGENT_ZCODE: &str = "zcode";
 pub const AGENT_KIMI: &str = "kimi";
+pub use antigravity::AGENT_ANTIGRAVITY;
 /// hermes：多端网关 agent（~/.hermes/state.db，SQLite 单库源，0.3.9 起）。
 /// cron 来源按 hermes 本人裁定不采（运行日志，非知识资产）。
 pub use hermes::AGENT_HERMES;
-pub use antigravity::AGENT_ANTIGRAVITY;
 /// pi：树状 JSONL 文件型源（~/.pi/agent/sessions，2026-09-10 真机样本驱动）。
 pub const AGENT_PI: &str = "pi";
 
@@ -39,7 +39,8 @@ pub(crate) const FILE_TOOLS: [&str; 4] = ["Write", "Edit", "MultiEdit", "Noteboo
 
 /// epoch 毫秒 → RFC3339（毫秒精度，UTC）。
 pub(crate) fn ms_to_iso(ms: i64) -> Option<String> {
-    chrono::DateTime::from_timestamp_millis(ms).map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
 pub(crate) fn truncate_chars(s: String, max: usize) -> String {
@@ -64,7 +65,16 @@ pub(crate) fn push_message(
         return;
     }
     let ord = out.iter().filter(|m| m.line_no == line_no).count() as u32;
-    out.push(crate::models::NewMessage { line_no, ord, kind, content, timestamp, uuid });
+    out.push(crate::models::NewMessage {
+        line_no,
+        ord,
+        kind,
+        content,
+        timestamp,
+        uuid,
+        native_tool_call_id: None,
+        tool_success: None,
+    });
 }
 
 /// Recursively find `*.jsonl` session files under a source root.
@@ -115,8 +125,7 @@ pub fn native_id(agent: &str, path: &Path) -> String {
             .collect();
         let mut anchor: Option<usize> = None;
         for i in 0..comps.len() {
-            if comps[i].starts_with("session_")
-                && comps.get(i + 1).map_or(false, |c| c == "agents")
+            if comps[i].starts_with("session_") && comps.get(i + 1).map_or(false, |c| c == "agents")
             {
                 anchor = Some(i); // 取最深的一个（wire.jsonl 的直接会话祖先）
             }
@@ -132,7 +141,11 @@ pub fn native_id(agent: &str, path: &Path) -> String {
             return id;
         }
         // 退化兜底：无 session_/agents 结构（非标准布局）——父目录+文件名保证唯一
-        let parent = path.parent().and_then(Path::file_name).map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let parent = path
+            .parent()
+            .and_then(Path::file_name)
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
         return format!("{parent}/{stem}");
     }
     if (agent == AGENT_CODEX || agent == AGENT_PI) && stem.len() > 36 {
@@ -223,10 +236,9 @@ pub fn capability_matrix() -> serde_json::Value {
           "writeback": "no", "encrypted": "no",
           "notes": "支持取回上下文压缩前的原文；没有续聊命令" },
         { "agent": AGENT_KIMI, "transcript": "yes", "search": "yes",
-          // 子 agent 以 #名字 独立成会话，是拆分不是谱系边
-          "lineage": "no", "resume": "partial",
+          "lineage": "partial", "resume": "partial",
           "writeback": "no", "encrypted": "no",
-          "notes": "主对话可续聊；子任务没有独立的续聊命令" },
+          "notes": "识别主对话与子 Agent 的 subagent 谱系；主对话可续聊，子任务没有独立续聊命令" },
         { "agent": AGENT_HERMES, "transcript": "yes", "search": "yes",
           "lineage": "yes", "resume": "yes",
           "writeback": "no", "encrypted": "no",

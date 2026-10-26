@@ -22,9 +22,14 @@ const BUSY_RETRY_SECS: u64 = 600;
 /// The database or repository was locked by another writer: not a failure.
 pub(crate) fn is_busy(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
-        c.downcast_ref::<rusqlite::Error>().and_then(|e| e.sqlite_error_code()).is_some_and(|code| {
-            matches!(code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
-        })
+        c.downcast_ref::<rusqlite::Error>()
+            .and_then(|e| e.sqlite_error_code())
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+            })
     })
 }
 
@@ -33,11 +38,15 @@ fn state_path(home: &Path) -> PathBuf {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn due(last: &Value, interval: u64, now: u64) -> bool {
-    last.as_u64().map_or(true, |t| now.saturating_sub(t) >= interval)
+    last.as_u64()
+        .map_or(true, |t| now.saturating_sub(t) >= interval)
 }
 
 fn load(home: &Path) -> Value {
@@ -56,7 +65,9 @@ fn normalize(state: &mut Value) {
     let snap = &state["snapshot"];
     let lock_failure = snap["ok"] == false
         && snap["retry"].is_null()
-        && snap["error"].as_str().is_some_and(|e| e.contains("locked") || e.contains("busy"));
+        && snap["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("locked") || e.contains("busy"));
     if lock_failure {
         state["snapshot"] = json!({"ok": false, "retry": true, "at": snap["at"].clone()});
         state["snapshot_attempt_at"] = Value::Null;
@@ -173,7 +184,8 @@ pub fn run_due(home: &Path) -> Result<Value> {
             Ok(r) if r["moved"].as_u64().unwrap_or(0) > 0 => {
                 migrating = r["remaining"] == true;
                 update(home, |state| {
-                    let moved = state["migration"]["moved"].as_u64().unwrap_or(0) + r["moved"].as_u64().unwrap_or(0);
+                    let moved = state["migration"]["moved"].as_u64().unwrap_or(0)
+                        + r["moved"].as_u64().unwrap_or(0);
                     state["migration"] = json!({"moved": moved, "remaining": r["remaining"], "skipped": r["skipped"]});
                 })?;
                 ran.push("migration");
@@ -211,7 +223,8 @@ pub fn run_due(home: &Path) -> Result<Value> {
             Err(e) => {
                 state["snapshot_attempt_at"] = json!(now);
                 state["snapshot_retry_at"] = Value::Null;
-                state["snapshot"] = json!({"ok": false, "at": crate::now_iso(), "error": format!("{e:#}")});
+                state["snapshot"] =
+                    json!({"ok": false, "at": crate::now_iso(), "error": format!("{e:#}")});
             }
         })?;
         ran.push("snapshot");
@@ -262,7 +275,12 @@ mod tests {
         let tmp = stale.join("abcd.tmp.1");
         std::fs::write(&tmp, b"x").unwrap();
         let old = SystemTime::now() - Duration::from_secs(2 * 86_400);
-        std::fs::File::options().write(true).open(&tmp).unwrap().set_modified(old).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
 
         let first = run_due(home).unwrap();
         assert_eq!(first["ran"], json!(["snapshot", "doctor"]));
@@ -271,7 +289,11 @@ mod tests {
         assert_eq!(st["doctor"]["tmp_removed"], 1);
         assert!(!tmp.exists());
         assert!(
-            st["doctor"]["problems"].as_array().unwrap().iter().all(|p| p["name"] != "db_snapshot"),
+            st["doctor"]["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["name"] != "db_snapshot"),
             "the automatic snapshot counts as fresh: {st}"
         );
 
@@ -288,7 +310,14 @@ mod tests {
         let r = run_due(home).unwrap();
         assert_eq!(r["ran"], json!(["doctor"]));
         let problems = status(home)["doctor"]["problems"].clone();
-        assert!(problems.as_array().unwrap().iter().all(|p| p["name"] != "db_snapshot"), "{problems}");
+        assert!(
+            problems
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["name"] != "db_snapshot"),
+            "{problems}"
+        );
     }
 
     #[test]
@@ -303,7 +332,11 @@ mod tests {
             std::fs::write(path, bytes).unwrap();
         }
         let first = run_due(home).unwrap();
-        assert_eq!(first["ran"], json!(["migration", "doctor"]), "snapshot waits while files remain");
+        assert_eq!(
+            first["ran"],
+            json!(["migration", "doctor"]),
+            "snapshot waits while files remain"
+        );
         let second = run_due(home).unwrap();
         assert_eq!(second["ran"], json!(["migration", "snapshot"]));
     }
@@ -318,14 +351,26 @@ mod tests {
         assert!(r["ran"].as_array().unwrap().contains(&json!("snapshot")));
         let st = status(home);
         assert_eq!(st["snapshot"]["retry"], true, "{st}");
-        assert!(st["snapshot_attempt_at"].is_null(), "未记为一次尝试，不等整个周期");
+        assert!(
+            st["snapshot_attempt_at"].is_null(),
+            "未记为一次尝试，不等整个周期"
+        );
         assert!(st["snapshot_retry_at"].as_u64().unwrap() > now_secs());
-        assert!(st["doctor"]["problems"].as_array().unwrap().iter().all(|p| p["name"] != "db_snapshot"),
-            "首份快照未完成时不提示快照过旧：{st}");
+        assert!(
+            st["doctor"]["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["name"] != "db_snapshot"),
+            "首份快照未完成时不提示快照过旧：{st}"
+        );
         drop(lock);
 
         // 等待时间到后自动补做
-        update(home, |state| state["snapshot_retry_at"] = json!(now_secs() - 1)).unwrap();
+        update(home, |state| {
+            state["snapshot_retry_at"] = json!(now_secs() - 1)
+        })
+        .unwrap();
         run_due(home).unwrap();
         let st = status(home);
         assert_eq!(st["snapshot"]["ok"], true, "{st}");
@@ -345,9 +390,15 @@ mod tests {
         })).unwrap();
         let st = status(home);
         assert_eq!(st["snapshot"]["retry"], true);
-        assert!(st["doctor"]["problems"].as_array().unwrap().is_empty(), "{st}");
+        assert!(
+            st["doctor"]["problems"].as_array().unwrap().is_empty(),
+            "{st}"
+        );
         let r = run_due(home).unwrap();
-        assert!(r["ran"].as_array().unwrap().contains(&json!("snapshot")), "立即重试：{r}");
+        assert!(
+            r["ran"].as_array().unwrap().contains(&json!("snapshot")),
+            "立即重试：{r}"
+        );
         assert_eq!(status(home)["snapshot"]["ok"], true);
     }
 
@@ -371,8 +422,14 @@ mod tests {
         record_doctor(home, &report).unwrap();
 
         let st = status(home);
-        assert!(st["doctor"]["problems"].as_array().unwrap().is_empty(), "skip 与干净自检都清掉旧问题：{st}");
-        assert_eq!(st["doctor"]["tmp_removed"], 3, "手动自检不清 tmp，保留原计数");
+        assert!(
+            st["doctor"]["problems"].as_array().unwrap().is_empty(),
+            "skip 与干净自检都清掉旧问题：{st}"
+        );
+        assert_eq!(
+            st["doctor"]["tmp_removed"], 3,
+            "手动自检不清 tmp，保留原计数"
+        );
         // 与后台自检同权记为一次尝试：当期不再重复跑
         assert_eq!(run_due(home).unwrap()["ran"], json!([]));
     }

@@ -1,10 +1,8 @@
 //! 0.3.1: bundle round-trip（create → verify → restore → 搜索命中）、
 //! --merge 合并语义、restore-agents 写回门控、setup 一键接入门控。
 
-// json! 只被两个 unix 门控的 stub 测试使用，Windows 编译下随之门控。
-#[cfg(unix)]
 use serde_json::json;
-use yourmem::{adapters, bundle, db, ingest, restore, setup, vault};
+use yourmem::{adapters, bundle, db, ingest, models::NewArtifact, restore, setup, vault, work};
 
 const SESSION_A: &str = r#"{"type":"user","cwd":"/tmp/proj-x","uuid":"a1","timestamp":"2026-08-01T10:00:00Z","message":{"role":"user","content":"甲项目的第一个决定"}}
 {"type":"assistant","uuid":"a2","timestamp":"2026-08-01T10:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"甲项目回复"}]}}"#;
@@ -30,6 +28,7 @@ fn make_src() -> (tempfile::TempDir, tempfile::TempDir) {
 fn bundle_roundtrip_fresh_home() {
     let (home, _src) = make_src();
     let conn = db::open(home.path()).unwrap();
+    let source_generation = work::database_generation(&conn).unwrap();
     let bundle_path = home.path().join("move.tar.gz");
 
     // create
@@ -53,17 +52,42 @@ fn bundle_roundtrip_fresh_home() {
     let new_home = tempfile::tempdir().unwrap();
     let r = bundle::restore(&bundle_path, new_home.path(), false).unwrap();
     assert_eq!(r["mode"], "fresh");
+    assert_ne!(r["database_generation"], json!(source_generation));
+    assert_eq!(
+        work::changes(
+            &db::open(new_home.path()).unwrap(),
+            Some(&source_generation),
+            0,
+            10
+        )
+        .unwrap()["reset_required"],
+        true
+    );
 
     // 搜索命中率与原机一致（验收标准）
     let conn2 = db::open(new_home.path()).unwrap();
-    let hits = db::search(&conn2, &db::SearchOpts {
-        query: "内涝".into(), project: None, agent: None, kind: None, limit: 10,
-    })
+    let hits = db::search(
+        &conn2,
+        &db::SearchOpts {
+            query: "内涝".into(),
+            project: None,
+            agent: None,
+            kind: None,
+            limit: 10,
+        },
+    )
     .unwrap();
     assert_eq!(hits.len(), 1);
-    let hits = db::search(&conn2, &db::SearchOpts {
-        query: "甲项目".into(), project: None, agent: None, kind: None, limit: 10,
-    })
+    let hits = db::search(
+        &conn2,
+        &db::SearchOpts {
+            query: "甲项目".into(),
+            project: None,
+            agent: None,
+            kind: None,
+            limit: 10,
+        },
+    )
     .unwrap();
     assert_eq!(hits.len(), 2); // user 提问 + assistant 回复各一条
 
@@ -86,7 +110,10 @@ fn bundle_filter_prunes_to_one_agent_or_project() {
         [],
     ).unwrap();
     let bundle_path = home.path().join("only-x.tar.gz");
-    let filter = bundle::BundleFilter { agent: None, project: Some("proj-x".into()) };
+    let filter = bundle::BundleFilter {
+        agent: None,
+        project: Some("proj-x".into()),
+    };
     bundle::create(&conn, home.path(), &bundle_path, &filter).unwrap();
 
     let new_home = tempfile::tempdir().unwrap();
@@ -96,9 +123,16 @@ fn bundle_filter_prunes_to_one_agent_or_project() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["project"], "proj-x");
     // 被剪掉的项目搜不到
-    let hits = db::search(&conn2, &db::SearchOpts {
-        query: "内涝".into(), project: None, agent: None, kind: None, limit: 10,
-    })
+    let hits = db::search(
+        &conn2,
+        &db::SearchOpts {
+            query: "内涝".into(),
+            project: None,
+            agent: None,
+            kind: None,
+            limit: 10,
+        },
+    )
     .unwrap();
     assert_eq!(hits.len(), 0);
     let checks: i64 = conn2.query_row("SELECT COUNT(*) FROM cross_checks", [], |r| r.get(0)).unwrap();
@@ -114,7 +148,13 @@ fn bundle_merge_into_existing() {
     let (home, _src) = make_src();
     let conn = db::open(home.path()).unwrap();
     let bundle_path = home.path().join("all.tar.gz");
-    bundle::create(&conn, home.path(), &bundle_path, &bundle::BundleFilter::default()).unwrap();
+    bundle::create(
+        &conn,
+        home.path(),
+        &bundle_path,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
 
     // 目标库：已有会话 aaaa（内容更旧/相同），缺 bbbb
     let target = tempfile::tempdir().unwrap();
@@ -136,9 +176,16 @@ fn bundle_merge_into_existing() {
     let conn2 = db::open(target.path()).unwrap();
     let sessions = db::recent_sessions(&conn2, None, 10).unwrap();
     assert_eq!(sessions.len(), 2);
-    let hits = db::search(&conn2, &db::SearchOpts {
-        query: "内涝".into(), project: None, agent: None, kind: None, limit: 10,
-    })
+    let hits = db::search(
+        &conn2,
+        &db::SearchOpts {
+            query: "内涝".into(),
+            project: None,
+            agent: None,
+            kind: None,
+            limit: 10,
+        },
+    )
     .unwrap();
     assert_eq!(hits.len(), 1);
 }
@@ -151,8 +198,15 @@ fn merge_carries_saw_response_item() {
     let bundle_path = home.path().join("all.tar.gz");
     {
         let conn = db::open(home.path()).unwrap();
-        conn.execute("UPDATE source_files SET saw_response_item = 1", []).unwrap();
-        bundle::create(&conn, home.path(), &bundle_path, &bundle::BundleFilter::default()).unwrap();
+        conn.execute("UPDATE source_files SET saw_response_item = 1", [])
+            .unwrap();
+        bundle::create(
+            &conn,
+            home.path(),
+            &bundle_path,
+            &bundle::BundleFilter::default(),
+        )
+        .unwrap();
     }
     // 全新 home 恢复 --merge（目标库需先建好）
     let target = tempfile::tempdir().unwrap();
@@ -161,7 +215,11 @@ fn merge_carries_saw_response_item() {
     assert_eq!(r["mode"], "merge");
     let conn2 = db::open(target.path()).unwrap();
     let saw: i64 = conn2
-        .query_row("SELECT COALESCE(MAX(saw_response_item), 0) FROM source_files", [], |r| r.get(0))
+        .query_row(
+            "SELECT COALESCE(MAX(saw_response_item), 0) FROM source_files",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(saw, 1, "saw_response_item 必须随 source_files 一并合并");
 }
@@ -175,12 +233,26 @@ fn merge_keeps_compact_line_no_and_archived_at() {
     let bundle_path = home.path().join("all.tar.gz");
     {
         let conn = db::open(home.path()).unwrap();
-        conn.execute("UPDATE sessions SET compact_line_no = 1 WHERE id = 'claude:aaaa'", []).unwrap();
+        conn.execute(
+            "UPDATE sessions SET compact_line_no = 1 WHERE id = 'claude:aaaa'",
+            [],
+        )
+        .unwrap();
         let pid: i64 = conn
-            .query_row("SELECT id FROM projects WHERE path = '/tmp/proj-x'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM projects WHERE path = '/tmp/proj-x'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         db::set_project_archived(&conn, pid, true).unwrap();
-        bundle::create(&conn, home.path(), &bundle_path, &bundle::BundleFilter::default()).unwrap();
+        bundle::create(
+            &conn,
+            home.path(),
+            &bundle_path,
+            &bundle::BundleFilter::default(),
+        )
+        .unwrap();
     }
     let target = tempfile::tempdir().unwrap();
     db::open(target.path()).unwrap();
@@ -188,16 +260,28 @@ fn merge_keeps_compact_line_no_and_archived_at() {
     assert_eq!(r["mode"], "merge");
     let conn2 = db::open(target.path()).unwrap();
     let cln: Option<i64> = conn2
-        .query_row("SELECT compact_line_no FROM sessions WHERE id = 'claude:aaaa'", [], |r| r.get(0))
+        .query_row(
+            "SELECT compact_line_no FROM sessions WHERE id = 'claude:aaaa'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(cln, Some(1), "compact_line_no 必须随 merge 保留");
     let archived: Option<String> = conn2
-        .query_row("SELECT archived_at FROM projects WHERE path = '/tmp/proj-x'", [], |r| r.get(0))
+        .query_row(
+            "SELECT archived_at FROM projects WHERE path = '/tmp/proj-x'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert!(archived.is_some(), "已废弃项目 merge 后不得复活");
     // 未废弃的项目不受影响
     let active: Option<String> = conn2
-        .query_row("SELECT archived_at FROM projects WHERE path = '/tmp/proj-y'", [], |r| r.get(0))
+        .query_row(
+            "SELECT archived_at FROM projects WHERE path = '/tmp/proj-y'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert!(active.is_none());
 }
@@ -210,7 +294,8 @@ fn merge_refreshes_fts_for_updated_memory_file() {
         let conn = db::open(home).unwrap();
         let bytes = text.as_bytes();
         let hash = vault::store_line(home, bytes).unwrap();
-        let (fid, _) = db::upsert_memory_file(&conn, "claude", "global", "/proj/CLAUDE.md", &hash).unwrap();
+        let (fid, _) =
+            db::upsert_memory_file(&conn, "claude", "global", "/proj/CLAUDE.md", &hash).unwrap();
         db::insert_memory_revision(&conn, fid, &hash, bytes.len() as u64).unwrap();
         // 手动设 updated_at 让新旧可比（upsert 内部用 now_iso）
         conn.execute(
@@ -223,15 +308,32 @@ fn merge_refreshes_fts_for_updated_memory_file() {
     };
     let src_home = tempfile::tempdir().unwrap();
     {
-        let conn = seed(src_home.path(), "决策：新版独有内容为准", "2026-08-02T00:00:00Z");
-        bundle::create(&conn, src_home.path(), &src_home.path().join("b.tar.gz"), &bundle::BundleFilter::default()).unwrap();
+        let conn = seed(
+            src_home.path(),
+            "决策：新版独有内容为准",
+            "2026-08-02T00:00:00Z",
+        );
+        bundle::create(
+            &conn,
+            src_home.path(),
+            &src_home.path().join("b.tar.gz"),
+            &bundle::BundleFilter::default(),
+        )
+        .unwrap();
     }
     let target = tempfile::tempdir().unwrap();
-    seed(target.path(), "决策：旧版独有内容为准", "2026-08-01T00:00:00Z");
+    seed(
+        target.path(),
+        "决策：旧版独有内容为准",
+        "2026-08-01T00:00:00Z",
+    );
 
     let r = bundle::restore(&src_home.path().join("b.tar.gz"), target.path(), true).unwrap();
     assert_eq!(r["mode"], "merge");
-    assert!(r["memory_fts_backfilled"].as_u64().unwrap_or(0) >= 1, "被更新的文件要重建索引: {r}");
+    assert!(
+        r["memory_fts_backfilled"].as_u64().unwrap_or(0) >= 1,
+        "被更新的文件要重建索引: {r}"
+    );
 
     let conn2 = db::open(target.path()).unwrap();
     let fresh = db::search_memory_files_fts(&conn2, "新版独有内容", 10).unwrap();
@@ -261,17 +363,24 @@ fn bundle_merge_remaps_project_ids() {
     {
         let conn = db::open(home.path()).unwrap();
         let alpha_id: i64 = conn
-            .query_row("SELECT id FROM projects WHERE path = '/tmp/alpha'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM projects WHERE path = '/tmp/alpha'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        db::save_memory(&conn, &db::MemoryInput {
-            project_id: Some(alpha_id),
-            scope: "project",
-            r#type: "fact",
-            content: "alpha 的架构决定",
-            status: None,
-            source_session_id: None,
-            source_message_id: None,
-        })
+        db::save_memory(
+            &conn,
+            &db::MemoryInput {
+                project_id: Some(alpha_id),
+                scope: "project",
+                r#type: "fact",
+                content: "alpha 的架构决定",
+                status: None,
+                source_session_id: None,
+                source_message_id: None,
+            },
+        )
         .unwrap();
         conn.execute(
             "INSERT INTO cross_checks(project_id, run_id, path, role, model, vendor, header_hash, created_at, updated_at)
@@ -282,7 +391,13 @@ fn bundle_merge_remaps_project_ids() {
     let bundle_path = home.path().join("all.tar.gz");
     {
         let conn = db::open(home.path()).unwrap();
-        bundle::create(&conn, home.path(), &bundle_path, &bundle::BundleFilter::default()).unwrap();
+        bundle::create(
+            &conn,
+            home.path(),
+            &bundle_path,
+            &bundle::BundleFilter::default(),
+        )
+        .unwrap();
     }
 
     // 目标库：beta 先到，拿到 id 1（与源库 alpha 的 id 相同）
@@ -317,7 +432,10 @@ fn restore_agents_gate() {
     // 预览：路径、后果、resume 命令
     let p = restore::plan(&conn, "claude", "aaaa").unwrap();
     let target = src.path().join("claude").join("aaaa.jsonl");
-    assert_eq!(p["will_write"][0].as_str().unwrap(), target.to_string_lossy());
+    assert_eq!(
+        p["will_write"][0].as_str().unwrap(),
+        target.to_string_lossy()
+    );
     assert_eq!(p["resume_command"], "claude --resume aaaa");
 
     // 目标已存在（源文件还在）→ 默认拒绝
@@ -328,13 +446,21 @@ fn restore_agents_gate() {
     let r = restore::execute(&conn, home.path(), "claude", "aaaa", true).unwrap();
     let bak = r["backup"].as_str().unwrap();
     assert!(std::path::Path::new(bak).is_file());
-    assert_eq!(std::fs::read_to_string(bak).unwrap(), "corrupted local copy\n");
+    assert_eq!(
+        std::fs::read_to_string(bak).unwrap(),
+        "corrupted local copy\n"
+    );
     // 重建内容与原始 fixture 逐字节一致
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), format!("{SESSION_A}\n"));
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        format!("{SESSION_A}\n")
+    );
 
     // opencode 型会话拒绝写回
     let oc_err = restore::plan(&conn, "opencode", "ses_anything").unwrap_err();
-    assert!(oc_err.to_string().contains("session not found") || oc_err.to_string().contains("SQLite"));
+    assert!(
+        oc_err.to_string().contains("session not found") || oc_err.to_string().contains("SQLite")
+    );
 }
 
 /// 伪造 yourmem 二进制的 stub（`--version` 输出 "yourmem <ver>"），用于测试版本探测。
@@ -375,21 +501,44 @@ fn setup_gate_plan_and_execute() {
     let p = setup::plan(&targets).unwrap();
     let agents = p["agents"].as_array().unwrap();
     assert_eq!(agents.len(), 7);
-    assert_eq!(agents.iter().filter(|a| a["status"] == "detected").count(), 2);
-    assert!(agents.iter().filter(|a| a["status"] == "detected")
-        .all(|a| a["actions"].as_array().unwrap().iter().all(|act| act["status"] == "todo")));
+    assert_eq!(
+        agents.iter().filter(|a| a["status"] == "detected").count(),
+        2
+    );
+    assert!(agents
+        .iter()
+        .filter(|a| a["status"] == "detected")
+        .all(|a| a["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|act| act["status"] == "todo")));
 
     // 执行：MCP 注册 + 指令写入
     let r = setup::execute(&targets).unwrap();
-    assert!(r["agents"].as_array().unwrap().iter().filter(|a| a["status"] == "detected").all(|a| a["status"] == "configured"));
+    assert!(r["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["status"] == "detected")
+        .all(|a| a["status"] == "configured"));
     let claude_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&targets.claude_json).unwrap()).unwrap();
     // current_exe 在测试里是测试二进制，只验证条目非空且 args 正确
-    assert!(!claude_json["mcpServers"]["yourmem"]["command"].as_str().unwrap().is_empty());
+    assert!(!claude_json["mcpServers"]["yourmem"]["command"]
+        .as_str()
+        .unwrap()
+        .is_empty());
     assert_eq!(claude_json["mcpServers"]["yourmem"]["args"][0], "mcp");
-    assert!(std::fs::read_to_string(&targets.codex_config).unwrap().contains("[mcp_servers.yourmem]"));
-    assert!(std::fs::read_to_string(&targets.claude_md).unwrap().contains("yourmem 跨 agent 记忆库"));
-    assert!(std::fs::read_to_string(&targets.codex_agents).unwrap().contains("search_history"));
+    assert!(std::fs::read_to_string(&targets.codex_config)
+        .unwrap()
+        .contains("[mcp_servers.yourmem]"));
+    assert!(std::fs::read_to_string(&targets.claude_md)
+        .unwrap()
+        .contains("yourmem 跨 agent 记忆库"));
+    assert!(std::fs::read_to_string(&targets.codex_agents)
+        .unwrap()
+        .contains("search_history"));
 
     // 幂等：把注册命令换成同版本 stub 后再跑，应全是 already_done
     //（测试二进制自身的 --version 不是 yourmem 的输出格式，直接复跑会判 stale）
@@ -398,7 +547,11 @@ fn setup_gate_plan_and_execute() {
         let mut v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&targets.claude_json).unwrap()).unwrap();
         v["mcpServers"]["yourmem"]["command"] = json!(stub.to_str().unwrap());
-        std::fs::write(&targets.claude_json, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        std::fs::write(
+            &targets.claude_json,
+            serde_json::to_string_pretty(&v).unwrap(),
+        )
+        .unwrap();
     }
     std::fs::write(
         &targets.codex_config,
@@ -409,7 +562,10 @@ fn setup_gate_plan_and_execute() {
     )
     .unwrap();
     let r2 = setup::execute(&targets).unwrap();
-    assert!(r2["agents"].as_array().unwrap().iter()
+    assert!(r2["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
         .filter(|a| a["status"] == "detected")
         .flat_map(|a| a["actions"].as_array().unwrap().clone())
         .all(|act| act["status"] == "already_done"));
@@ -423,7 +579,11 @@ fn setup_gate_plan_and_execute() {
     let baks: Vec<_> = std::fs::read_dir(targets.claude_md.parent().unwrap())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("CLAUDE.md.bak-"))
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("CLAUDE.md.bak-")
+        })
         .collect();
     assert!(!baks.is_empty(), "覆盖前必须留下 .bak 时间戳备份");
 }
@@ -450,8 +610,13 @@ fn setup_selected_only_returns_requested_agents() {
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0]["agent"], "codex");
     setup::execute_selected(&targets, &selected).unwrap();
-    assert!(std::fs::read_to_string(&targets.codex_config).unwrap().contains("[mcp_servers.yourmem]"));
-    assert_eq!(std::fs::read_to_string(&targets.hermes_config).unwrap(), "mcp_servers:\n");
+    assert!(std::fs::read_to_string(&targets.codex_config)
+        .unwrap()
+        .contains("[mcp_servers.yourmem]"));
+    assert_eq!(
+        std::fs::read_to_string(&targets.hermes_config).unwrap(),
+        "mcp_servers:\n"
+    );
     assert!(setup::plan_selected(&targets, &[]).is_err());
     assert!(setup::plan_selected(&targets, &["unknown".to_string()]).is_err());
 }
@@ -462,8 +627,16 @@ fn setup_selected_registers_json_agents_without_touching_other_agents() {
     for dir in [".zcode/cli", ".kimi-code", ".gemini", ".cursor"] {
         std::fs::create_dir_all(fake.path().join(dir)).unwrap();
     }
-    std::fs::write(fake.path().join(".zcode/cli/config.json"), r#"{"plugins":{"enabled":{}}}"#).unwrap();
-    std::fs::write(fake.path().join(".kimi-code/mcp.json"), r#"{"mcpServers":{"other":{"command":"node"}}}"#).unwrap();
+    std::fs::write(
+        fake.path().join(".zcode/cli/config.json"),
+        r#"{"plugins":{"enabled":{}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        fake.path().join(".kimi-code/mcp.json"),
+        r#"{"mcpServers":{"other":{"command":"node"}}}"#,
+    )
+    .unwrap();
     std::fs::write(fake.path().join(".gemini/settings.json"), r#"{"hooks":{}}"#).unwrap();
     let targets = setup::Targets {
         claude_json: fake.path().join("nope-claude/.claude.json"),
@@ -476,19 +649,29 @@ fn setup_selected_registers_json_agents_without_touching_other_agents() {
         cursor_mcp: fake.path().join(".cursor/mcp.json"),
         hermes_config: fake.path().join("nope-hermes/config.yaml"),
     };
-    let selected = vec!["zcode".to_string(), "kimi".to_string(), "gemini".to_string(), "cursor".to_string()];
+    let selected = vec![
+        "zcode".to_string(),
+        "kimi".to_string(),
+        "gemini".to_string(),
+        "cursor".to_string(),
+    ];
     let plan = setup::plan_selected(&targets, &selected).unwrap();
     assert_eq!(plan["agents"].as_array().unwrap().len(), 4);
     assert!(plan["agents"].as_array().unwrap().iter().all(|a| {
-        a["status"] == "detected" && a["actions"].as_array().unwrap().len() == 1
+        a["status"] == "detected"
+            && a["actions"].as_array().unwrap().len() == 1
             && a["actions"][0]["kind"] == "register_mcp"
     }));
 
     setup::execute_selected(&targets, &selected).unwrap();
-    let z: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&targets.zcode_config).unwrap()).unwrap();
-    let k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&targets.kimi_mcp).unwrap()).unwrap();
-    let g: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&targets.gemini_settings).unwrap()).unwrap();
-    let c: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&targets.cursor_mcp).unwrap()).unwrap();
+    let z: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&targets.zcode_config).unwrap()).unwrap();
+    let k: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&targets.kimi_mcp).unwrap()).unwrap();
+    let g: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&targets.gemini_settings).unwrap()).unwrap();
+    let c: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&targets.cursor_mcp).unwrap()).unwrap();
     assert_eq!(z["mcp"]["servers"]["yourmem"]["type"], "stdio");
     assert_eq!(z["mcp"]["servers"]["yourmem"]["args"][0], "mcp");
     assert_eq!(k["mcpServers"]["other"]["command"], "node");
@@ -536,9 +719,18 @@ fn setup_detects_and_refreshes_stale_mcp_registration() {
     .unwrap();
 
     let p = setup::plan(&targets).unwrap();
-    for a in p["agents"].as_array().unwrap().into_iter().filter(|a| a["status"] == "detected") {
+    for a in p["agents"]
+        .as_array()
+        .unwrap()
+        .into_iter()
+        .filter(|a| a["status"] == "detected")
+    {
         let mcp = &a["actions"][0];
-        assert_eq!(mcp["status"], "stale", "{} 的 MCP 注册应判 stale", a["agent"]);
+        assert_eq!(
+            mcp["status"], "stale",
+            "{} 的 MCP 注册应判 stale",
+            a["agent"]
+        );
         assert_eq!(mcp["detail"]["version"], "0.0.1");
     }
 
@@ -550,8 +742,14 @@ fn setup_detects_and_refreshes_stale_mcp_registration() {
     assert_ne!(new_cmd, old.to_str().unwrap());
     let toml = std::fs::read_to_string(&targets.codex_config).unwrap();
     assert!(!toml.contains(old.to_str().unwrap()));
-    assert!(toml.contains("[mcp_servers.yourmem.tools.search_history]"), "tools 子表必须保留");
-    assert!(toml.matches("[mcp_servers.yourmem]").count() == 1, "主表不能重复");
+    assert!(
+        toml.contains("[mcp_servers.yourmem.tools.search_history]"),
+        "tools 子表必须保留"
+    );
+    assert!(
+        toml.matches("[mcp_servers.yourmem]").count() == 1,
+        "主表不能重复"
+    );
 }
 
 #[test]
@@ -594,8 +792,12 @@ fn instruction_block_version_gate() {
     // plan：旧版块判 stale
     let p = setup::plan(&targets).unwrap();
     let claude = &p["agents"].as_array().unwrap()[0];
-    let instr = claude["actions"].as_array().unwrap()
-        .iter().find(|a| a["kind"] == "global_instructions").unwrap();
+    let instr = claude["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["kind"] == "global_instructions")
+        .unwrap();
     assert_eq!(instr["status"], "stale");
 
     // execute：旧块整体替换为新全文，用户内容保留，旧内容消失，写前有 .bak
@@ -605,13 +807,23 @@ fn instruction_block_version_gate() {
     assert!(content.starts_with("# 我自己的规则"));
     assert!(content.contains("## 我自己的另一节\n保留我"));
     assert!(!content.contains("旧版内容"));
-    assert!(std::fs::read_dir(targets.claude_md.parent().unwrap()).unwrap()
-        .any(|e| e.unwrap().file_name().to_string_lossy().starts_with("CLAUDE.md.bak-")));
+    assert!(std::fs::read_dir(targets.claude_md.parent().unwrap())
+        .unwrap()
+        .any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("CLAUDE.md.bak-")));
 
     // 幂等：已是新全文 → already_done
     let r2 = setup::execute(&targets).unwrap();
-    let instr2 = r2["agents"].as_array().unwrap()[0]["actions"].as_array().unwrap()
-        .iter().find(|a| a["kind"] == "global_instructions").unwrap().clone();
+    let instr2 = r2["agents"].as_array().unwrap()[0]["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["kind"] == "global_instructions")
+        .unwrap()
+        .clone();
     assert_eq!(instr2["status"], "already_done");
 }
 
@@ -623,11 +835,23 @@ fn filtered_bundle_keeps_only_own_agent_tombstones() {
     let conn = db::open(home.path()).unwrap();
     // 墓碑之一用"稍后要导入的 kimi wire.jsonl 的真实路径"——恢复后按路径
     // 精确阻断的效果才能被真正检验（codex 终审 suggestion）
-    let victim_wire = src.path().join("kimi-victim").join("sessions").join("wd_v")
-        .join("session_00000000-0000-0000-0000-0000000000ee").join("agents").join("main").join("wire.jsonl");
+    let victim_wire = src
+        .path()
+        .join("kimi-victim")
+        .join("sessions")
+        .join("wd_v")
+        .join("session_00000000-0000-0000-0000-0000000000ee")
+        .join("agents")
+        .join("main")
+        .join("wire.jsonl");
     std::fs::create_dir_all(victim_wire.parent().unwrap()).unwrap();
-    std::fs::write(&victim_wire,
-        r#"{"type":"turn.prompt","input":[{"type":"text","text":"同路径墓碑的受害者"}]}"#.to_string() + "\n").unwrap();
+    std::fs::write(
+        &victim_wire,
+        r#"{"type":"turn.prompt","input":[{"type":"text","text":"同路径墓碑的受害者"}]}"#
+            .to_string()
+            + "\n",
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO purged_sources(path, session_id, purged_at) VALUES
          ('/tmp/a.jsonl', 'claude:purged-1', '2026-08-23T00:00:00Z'),
@@ -638,41 +862,93 @@ fn filtered_bundle_keeps_only_own_agent_tombstones() {
     .unwrap();
     // 前置断言：未过滤的 bundle（带墓碑）恢复后，同路径导入为 0（墓碑确实阻断）
     let out_all = home.path().join("all-with-tomb.tar.gz");
-    bundle::create(&conn, home.path(), &out_all, &bundle::BundleFilter::default()).unwrap();
+    bundle::create(
+        &conn,
+        home.path(),
+        &out_all,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
     let t_all = tempfile::tempdir().unwrap();
     bundle::restore(&out_all, t_all.path(), false).unwrap();
     {
         let mut ca = db::open(t_all.path()).unwrap();
-        let roots_a = vec![(adapters::AGENT_KIMI, src.path().join("kimi-victim").join("sessions"))];
-        let out_a = yourmem::ingest::import_all(&mut ca, t_all.path(), &roots_a, None, None).unwrap();
+        let roots_a = vec![(
+            adapters::AGENT_KIMI,
+            src.path().join("kimi-victim").join("sessions"),
+        )];
+        let out_a =
+            yourmem::ingest::import_all(&mut ca, t_all.path(), &roots_a, None, None).unwrap();
         assert_eq!(out_a.messages_added, 0, "前置：真实路径墓碑确实阻断导入");
     }
     let out = home.path().join("only-claude.tar.gz");
-    bundle::create(&conn, home.path(), &out, &bundle::BundleFilter { agent: Some("claude".into()), project: None }).unwrap();
+    bundle::create(
+        &conn,
+        home.path(),
+        &out,
+        &bundle::BundleFilter {
+            agent: Some("claude".into()),
+            project: None,
+        },
+    )
+    .unwrap();
 
     let target = tempfile::tempdir().unwrap();
     bundle::restore(&out, target.path(), false).unwrap();
     let c2 = db::open(target.path()).unwrap();
-    let claude_tb: i64 = c2.query_row(
-        "SELECT COUNT(*) FROM purged_sources WHERE session_id LIKE 'claude:%'", [], |r| r.get(0)).unwrap();
-    let oc_tb: i64 = c2.query_row(
-        "SELECT COUNT(*) FROM purged_sources WHERE session_id LIKE 'opencode:%'", [], |r| r.get(0)).unwrap();
-    assert_eq!(claude_tb, 1, "本 agent 的有效墓碑必须保留（会话不在 sessions 是常态）");
+    let claude_tb: i64 = c2
+        .query_row(
+            "SELECT COUNT(*) FROM purged_sources WHERE session_id LIKE 'claude:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let oc_tb: i64 = c2
+        .query_row(
+            "SELECT COUNT(*) FROM purged_sources WHERE session_id LIKE 'opencode:%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        claude_tb, 1,
+        "本 agent 的有效墓碑必须保留（会话不在 sessions 是常态）"
+    );
     assert_eq!(oc_tb, 0, "其他 agent 的墓碑不得进过滤 bundle");
 
     // project 过滤不裁墓碑（保守多带）
     let out2 = home.path().join("only-x2.tar.gz");
-    bundle::create(&conn, home.path(), &out2, &bundle::BundleFilter { agent: None, project: Some("proj-x".into()) }).unwrap();
+    bundle::create(
+        &conn,
+        home.path(),
+        &out2,
+        &bundle::BundleFilter {
+            agent: None,
+            project: Some("proj-x".into()),
+        },
+    )
+    .unwrap();
     let t2 = tempfile::tempdir().unwrap();
     bundle::restore(&out2, t2.path(), false).unwrap();
     let c3 = db::open(t2.path()).unwrap();
-    let kept: i64 = c3.query_row("SELECT COUNT(*) FROM purged_sources", [], |r| r.get(0)).unwrap();
-    assert_eq!(kept, 0, "project 过滤全删墓碑——多带会静默阻断他项目本地导入（codex 十一审复现）");
+    let kept: i64 = c3
+        .query_row("SELECT COUNT(*) FROM purged_sources", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        kept, 0,
+        "project 过滤全删墓碑——多带会静默阻断他项目本地导入（codex 十一审复现）"
+    );
     // 真实导入验证：project 过滤 bundle 恢复后，同一路径的源文件不得被墓碑阻断
     let mut c4 = db::open(t2.path()).unwrap();
-    let roots = vec![(adapters::AGENT_KIMI, src.path().join("kimi-victim").join("sessions"))];
+    let roots = vec![(
+        adapters::AGENT_KIMI,
+        src.path().join("kimi-victim").join("sessions"),
+    )];
     let out3 = yourmem::ingest::import_all(&mut c4, t2.path(), &roots, None, None).unwrap();
-    assert_eq!(out3.messages_added, 1, "墓碑已随 project 过滤删除，同路径源文件正常导入");
+    assert_eq!(
+        out3.messages_added, 1,
+        "墓碑已随 project 过滤删除，同路径源文件正常导入"
+    );
 }
 
 #[test]
@@ -688,24 +964,49 @@ fn merge_bundle_without_tombstone_table_v3_like() {
     let dec = flate2::read::GzDecoder::new(file);
     let mut ar = tar::Archive::new(dec);
     ar.unpack(tmp.path()).unwrap();
-    let root: std::path::PathBuf = std::fs::read_dir(tmp.path()).unwrap().next().unwrap().unwrap().path();
+    let root: std::path::PathBuf = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     let snap = root.join("db");
-    let snap_file: std::path::PathBuf = std::fs::read_dir(&snap).unwrap().next().unwrap().unwrap().path();
+    let snap_file: std::path::PathBuf = std::fs::read_dir(&snap)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     {
         let c = rusqlite::Connection::open(&snap_file).unwrap();
-        // 真实 v3 快照也没有 v10/v11 的两列——一并去掉，覆盖 merge 的缺列探测分支
+        // 真实 v3 快照没有新版 work_* 触发器，也没有 v10/v11 的两列。
+        let triggers: Vec<String> = c
+            .prepare(
+                "SELECT name FROM sqlite_master
+            WHERE type='trigger' AND name LIKE 'work_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for trigger in triggers {
+            c.execute_batch(&format!("DROP TRIGGER {trigger}")).unwrap();
+        }
         c.execute_batch(
             "DROP TABLE purged_sources; DROP TABLE gc_pending;
              ALTER TABLE sessions DROP COLUMN compact_line_no;
              ALTER TABLE projects DROP COLUMN archived_at;",
-        ).unwrap();
+        )
+        .unwrap();
         c.pragma_update(None, "user_version", 3).unwrap();
     }
     // manifest 同步改 schema_version=3（版本门读 manifest，快照 user_version
     // 只是模拟的陪衬——codex 十一审 suggestion）
     {
         let mp = root.join("manifest.json");
-        let mut m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&mp).unwrap()).unwrap();
+        let mut m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mp).unwrap()).unwrap();
         m["schema_version"] = serde_json::json!(3);
         std::fs::write(&mp, serde_json::to_string_pretty(&m).unwrap()).unwrap();
     }
@@ -713,16 +1014,25 @@ fn merge_bundle_without_tombstone_table_v3_like() {
     let f2 = std::fs::File::create(&out2).unwrap();
     let enc = flate2::write::GzEncoder::new(f2, flate2::Compression::default());
     let mut tar = tar::Builder::new(enc);
-    tar.append_dir_all(root.file_name().unwrap(), &root).unwrap();
+    tar.append_dir_all(root.file_name().unwrap(), &root)
+        .unwrap();
     tar.into_inner().unwrap().finish().unwrap();
 
     let target = tempfile::tempdir().unwrap();
     let tc = db::open(target.path()).unwrap();
-    db::save_memory(&tc, &db::MemoryInput {
-        project_id: None, scope: "global", r#type: "fact",
-        content: "目标库已有内容", status: None,
-        source_session_id: None, source_message_id: None,
-    }).unwrap();
+    db::save_memory(
+        &tc,
+        &db::MemoryInput {
+            project_id: None,
+            scope: "global",
+            r#type: "fact",
+            content: "目标库已有内容",
+            status: None,
+            source_session_id: None,
+            source_message_id: None,
+        },
+    )
+    .unwrap();
     let r = bundle::restore(&out2, target.path(), true).unwrap();
     assert_eq!(r["mode"], "merge", "v3（无墓碑表）bundle merge 不得报错");
 }
@@ -737,11 +1047,19 @@ fn merge_remaps_memory_source_message_pointer() {
     let msg_id: i64 = conn.query_row(
         "SELECT id FROM messages WHERE session_id = 'claude:aaaa' ORDER BY line_no, ord LIMIT 1",
         [], |r| r.get(0)).unwrap();
-    db::save_memory(&conn, &db::MemoryInput {
-        project_id: None, scope: "global", r#type: "decision",
-        content: "merge 指针重映射验证", status: None,
-        source_session_id: Some("claude:aaaa"), source_message_id: Some(msg_id),
-    }).unwrap();
+    db::save_memory(
+        &conn,
+        &db::MemoryInput {
+            project_id: None,
+            scope: "global",
+            r#type: "decision",
+            content: "merge 指针重映射验证",
+            status: None,
+            source_session_id: Some("claude:aaaa"),
+            source_message_id: Some(msg_id),
+        },
+    )
+    .unwrap();
 
     let out = home.path().join("ptr.tar.gz");
     bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
@@ -760,14 +1078,21 @@ fn merge_remaps_memory_source_message_pointer() {
     bundle::restore(&out, target.path(), true).unwrap();
 
     let tc = db::open(target.path()).unwrap();
-    let (smid, line): (Option<i64>, Option<i64>) = tc.query_row(
-        "SELECT m.source_message_id, msg.line_no FROM memories m
+    let (smid, line): (Option<i64>, Option<i64>) = tc
+        .query_row(
+            "SELECT m.source_message_id, msg.line_no FROM memories m
          LEFT JOIN messages msg ON msg.id = m.source_message_id
          WHERE m.content = 'merge 指针重映射验证'",
-        [], |r| Ok((r.get(0)?, r.get(1)?)),
-    ).unwrap();
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
     assert!(smid.is_some(), "指针不得丢");
-    assert_eq!(line, Some(1), "重映射后必须指向 aaaa 的 L1（原消息行号），实际 {line:?}");
+    assert_eq!(
+        line,
+        Some(1),
+        "重映射后必须指向 aaaa 的 L1（原消息行号），实际 {line:?}"
+    );
     // JOIN 语义本身由 tests/dossier.rs 的行号保护测试覆盖；此处证明重映射即可
     let _ = src;
 }
@@ -789,10 +1114,21 @@ fn merge_session_clears_conflicting_tombstone() {
     drop(tc);
     bundle::restore(&out, target.path(), true).unwrap();
     let tc = db::open(target.path()).unwrap();
-    let tb: i64 = tc.query_row(
-        "SELECT COUNT(*) FROM purged_sources WHERE session_id = 'claude:aaaa'", [], |r| r.get(0)).unwrap();
+    let tb: i64 = tc
+        .query_row(
+            "SELECT COUNT(*) FROM purged_sources WHERE session_id = 'claude:aaaa'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(tb, 0, "bundle 带入的会话必须清掉矛盾墓碑");
-    let sess: i64 = tc.query_row("SELECT COUNT(*) FROM sessions WHERE id = 'claude:aaaa'", [], |r| r.get(0)).unwrap();
+    let sess: i64 = tc
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE id = 'claude:aaaa'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(sess, 1);
 }
 
@@ -813,14 +1149,26 @@ fn merge_pointer_survives_skipped_and_replaced_sessions() {
         // 两条既有指针分别指向 aaaa 的 L1 与 L2（rowid 复用下按旧消息 id 更新
         // 会把两条改成同一目标——终审四轮 suggestion 的尖锐回归）
         for (line, tag) in [(1, "既有指针L1"), (2, "既有指针L2")] {
-            let mid: i64 = tc.query_row(
-                "SELECT id FROM messages WHERE session_id = 'claude:aaaa' AND line_no = ?1",
-                rusqlite::params![line], |r| r.get(0)).unwrap();
-            db::save_memory(&tc, &db::MemoryInput {
-                project_id: None, scope: "global", r#type: "decision",
-                content: tag, status: None,
-                source_session_id: Some("claude:aaaa"), source_message_id: Some(mid),
-            }).unwrap();
+            let mid: i64 = tc
+                .query_row(
+                    "SELECT id FROM messages WHERE session_id = 'claude:aaaa' AND line_no = ?1",
+                    rusqlite::params![line],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            db::save_memory(
+                &tc,
+                &db::MemoryInput {
+                    project_id: None,
+                    scope: "global",
+                    r#type: "decision",
+                    content: tag,
+                    status: None,
+                    source_session_id: Some("claude:aaaa"),
+                    source_message_id: Some(mid),
+                },
+            )
+            .unwrap();
         }
     }
 
@@ -835,42 +1183,71 @@ fn merge_pointer_survives_skipped_and_replaced_sessions() {
         let mut c = db::open(home.path()).unwrap();
         let roots = vec![(adapters::AGENT_CLAUDE, src.path().join("claude"))];
         yourmem::ingest::import_all(&mut c, home.path(), &roots, None, None).unwrap();
-        let mid: i64 = c.query_row(
-            "SELECT id FROM messages WHERE session_id = 'claude:bbbb' AND line_no = 1",
-            [], |r| r.get(0)).unwrap();
-        db::save_memory(&c, &db::MemoryInput {
-            project_id: None, scope: "global", r#type: "decision",
-            content: "skipped 会话指针（不得变 NULL）", status: None,
-            source_session_id: Some("claude:bbbb"), source_message_id: Some(mid),
-        }).unwrap();
+        let mid: i64 = c
+            .query_row(
+                "SELECT id FROM messages WHERE session_id = 'claude:bbbb' AND line_no = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db::save_memory(
+            &c,
+            &db::MemoryInput {
+                project_id: None,
+                scope: "global",
+                r#type: "decision",
+                content: "skipped 会话指针（不得变 NULL）",
+                status: None,
+                source_session_id: Some("claude:bbbb"),
+                source_message_id: Some(mid),
+            },
+        )
+        .unwrap();
         drop(c);
     }
     // 第二次合并：aaaa 走替换、bbbb 走 skipped
-    bundle::create(&db::open(home.path()).unwrap(), home.path(),
-        &home.path().join("ptr3.tar.gz"), &bundle::BundleFilter::default()).unwrap();
+    bundle::create(
+        &db::open(home.path()).unwrap(),
+        home.path(),
+        &home.path().join("ptr3.tar.gz"),
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
     bundle::restore(&home.path().join("ptr3.tar.gz"), target.path(), true).unwrap();
 
     let tc = db::open(target.path()).unwrap();
     // skipped：指针仍指向 bbbb 的 L1
-    let (smid, sess, line): (Option<i64>, Option<String>, Option<i64>) = tc.query_row(
-        "SELECT m.source_message_id, msg.session_id, msg.line_no FROM memories m
+    let (smid, sess, line): (Option<i64>, Option<String>, Option<i64>) = tc
+        .query_row(
+            "SELECT m.source_message_id, msg.session_id, msg.line_no FROM memories m
          LEFT JOIN messages msg ON msg.id = m.source_message_id
          WHERE m.content = 'skipped 会话指针（不得变 NULL）'",
-        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    ).unwrap();
-    assert_eq!((sess.as_deref(), line), (Some("claude:bbbb"), Some(1)), "skipped 指针按坐标对齐: {sess:?}/{line:?}");
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (sess.as_deref(), line),
+        (Some("claude:bbbb"), Some(1)),
+        "skipped 指针按坐标对齐: {sess:?}/{line:?}"
+    );
     assert!(smid.is_some());
     // replaced：两条既有指针各自重指到原行号（rowid 复用不改坐标语义）
     for (want_line, tag) in [(1, "既有指针L1"), (2, "既有指针L2")] {
-        let (sess, line): (Option<String>, Option<i64>) = tc.query_row(
-            "SELECT msg.session_id, msg.line_no FROM memories m
+        let (sess, line): (Option<String>, Option<i64>) = tc
+            .query_row(
+                "SELECT msg.session_id, msg.line_no FROM memories m
              JOIN messages msg ON msg.id = m.source_message_id
              WHERE m.content = ?1",
-            rusqlite::params![tag],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
-        assert_eq!((sess.as_deref(), line), (Some("claude:aaaa"), Some(want_line)),
-            "{tag} 替换后必须仍指向 L{want_line}（rowid 复用不得改坐标）");
+                rusqlite::params![tag],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (sess.as_deref(), line),
+            (Some("claude:aaaa"), Some(want_line)),
+            "{tag} 替换后必须仍指向 L{want_line}（rowid 复用不得改坐标）"
+        );
     }
 }
 
@@ -880,15 +1257,33 @@ fn merge_same_bundle_twice_dedups_handoffs() {
     let (home, _src) = make_src();
     let conn = db::open(home.path()).unwrap();
     let pid: i64 = conn
-        .query_row("SELECT id FROM projects ORDER BY id LIMIT 1", [], |r| r.get(0))
+        .query_row("SELECT id FROM projects ORDER BY id LIMIT 1", [], |r| {
+            r.get(0)
+        })
         .unwrap();
-    db::create_handoff(&conn, pid, &db::HandoffFields {
-        title: "迁移前交接", done: "d", state: "s", decisions: "",
-        files_changed: "", open_issues: "", next_steps: "", session_id: None,
-    })
+    db::create_handoff(
+        &conn,
+        pid,
+        &db::HandoffFields {
+            title: "迁移前交接",
+            done: "d",
+            state: "s",
+            decisions: "",
+            files_changed: "",
+            open_issues: "",
+            next_steps: "",
+            session_id: None,
+        },
+    )
     .unwrap();
     let bundle_path = home.path().join("all.tar.gz");
-    bundle::create(&conn, home.path(), &bundle_path, &bundle::BundleFilter::default()).unwrap();
+    bundle::create(
+        &conn,
+        home.path(),
+        &bundle_path,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
 
     let target = tempfile::tempdir().unwrap();
     db::open(target.path()).unwrap(); // merge 要求目标库已存在
@@ -926,21 +1321,36 @@ fn usage_summary_window_excludes_before_cutoff() {
     assert_eq!(summary[0]["name"], "recent_event");
 }
 
-
 /// Rewrite only synthetic test archives to exercise validation independently of creation.
-fn rewrite_bundle(path: &std::path::Path, change: impl FnOnce(&std::path::Path, &rusqlite::Connection)) {
+fn rewrite_bundle(
+    path: &std::path::Path,
+    change: impl FnOnce(&std::path::Path, &rusqlite::Connection),
+) {
     let tmp = tempfile::tempdir().unwrap();
     let dec = flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap());
     tar::Archive::new(dec).unpack(tmp.path()).unwrap();
-    let root = std::fs::read_dir(tmp.path()).unwrap().next().unwrap().unwrap().path();
-    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
-    let db_path = root.join("db").join(manifest["db_snapshot"].as_str().unwrap());
+    let root = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("manifest.json")).unwrap()).unwrap();
+    let db_path = root
+        .join("db")
+        .join(manifest["db_snapshot"].as_str().unwrap());
     let conn = rusqlite::Connection::open(db_path).unwrap();
     change(&root, &conn);
     drop(conn);
-    let enc = flate2::write::GzEncoder::new(std::fs::File::create(path).unwrap(), flate2::Compression::default());
+    let enc = flate2::write::GzEncoder::new(
+        std::fs::File::create(path).unwrap(),
+        flate2::Compression::default(),
+    );
     let mut archive = tar::Builder::new(enc);
-    archive.append_dir_all(root.file_name().unwrap(), &root).unwrap();
+    archive
+        .append_dir_all(root.file_name().unwrap(), &root)
+        .unwrap();
     archive.into_inner().unwrap().finish().unwrap();
 }
 
@@ -996,8 +1406,16 @@ fn project_bundle_excludes_other_project_and_global_memory_bytes() {
     let (home, _src) = make_src();
     let conn = db::open(home.path()).unwrap();
     for (scope, path, text) in [
-        ("project:/tmp/proj-x", "/tmp/proj-x/AGENTS.md", "KEEP_PROJECT_MEMORY"),
-        ("project:/tmp/proj-y", "/tmp/proj-y/AGENTS.md", "EXCLUDED_PROJECT_MEMORY"),
+        (
+            "project:/tmp/proj-x",
+            "/tmp/proj-x/AGENTS.md",
+            "KEEP_PROJECT_MEMORY",
+        ),
+        (
+            "project:/tmp/proj-y",
+            "/tmp/proj-y/AGENTS.md",
+            "EXCLUDED_PROJECT_MEMORY",
+        ),
         ("global", "/tmp/global/AGENTS.md", "EXCLUDED_GLOBAL_MEMORY"),
     ] {
         let hash = vault::store_line(home.path(), text.as_bytes()).unwrap();
@@ -1005,22 +1423,49 @@ fn project_bundle_excludes_other_project_and_global_memory_bytes() {
         db::insert_memory_revision(&conn, fid, &hash, text.len() as u64).unwrap();
         db::set_memory_fts(&conn, fid, text).unwrap();
     }
-    conn.execute("INSERT INTO memories(id,scope,type,content,created_at,updated_at)
-        VALUES ('global-test','global','fact','EXCLUDED_CURATED_GLOBAL','2026-01-01','2026-01-01')", []).unwrap();
+    conn.execute(
+        "INSERT INTO memories(id,scope,type,content,created_at,updated_at)
+        VALUES ('global-test','global','fact','EXCLUDED_CURATED_GLOBAL','2026-01-01','2026-01-01')",
+        [],
+    )
+    .unwrap();
     let out = home.path().join("project.tar.gz");
-    bundle::create(&conn, home.path(), &out, &bundle::BundleFilter { project: Some("proj-x".into()), agent: None }).unwrap();
+    bundle::create(
+        &conn,
+        home.path(),
+        &out,
+        &bundle::BundleFilter {
+            project: Some("proj-x".into()),
+            agent: None,
+        },
+    )
+    .unwrap();
     let target = tempfile::tempdir().unwrap();
     bundle::restore(&out, target.path(), false).unwrap();
     let restored = db::open(target.path()).unwrap();
     assert_eq!(db::list_memory_files(&restored).unwrap().len(), 1);
-    assert_eq!(restored.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(
+        restored
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
     let dec = flate2::read::GzDecoder::new(std::fs::File::open(out).unwrap());
     for entry in tar::Archive::new(dec).entries().unwrap() {
         use std::io::Read;
         let mut bytes = Vec::new();
         entry.unwrap().read_to_end(&mut bytes).unwrap();
-        for excluded in ["EXCLUDED_PROJECT_MEMORY", "EXCLUDED_GLOBAL_MEMORY", "EXCLUDED_CURATED_GLOBAL"] {
-            assert!(!bytes.windows(excluded.len()).any(|w| w == excluded.as_bytes()), "excluded text in archive: {excluded}");
+        for excluded in [
+            "EXCLUDED_PROJECT_MEMORY",
+            "EXCLUDED_GLOBAL_MEMORY",
+            "EXCLUDED_CURATED_GLOBAL",
+        ] {
+            assert!(
+                !bytes
+                    .windows(excluded.len())
+                    .any(|w| w == excluded.as_bytes()),
+                "excluded text in archive: {excluded}"
+            );
         }
     }
 }
@@ -1033,12 +1478,20 @@ fn bundle_validation_checks_reference_coverage_schema_and_database_integrity() {
         let out = home.path().join(format!("{case}.tar.gz"));
         bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
         rewrite_bundle(&out, |root, c| match case {
-            "missing" => { c.execute("UPDATE vault_lines SET hash=?1", ["f".repeat(64)]).unwrap(); }
-            "schema" => { c.pragma_update(None, "user_version", 999).unwrap(); }
-            "foreign-key" => { c.execute_batch("PRAGMA foreign_keys=OFF; UPDATE messages SET session_id='missing' WHERE session_id='claude:aaaa';").unwrap(); }
+            "missing" => {
+                c.execute("UPDATE vault_lines SET hash=?1", ["f".repeat(64)])
+                    .unwrap();
+            }
+            "schema" => {
+                c.pragma_update(None, "user_version", 999).unwrap();
+            }
+            "foreign-key" => {
+                c.execute_batch("PRAGMA foreign_keys=OFF; UPDATE messages SET session_id='missing' WHERE session_id='claude:aaaa';").unwrap();
+            }
             _ => {
                 let mp = root.join("manifest.json");
-                let mut m: serde_json::Value = serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
+                let mut m: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&mp).unwrap()).unwrap();
                 m["db_snapshot"] = serde_json::json!("../outside.sqlite");
                 std::fs::write(mp, serde_json::to_vec(&m).unwrap()).unwrap();
             }
@@ -1057,12 +1510,16 @@ fn bundle_validation_checks_reference_coverage_schema_and_database_integrity() {
 fn object_copy_failure_preserves_database_and_allows_restore_retry() {
     let (home, _src) = make_src();
     let conn = db::open(home.path()).unwrap();
-    let hash: String = conn.query_row("SELECT hash FROM vault_lines LIMIT 1", [], |r| r.get(0)).unwrap();
+    let hash: String = conn
+        .query_row("SELECT hash FROM vault_lines LIMIT 1", [], |r| r.get(0))
+        .unwrap();
     let out = home.path().join("restore.tar.gz");
     bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
     for merge in [false, true] {
         let target = tempfile::tempdir().unwrap();
-        if merge { db::open(target.path()).unwrap(); }
+        if merge {
+            db::open(target.path()).unwrap();
+        }
         // 对象库位置被目录占住：对象写入失败
         let blocker = vault::store_db_path(target.path());
         std::fs::create_dir_all(&blocker).unwrap();
@@ -1070,7 +1527,9 @@ fn object_copy_failure_preserves_database_and_allows_restore_retry() {
         if merge {
             let c = db::open(target.path()).unwrap();
             assert_eq!(db::recent_sessions(&c, None, 10).unwrap().len(), 0);
-        } else { assert!(!target.path().join("yourmem.db").exists()); }
+        } else {
+            assert!(!target.path().join("yourmem.db").exists());
+        }
         std::fs::remove_dir(blocker).unwrap();
         bundle::restore(&out, target.path(), merge).unwrap();
         let c = db::open(target.path()).unwrap();
@@ -1087,7 +1546,9 @@ fn restore_repairs_corrupt_existing_objects_and_previews_conflicts() {
     bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
     let target = tempfile::tempdir().unwrap();
     bundle::restore(&out, target.path(), false).unwrap();
-    let hash: String = conn.query_row("SELECT hash FROM vault_lines LIMIT 1", [], |r| r.get(0)).unwrap();
+    let hash: String = conn
+        .query_row("SELECT hash FROM vault_lines LIMIT 1", [], |r| r.get(0))
+        .unwrap();
     rusqlite::Connection::open(vault::store_db_path(target.path()))
         .unwrap()
         .execute("UPDATE objects SET data = x'00' WHERE hash = ?1", [&hash])
@@ -1106,42 +1567,75 @@ fn cli_restore_into_default_fresh_home_does_not_create_database_early() {
     bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
     let target = tempfile::tempdir().unwrap();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_yourmem"))
-        .env("YOUMEM_HOME", target.path()).arg("bundle").arg("restore").arg(&out).output().unwrap();
-    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        .env("YOUMEM_HOME", target.path())
+        .arg("bundle")
+        .arg("restore")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let r: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(r["mode"], "fresh");
 }
-
 
 #[test]
 fn failed_index_backfill_rolls_back_the_entire_merge() {
     let (home, _src) = make_src();
     let conn = db::open(home.path()).unwrap();
     let hash = vault::store_line(home.path(), b"source memory").unwrap();
-    let (fid, _) = db::upsert_memory_file(&conn, "codex", "global", "/tmp/AGENTS.md", &hash).unwrap();
+    let (fid, _) =
+        db::upsert_memory_file(&conn, "codex", "global", "/tmp/AGENTS.md", &hash).unwrap();
     db::insert_memory_revision(&conn, fid, &hash, 13).unwrap();
     db::set_memory_fts(&conn, fid, "source memory").unwrap();
     let out = home.path().join("transaction.tar.gz");
     bundle::create(&conn, home.path(), &out, &bundle::BundleFilter::default()).unwrap();
     let target = tempfile::tempdir().unwrap();
     let target_conn = db::open(target.path()).unwrap();
-    target_conn.execute_batch("DROP TABLE memory_fts; CREATE TABLE memory_fts(broken TEXT);").unwrap();
+    target_conn
+        .execute_batch("DROP TABLE memory_fts; CREATE TABLE memory_fts(broken TEXT);")
+        .unwrap();
     assert!(bundle::restore(&out, target.path(), true).is_err());
-    assert_eq!(target_conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
-    assert_eq!(target_conn.query_row("SELECT COUNT(*) FROM memory_files", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(
+        target_conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        target_conn
+            .query_row("SELECT COUNT(*) FROM memory_files", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
     target_conn.execute_batch("DROP TABLE memory_fts;").unwrap();
     drop(target_conn);
     db::open(target.path()).unwrap();
     bundle::restore(&out, target.path(), true).unwrap();
     let c = db::open(target.path()).unwrap();
-    assert_eq!(yourmem::memfiles::search(&c, target.path(), "source memory", 10).unwrap().len(), 1);
+    assert_eq!(
+        yourmem::memfiles::search(&c, target.path(), "source memory", 10)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
 fn merge_replacement_keeps_local_links_and_trash_state() {
     let (home, src) = make_src();
     let out = home.path().join("first.tar.gz");
-    bundle::create(&db::open(home.path()).unwrap(), home.path(), &out, &bundle::BundleFilter::default()).unwrap();
+    bundle::create(
+        &db::open(home.path()).unwrap(),
+        home.path(),
+        &out,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
     let target = tempfile::tempdir().unwrap();
     bundle::restore(&out, target.path(), false).unwrap();
     {
@@ -1150,7 +1644,8 @@ fn merge_replacement_keeps_local_links_and_trash_state() {
             "INSERT INTO session_links(child_session_id, parent_session_id, link_type, created_at)
              VALUES ('claude:bbbb', 'claude:aaaa', 'continuation', '2026-08-01T00:00:00Z')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         db::set_session_deleted(&tc, "claude:aaaa", true).unwrap();
     }
     // 源库里 aaaa 变长 → 合并时走替换
@@ -1160,7 +1655,14 @@ fn merge_replacement_keeps_local_links_and_trash_state() {
             + r#"{"type":"user","cwd":"/tmp/proj-x","uuid":"a3","timestamp":"2026-08-01T11:00:00Z","message":{"role":"user","content":"追加行"}}"# + "\n",
     ).unwrap();
     let mut c = db::open(home.path()).unwrap();
-    ingest::import_all(&mut c, home.path(), &[(adapters::AGENT_CLAUDE, src.path().join("claude"))], None, None).unwrap();
+    ingest::import_all(
+        &mut c,
+        home.path(),
+        &[(adapters::AGENT_CLAUDE, src.path().join("claude"))],
+        None,
+        None,
+    )
+    .unwrap();
     let second = home.path().join("second.tar.gz");
     bundle::create(&c, home.path(), &second, &bundle::BundleFilter::default()).unwrap();
     let r = bundle::restore(&second, target.path(), true).unwrap();
@@ -1171,10 +1673,21 @@ fn merge_replacement_keeps_local_links_and_trash_state() {
         "SELECT COUNT(*) FROM session_links WHERE child_session_id = 'claude:bbbb' AND parent_session_id = 'claude:aaaa'",
         [], |r| r.get(0)).unwrap();
     assert_eq!(links, 1, "本机独有的谱系边保留");
-    let deleted: Option<String> = tc.query_row(
-        "SELECT deleted_at FROM sessions WHERE id = 'claude:aaaa'", [], |r| r.get(0)).unwrap();
+    let deleted: Option<String> = tc
+        .query_row(
+            "SELECT deleted_at FROM sessions WHERE id = 'claude:aaaa'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert!(deleted.is_some(), "本机已放进回收站的会话不因合并复活");
-    let mc: i64 = tc.query_row("SELECT message_count FROM sessions WHERE id = 'claude:aaaa'", [], |r| r.get(0)).unwrap();
+    let mc: i64 = tc
+        .query_row(
+            "SELECT message_count FROM sessions WHERE id = 'claude:aaaa'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(mc, 3, "内容已更新为包里的新版本");
 }
 
@@ -1195,13 +1708,19 @@ fn merging_missing_history_keeps_the_current_memory_text_searchable() {
             "INSERT INTO memory_files(id, agent, scope, path, current_hash, updated_at)
              VALUES (1, 'claude', 'global', '/proj/MEMORY.md', ?1, ?2)",
             rusqlite::params![a, t],
-        ).unwrap();
+        )
+        .unwrap();
     }
-    for (c, h, at) in [(&sc, &b, "2026-09-20T00:00:00Z"), (&sc, &a, "2026-09-30T00:00:00Z"), (&dc, &a, "2026-09-25T00:00:00Z")] {
+    for (c, h, at) in [
+        (&sc, &b, "2026-09-20T00:00:00Z"),
+        (&sc, &a, "2026-09-30T00:00:00Z"),
+        (&dc, &a, "2026-09-25T00:00:00Z"),
+    ] {
         c.execute(
             "INSERT INTO memory_revisions(file_id, hash, size, captured_at) VALUES (1, ?1, 10, ?2)",
             rusqlite::params![h, at],
-        ).unwrap();
+        )
+        .unwrap();
     }
     db::set_memory_fts(&dc, 1, current).unwrap();
     let pack = src.path().join("memory.tar.gz");
@@ -1209,8 +1728,15 @@ fn merging_missing_history_keeps_the_current_memory_text_searchable() {
     bundle::restore(&pack, dst.path(), true).unwrap();
 
     let conn = db::open(dst.path()).unwrap();
-    assert!(!db::search_memory_files_fts(&conn, "当前版本的内容", 10).unwrap().is_empty());
-    assert!(db::search_memory_files_fts(&conn, "早期版本的内容", 10).unwrap().is_empty(), "索引不能退回旧修订");
+    assert!(!db::search_memory_files_fts(&conn, "当前版本的内容", 10)
+        .unwrap()
+        .is_empty());
+    assert!(
+        db::search_memory_files_fts(&conn, "早期版本的内容", 10)
+            .unwrap()
+            .is_empty(),
+        "索引不能退回旧修订"
+    );
 }
 
 #[test]
@@ -1223,15 +1749,1128 @@ fn merging_an_old_schema_bundle_corrects_artifact_times() {
          INSERT INTO session_artifacts(session_id, path, tool, created_at)
          SELECT id, 'late.rs', 'Write', '2026-10-01T04:00:00Z' FROM sessions LIMIT 1;
          PRAGMA user_version = 12;",
-    ).unwrap();
+    )
+    .unwrap();
     let pack = home.path().join("v12.tar.gz");
     bundle::create(&conn, home.path(), &pack, &bundle::BundleFilter::default()).unwrap();
     let target = tempfile::tempdir().unwrap();
     db::open(target.path()).unwrap();
     bundle::restore(&pack, target.path(), true).unwrap();
     let tc = db::open(target.path()).unwrap();
-    let late: i64 = tc.query_row(
-        "SELECT COUNT(*) FROM session_artifacts a JOIN sessions s ON s.id = a.session_id
-         WHERE julianday(a.created_at) > julianday(s.ended_at)", [], |r| r.get(0)).unwrap();
+    let late: i64 = tc
+        .query_row(
+            "SELECT COUNT(*) FROM session_artifacts a JOIN sessions s ON s.id = a.session_id
+         WHERE julianday(a.created_at) > julianday(s.ended_at)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(late, 0, "合并后的产物时间不晚于会话结束");
+}
+
+fn bundled_config(path: &std::path::Path) -> Option<serde_json::Value> {
+    use std::io::Read;
+    let decoder = flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap());
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry
+            .path()
+            .unwrap()
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some("config.json")
+        {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            return Some(serde_json::from_slice(&bytes).unwrap());
+        }
+    }
+    None
+}
+
+#[test]
+fn full_bundle_roundtrips_allowlisted_config_without_secrets() {
+    let (home, src) = make_src();
+    let backup = src.path().join("backup");
+    let project = src.path().join("project");
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let extra_root = src.path().join("claude");
+    ingest::write_config(home.path(), &json!({
+        "extra_roots": [{"agent": "claude", "path": extra_root, "access_token": "ROOT_SECRET"}],
+        "disabled_agents": ["codex"],
+        "backup_dir": backup,
+        "auto_purge_trash": true,
+        "snapshot_interval_days": 0,
+        "snapshot_keep_recent": 7,
+        "snapshot_keep_monthly": 4,
+        "snapshot_auto_cleanup": false,
+        "index_tool_output": true,
+        "tracked_docs": [{"project": project, "path": "HANDOFF.md", "credential": "DOC_SECRET"}],
+        "ai": {
+            "base_url": "https://example.test/v1", "model": "safe-model",
+            "max_input_chars": 40000, "api_key": "AI_SECRET"
+        },
+        "apiKey": "TOP_SECRET",
+        "future_unknown_shape": {"password": "NESTED_SECRET"}
+    })).unwrap();
+    let pack = home.path().join("config.tar.gz");
+    let manifest = bundle::create(
+        &db::open(home.path()).unwrap(),
+        home.path(),
+        &pack,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
+    assert_eq!(manifest["format_version"], 3);
+    assert_eq!(manifest["config"]["included"], true);
+    assert!(manifest["config"]["excluded_fields"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("future_unknown_shape")));
+
+    let exported = bundled_config(&pack).unwrap();
+    assert_eq!(exported["extra_roots"][0]["path"], json!(extra_root));
+    assert_eq!(exported["disabled_agents"], json!(["codex"]));
+    assert_eq!(exported["auto_purge_trash"], true);
+    assert_eq!(exported["snapshot_interval_days"], 0);
+    assert_eq!(exported["snapshot_keep_recent"], 7);
+    assert_eq!(exported["snapshot_keep_monthly"], 4);
+    assert_eq!(exported["snapshot_auto_cleanup"], false);
+    assert_eq!(exported["index_tool_output"], true);
+    assert_eq!(
+        exported["ai"],
+        json!({
+            "base_url": "https://example.test/v1", "model": "safe-model", "max_input_chars": 40000
+        })
+    );
+    {
+        use std::io::Read;
+        let decoder = flate2::read::GzDecoder::new(std::fs::File::open(&pack).unwrap());
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive.entries().unwrap() {
+            let mut bytes = Vec::new();
+            entry.unwrap().read_to_end(&mut bytes).unwrap();
+            for secret in [
+                "ROOT_SECRET",
+                "DOC_SECRET",
+                "AI_SECRET",
+                "TOP_SECRET",
+                "NESTED_SECRET",
+            ] {
+                assert!(
+                    !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+                    "archive entry contains excluded secret {secret}"
+                );
+            }
+        }
+    }
+
+    let target = tempfile::tempdir().unwrap();
+    let restored = bundle::restore(&pack, target.path(), false).unwrap();
+    assert_eq!(restored["path_remapping_required"], false, "{restored}");
+    assert_eq!(restored["config"]["status"], "restored");
+    let local = ingest::read_config(target.path());
+    let mut expected_local = exported.clone();
+    expected_local.as_object_mut().unwrap().remove("auto_purge_trash");
+    assert_eq!(local, expected_local, "自动清空回收站不随恢复开启");
+    assert_eq!(restored["config"]["held_back"], json!(["auto_purge_trash"]));
+    assert_eq!(
+        ingest::extra_roots(target.path()),
+        vec![("claude".into(), extra_root)]
+    );
+    let again = bundle::restore_config(
+        &pack,
+        target.path(),
+        &std::collections::HashMap::new(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(again["status"], "unchanged");
+    assert_eq!(again["changed"], false);
+}
+
+#[test]
+fn filtered_bundle_has_no_personal_config_and_tampered_config_fails_verification() {
+    let (home, _src) = make_src();
+    ingest::write_config(
+        home.path(),
+        &json!({
+            "disabled_agents": ["codex"], "snapshot_keep_recent": 9,
+            "token": "SHARE_CONFIG_SECRET"
+        }),
+    )
+    .unwrap();
+    let filtered = home.path().join("filtered.tar.gz");
+    let manifest = bundle::create(
+        &db::open(home.path()).unwrap(),
+        home.path(),
+        &filtered,
+        &bundle::BundleFilter {
+            agent: Some("claude".into()),
+            project: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(manifest["config"]["included"], false);
+    assert!(bundled_config(&filtered).is_none());
+    let target = tempfile::tempdir().unwrap();
+    let restored = bundle::restore(&filtered, target.path(), false).unwrap();
+    assert_eq!(restored["config"]["status"], "not_included");
+    assert!(!target.path().join("config.json").exists());
+
+    let full = home.path().join("full.tar.gz");
+    bundle::create(
+        &db::open(home.path()).unwrap(),
+        home.path(),
+        &full,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
+    rewrite_bundle(&full, |root, _| {
+        let path = root.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["new_nested_shape"] = json!({"credential": "MUST_NOT_PASS"});
+        std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    });
+    let report = bundle::verify(&full).unwrap();
+    assert_eq!(report["ok"], false);
+    assert!(!report["config_errors"].as_array().unwrap().is_empty());
+    assert!(bundle::restore(&full, tempfile::tempdir().unwrap().path(), false).is_err());
+}
+
+#[test]
+fn restore_previews_invalid_paths_and_applies_only_explicit_mappings() {
+    let (home, _src) = make_src();
+    let missing = home.path().join("source-root-does-not-exist");
+    let old_backup = home.path().join("old-backups");
+    ingest::write_config(
+        home.path(),
+        &json!({
+            "extra_roots": [{"agent": "claude", "path": missing}],
+            "backup_dir": old_backup,
+            "snapshot_keep_recent": 6
+        }),
+    )
+    .unwrap();
+    let pack = home.path().join("paths.tar.gz");
+    bundle::create(
+        &db::open(home.path()).unwrap(),
+        home.path(),
+        &pack,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let preview = bundle::restore_plan(&pack, target.path()).unwrap();
+    assert_eq!(preview["path_remapping_required"], true);
+    assert!(preview["config"]["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path["status"] == "remap_available" && path["field"] == "backup_dir"));
+    assert!(preview["config"]["suggested_mappings"]
+        .as_object()
+        .unwrap()
+        .contains_key(&old_backup.to_string_lossy().to_string()));
+
+    let restored = bundle::restore(&pack, target.path(), false).unwrap();
+    assert_eq!(restored["path_remapping_required"], true);
+    assert_eq!(restored["config"]["status"], "path_remapping_required");
+    assert!(
+        !target.path().join("config.json").exists(),
+        "待定路径不得静默写入"
+    );
+    assert!(
+        target.path().join("yourmem.db").is_file(),
+        "数据库仍应完成恢复"
+    );
+
+    let replacement = target.path().join("replacement-root");
+    let new_backup = target.path().join("new-backups");
+    std::fs::create_dir_all(&replacement).unwrap();
+    let blocker = target.path().join("not-a-directory");
+    std::fs::write(&blocker, b"file").unwrap();
+    let mut invalid = std::collections::HashMap::new();
+    invalid.insert(
+        missing.to_string_lossy().to_string(),
+        blocker.to_string_lossy().to_string(),
+    );
+    invalid.insert(
+        old_backup.to_string_lossy().to_string(),
+        new_backup.to_string_lossy().to_string(),
+    );
+    let rejected = bundle::restore_config(&pack, target.path(), &invalid, false).unwrap();
+    assert_eq!(rejected["status"], "invalid_path");
+    assert!(!target.path().join("config.json").exists());
+
+    let mappings = std::collections::HashMap::from([
+        (
+            missing.to_string_lossy().to_string(),
+            replacement.to_string_lossy().to_string(),
+        ),
+        (
+            old_backup.to_string_lossy().to_string(),
+            new_backup.to_string_lossy().to_string(),
+        ),
+    ]);
+    let applied = bundle::restore_config(&pack, target.path(), &mappings, false).unwrap();
+    assert_eq!(applied["status"], "restored", "{applied}");
+    assert_eq!(applied["path_remapping_required"], false);
+    let config = ingest::read_config(target.path());
+    assert_eq!(config["extra_roots"][0]["path"], json!(replacement));
+    assert_eq!(config["backup_dir"], json!(new_backup));
+    assert_eq!(config["snapshot_keep_recent"], 6);
+    assert_eq!(
+        ingest::extra_roots(target.path()),
+        vec![("claude".into(), replacement)]
+    );
+    let again = bundle::restore_config(&pack, target.path(), &mappings, false).unwrap();
+    assert_eq!(again["status"], "unchanged");
+}
+
+#[test]
+fn merge_preserves_conflicting_local_config_until_explicit_overwrite() {
+    let (home, _src) = make_src();
+    ingest::write_config(
+        home.path(),
+        &json!({
+            "snapshot_keep_recent": 3, "snapshot_auto_cleanup": true,
+            "disabled_agents": ["codex"]
+        }),
+    )
+    .unwrap();
+    let pack = home.path().join("merge-config.tar.gz");
+    bundle::create(
+        &db::open(home.path()).unwrap(),
+        home.path(),
+        &pack,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
+    let target = tempfile::tempdir().unwrap();
+    db::open(target.path()).unwrap();
+    ingest::write_config(
+        target.path(),
+        &json!({
+            "snapshot_keep_recent": 99,
+            "local_api_token": "LOCAL_SECRET_MUST_SURVIVE",
+            "local_future_setting": {"anything": true}
+        }),
+    )
+    .unwrap();
+
+    let preview = bundle::restore_plan(&pack, target.path()).unwrap();
+    assert_eq!(preview["config_restore_required"], true);
+    assert_eq!(
+        preview["config"]["conflicts"],
+        json!(["snapshot_keep_recent"])
+    );
+    let merged = bundle::restore(&pack, target.path(), true).unwrap();
+    assert_eq!(merged["config"]["status"], "config_conflict");
+    assert_eq!(
+        ingest::read_config(target.path())["snapshot_keep_recent"],
+        99
+    );
+    let pending = bundle::restore_config(
+        &pack,
+        target.path(),
+        &std::collections::HashMap::new(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(pending["status"], "config_conflict");
+    assert_eq!(
+        ingest::read_config(target.path())["snapshot_keep_recent"],
+        99
+    );
+
+    let applied = bundle::restore_config(
+        &pack,
+        target.path(),
+        &std::collections::HashMap::new(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(applied["status"], "restored");
+    let config = ingest::read_config(target.path());
+    assert_eq!(config["snapshot_keep_recent"], 3);
+    assert_eq!(config["snapshot_auto_cleanup"], true);
+    assert_eq!(config["disabled_agents"], json!(["codex"]));
+    assert_eq!(config["local_api_token"], "LOCAL_SECRET_MUST_SURVIVE");
+    assert_eq!(config["local_future_setting"], json!({"anything": true}));
+    let again = bundle::restore_config(
+        &pack,
+        target.path(),
+        &std::collections::HashMap::new(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(again["status"], "unchanged");
+}
+
+#[test]
+fn legacy_v2_bundle_without_config_still_restores() {
+    let (home, _src) = make_src();
+    let pack = home.path().join("v2.tar.gz");
+    bundle::create(
+        &db::open(home.path()).unwrap(),
+        home.path(),
+        &pack,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
+    rewrite_bundle(&pack, |root, _| {
+        std::fs::remove_file(root.join("config.json")).unwrap();
+        let path = root.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["format_version"] = json!(2);
+        manifest.as_object_mut().unwrap().remove("config");
+        std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    });
+    assert_eq!(bundle::verify(&pack).unwrap()["ok"], true);
+    let target = tempfile::tempdir().unwrap();
+    let restored = bundle::restore(&pack, target.path(), false).unwrap();
+    assert_eq!(restored["config"]["status"], "not_included");
+    assert_eq!(
+        db::recent_sessions(&db::open(target.path()).unwrap(), None, 10)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn merge_replays_single_chain_rotates_generation_and_recollects() {
+    let (home, src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    let pid: i64 = conn
+        .query_row(
+            "SELECT id FROM projects WHERE path='/tmp/proj-x'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let task = work::create_task(&conn, pid, "单链任务", Some("claude:aaaa"), false).unwrap()
+        ["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    work::update_task(
+        &conn,
+        &task,
+        Some("单链任务（改名）"),
+        Some("in_progress"),
+        Some(1),
+        Some("claude:aaaa"),
+        false,
+    )
+    .unwrap();
+    work::update_task(&conn,&task,None,Some("completed"),Some(2),Some("claude:aaaa"),true).unwrap();
+    work::update_task(&conn,&task,Some("单链任务（最终）"),None,Some(3),Some("claude:aaaa"),false).unwrap();
+    conn.execute("UPDATE messages SET native_tool_call_id='native-a1' WHERE session_id='claude:aaaa' AND line_no=1",[]).unwrap();
+    conn.execute("INSERT INTO change_log(seq,entity_table,entity_key,operation,committed_at) VALUES(100000,'source','old','insert','2026-01-01')",[]).unwrap();
+    let pack = home.path().join("single-chain.tar.gz");
+    bundle::create(&conn, home.path(), &pack, &bundle::BundleFilter::default()).unwrap();
+    drop(conn);
+
+    let target = tempfile::tempdir().unwrap();
+    let tc = db::open(target.path()).unwrap();
+    db::add_project(&tc, "/tmp/project-already-present").unwrap();
+    let target_pid = db::add_project(&tc, "/tmp/proj-x").unwrap().0;
+    assert_ne!(target_pid, pid);
+    let old_generation = work::database_generation(&tc).unwrap();
+    drop(tc);
+    let preview = bundle::restore_plan(&pack, target.path()).unwrap();
+    assert!(preview["work_plan"]["task_forks"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let merged = bundle::restore(&pack, target.path(), true).unwrap();
+    assert_ne!(
+        merged["merged"]["database_generation"],
+        json!(old_generation)
+    );
+    let tc = db::open(target.path()).unwrap();
+    assert_eq!(work::task(&tc, &task).unwrap()["status"], "completed");
+    assert_eq!(work::task(&tc, &task).unwrap()["title"], "单链任务（最终）");
+    assert_eq!(work::task(&tc, &task).unwrap()["state_policy"], "user_locked");
+    assert_eq!(work::task(&tc, &task).unwrap()["project_id"], target_pid);
+    assert_eq!(
+        tc.query_row::<String, _, _>(
+            "SELECT native_tool_call_id FROM messages WHERE session_id='claude:aaaa' AND line_no=1",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        "native-a1"
+    );
+    let max_seq: i64 = tc
+        .query_row("SELECT MAX(seq) FROM change_log", [], |r| r.get(0))
+        .unwrap();
+    assert!(max_seq < 100000, "源 change_log seq 不得拼接");
+    assert!(
+        tc.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM change_log WHERE entity_table='merge' AND operation='merge'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        work::changes(&tc, Some(&old_generation), 0, 10).unwrap()["reset_required"],
+        true
+    );
+    drop(tc);
+
+    std::fs::write(src.path().join("claude/aaaa.jsonl"),
+        std::fs::read_to_string(src.path().join("claude/aaaa.jsonl")).unwrap()
+        + r#"{"type":"user","cwd":"/tmp/proj-x","uuid":"a3","timestamp":"2026-08-01T11:00:00Z","message":{"role":"user","content":"合并后继续采集"}}"# + "\n").unwrap();
+    let mut tc = db::open(target.path()).unwrap();
+    let imported = ingest::import_all(
+        &mut tc,
+        target.path(),
+        &[(adapters::AGENT_CLAUDE, src.path().join("claude"))],
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(imported.messages_added, 1);
+    assert_eq!(
+        tc.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM messages WHERE session_id='claude:aaaa'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        3
+    );
+    assert_eq!(work::task(&tc, &task).unwrap()["status"], "completed");
+}
+
+#[test]
+fn two_machine_forks_aliases_relations_and_claims_are_conservative() {
+    let (home, _src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    let pid: i64 = conn
+        .query_row(
+            "SELECT id FROM projects WHERE path='/tmp/proj-x'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let main = work::create_task(&conn, pid, "双机主任务", Some("claude:aaaa"), false).unwrap()
+        ["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let other = work::create_task(&conn, pid, "关系目标", None, true).unwrap()["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    work::link_session(&conn, &main, "claude:aaaa", "origin", "user_confirmed").unwrap();
+    let claim = work::issue_claim(&conn, &main, "contribution").unwrap();
+    let token = claim["claim_token"].as_str().unwrap().to_string();
+    let base = home.path().join("base-work.tar.gz");
+    bundle::create(&conn, home.path(), &base, &bundle::BundleFilter::default()).unwrap();
+    drop(conn);
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    bundle::restore(&base, a.path(), false).unwrap();
+    bundle::restore(&base, b.path(), false).unwrap();
+
+    let ac = db::open(a.path()).unwrap();
+    work::update_task(
+        &ac,
+        &main,
+        None,
+        Some("in_progress"),
+        Some(1),
+        Some("claude:aaaa"),
+        false,
+    )
+    .unwrap();
+    work::unlink_session(&ac, &main, "claude:aaaa").unwrap();
+    let a_extra = work::create_task(&ac, pid, "A 机独有任务", None, true).unwrap()["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    work::add_task_link(&ac, &main, &other, "related", true).unwrap();
+    ac.execute("INSERT INTO messages(session_id,line_no,ord,kind,content,native_tool_call_id) VALUES('claude:aaaa',3,0,'tool_call',?1,'claim-native-a')",
+        [format!("get_task_context: {{\"claim_token\":\"{token}\"}}")]).unwrap();
+    ac.execute(
+        "UPDATE sessions SET message_count=3 WHERE id='claude:aaaa'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        work::process_session_evidence(&ac, "claude:aaaa").unwrap()["claims"],
+        1
+    );
+    drop(ac);
+
+    let bc = db::open(b.path()).unwrap();
+    work::update_task(
+        &bc,
+        &main,
+        None,
+        Some("completed"),
+        Some(1),
+        Some("claude:aaaa"),
+        false,
+    )
+    .unwrap();
+    let b_extra = work::create_task(&bc, pid, "B 机独有任务", None, true).unwrap()["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    work::add_task_link(&bc, &main, &other, "related", false).unwrap();
+    drop(bc);
+    let incoming = b.path().join("incoming.tar.gz");
+    bundle::create(
+        &db::open(b.path()).unwrap(),
+        b.path(),
+        &incoming,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
+
+    let preview = bundle::restore_plan(&incoming, a.path()).unwrap();
+    assert_eq!(
+        preview["work_plan"]["task_forks"].as_array().unwrap().len(),
+        1,
+        "{preview}"
+    );
+    assert_eq!(
+        preview["work_plan"]["task_alias_remaps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        preview["work_plan"]["relation_conflicts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let old_generation = work::database_generation(&db::open(a.path()).unwrap()).unwrap();
+    let merged = bundle::restore(&incoming, a.path(), true).unwrap();
+    assert_eq!(merged["merged"]["work"]["task_forks"], 1);
+    assert_eq!(merged["merged"]["work"]["task_alias_remaps"], 1);
+    assert_ne!(
+        merged["merged"]["database_generation"],
+        json!(old_generation)
+    );
+
+    let ac = db::open(a.path()).unwrap();
+    let current = work::task(&ac, &main).unwrap();
+    assert_eq!(
+        current["status"], "in_progress",
+        "分叉不得按 revision/time 选择覆盖"
+    );
+    assert_eq!(current["revision"], 2);
+    assert_eq!(
+        ac.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?1",
+            [&main],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        3
+    );
+    assert_eq!(
+        ac.query_row::<i64, _, _>("SELECT task_no FROM tasks WHERE id=?1", [&b_extra], |r| r
+            .get(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        ac.query_row::<i64, _, _>("SELECT task_no FROM tasks WHERE id=?1", [&a_extra], |r| r
+            .get(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(ac.query_row::<String,_,_>("SELECT state FROM task_sessions WHERE task_id=?1 AND relation='origin' AND evidence='user_confirmed'",[&main],|r|r.get(0)).unwrap(),"rejected");
+    assert_eq!(
+        ac.query_row::<String, _, _>(
+            "SELECT status FROM task_links WHERE source_task_id=?1",
+            [&main],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        "confirmed"
+    );
+    assert_eq!(
+        ac.query_row::<String, _, _>("SELECT status FROM task_claims", [], |r| r.get(0))
+            .unwrap(),
+        "claimed"
+    );
+    assert_eq!(
+        ac.query_row::<String, _, _>("SELECT native_tool_call_id FROM task_claims", [], |r| r
+            .get(0))
+            .unwrap(),
+        "claim-native-a"
+    );
+    let kinds: std::collections::HashSet<String> = ac
+        .prepare("SELECT kind FROM merge_conflicts")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for kind in [
+        "task_event_fork",
+        "task_session_decision",
+        "task_link_decision",
+    ] {
+        assert!(kinds.contains(kind), "缺少冲突 {kind}: {kinds:?}");
+    }
+    // 会话 id 含冒号（claude:aaaa）：解决冲突必须命中原关联行
+    let session_conflict: String = ac.query_row("SELECT id FROM merge_conflicts WHERE kind='task_session_decision' AND status='pending'",[],|row|row.get(0)).unwrap();
+    let before_state: String = ac.query_row("SELECT state FROM task_sessions WHERE task_id=?1 AND session_id='claude:aaaa' AND relation='origin' AND evidence='user_confirmed'",[&main],|r|r.get(0)).unwrap();
+    work::resolve_merge_conflict(&ac,&session_conflict,"incoming").unwrap();
+    let after_state: String = ac.query_row("SELECT state FROM task_sessions WHERE task_id=?1 AND session_id='claude:aaaa' AND relation='origin' AND evidence='user_confirmed'",[&main],|r|r.get(0)).unwrap();
+    assert_ne!(before_state, after_state, "采用对方应改到 claude:aaaa 这条关联");
+    let conflict: String = ac.query_row("SELECT id FROM merge_conflicts WHERE kind='task_event_fork' AND status='pending'",[],|row|row.get(0)).unwrap();
+    work::resolve_merge_conflict(&ac,&conflict,"incoming").unwrap();
+    assert_eq!(work::task(&ac,&main).unwrap()["status"],"completed");
+    assert_eq!(ac.query_row::<i64,_,_>("SELECT COUNT(*) FROM task_events WHERE task_id=?1 AND effect='applied'",[&main],|row|row.get(0)).unwrap(),1);
+    work::update_task(&ac,&main,None,Some("in_progress"),Some(2),None,true).unwrap();
+    drop(ac);
+    bundle::restore(&incoming,a.path(),true).unwrap();
+    assert_eq!(work::task(&db::open(a.path()).unwrap(),&main).unwrap()["status"],"in_progress");
+}
+
+#[test]
+fn all_work_assets_and_revision_uuid_roundtrip_with_remaps() {
+    let (home, _src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    let pid: i64 = conn
+        .query_row(
+            "SELECT id FROM projects WHERE path='/tmp/proj-x'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let task = work::create_task(&conn, pid, "全资产任务", Some("claude:aaaa"), false).unwrap()
+        ["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let other = work::create_task(&conn, pid, "依赖任务", None, true).unwrap()["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    work::link_session(
+        &conn,
+        &task,
+        "claude:aaaa",
+        "contribution",
+        "user_confirmed",
+    )
+    .unwrap();
+    work::add_task_link(&conn, &task, &other, "depends_on", true).unwrap();
+    conn.execute("INSERT INTO messages(session_id,line_no,ord,kind,content,native_tool_call_id) VALUES('claude:aaaa',3,0,'tool_call','Bash: cargo test','verify-call')",[]).unwrap();
+    conn.execute("INSERT INTO messages(session_id,line_no,ord,kind,content,timestamp,native_tool_call_id,tool_success)
+        VALUES('claude:aaaa',3,1,'tool_result','{\"call_id\":\"verify-call\",\"exit_code\":0}','2026-08-01T10:02:00Z','verify-call',1)",[]).unwrap();
+    conn.execute(
+        "UPDATE sessions SET message_count=3 WHERE id='claude:aaaa'",
+        [],
+    )
+    .unwrap();
+    let mid: i64 = conn
+        .query_row(
+            "SELECT id FROM messages WHERE session_id='claude:aaaa' AND line_no=3 AND kind='tool_result'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    work::add_verification(&conn, &task, "test", "passed", Some(mid), "", false).unwrap();
+    work::record_step_snapshot(
+        &conn,
+        "claude:aaaa",
+        3,
+        Some("2026-08-01T10:02:00Z"),
+        &[(
+            Some("step-native".into()),
+            "实现合并".into(),
+            "completed".into(),
+        )],
+        Some(&task),
+    )
+    .unwrap();
+    work::insert_artifacts(
+        &conn,
+        "claude:aaaa",
+        Some(pid),
+        "claude",
+        &[NewArtifact {
+            path: "src/bundle.rs".into(),
+            from_path: None,
+            tool: "Edit".into(),
+            operation: "edit".into(),
+            native_tool_call_id: Some("artifact-native".into()),
+            timestamp: Some("2026-08-01T10:02:00Z".into()),
+            line_no: 3,
+            ord: 0,
+        }],
+    )
+    .unwrap();
+    db::save_memory(
+        &conn,
+        &db::MemoryInput {
+            project_id: Some(pid),
+            scope: "project",
+            r#type: "decision",
+            content: "全资产记忆",
+            status: None,
+            source_session_id: Some("claude:aaaa"),
+            source_message_id: Some(mid),
+        },
+    )
+    .unwrap();
+    let memory: String = conn
+        .query_row(
+            "SELECT id FROM memories WHERE content='全资产记忆'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    work::record_memory_event(
+        &conn,
+        &memory,
+        "confirmed",
+        None,
+        Some("全资产记忆"),
+        Some("claude:aaaa"),
+        Some(mid),
+    )
+    .unwrap();
+    let label = work::create_label(&conn, "迁移标签", "project", Some(pid)).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    work::label_memory(&conn, &memory, &label).unwrap();
+    let handoff = work::create_handoff(
+        &conn,
+        pid,
+        &db::HandoffFields {
+            title: "任务交接",
+            next_steps: "继续",
+            ..Default::default()
+        },
+        Some(&task),
+    )
+    .unwrap();
+    let handoff_numeric = handoff["handoff_id"].as_i64().unwrap();
+    let handoff_uuid = handoff["uuid"].as_str().unwrap().to_string();
+    work::pin_record(&conn, pid, "handoff", &format!("handoff:{handoff_numeric}")).unwrap();
+    work::update_task(&conn, &task, None, Some("completed"), Some(1), None, true).unwrap();
+    work::update_task(&conn, &task, None, Some("open"), Some(2), None, false).unwrap();
+
+    let hash_a = vault::store_line(home.path(), b"document A").unwrap();
+    let hash_b = vault::store_line(home.path(), b"document B").unwrap();
+    let (fid, _) = db::upsert_memory_file(
+        &conn,
+        "doc",
+        "project:/tmp/proj-x",
+        "/tmp/proj-x/HANDOFF.md",
+        &hash_a,
+    )
+    .unwrap();
+    let r1 = db::insert_memory_revision(&conn, fid, &hash_a, 10).unwrap();
+    let r2 = db::insert_memory_revision(&conn, fid, &hash_b, 10).unwrap();
+    let r3 = db::insert_memory_revision(&conn, fid, &hash_a, 10).unwrap();
+    for (id, at) in [
+        (r1, "2026-08-01T00:00:00Z"),
+        (r2, "2026-08-02T00:00:00Z"),
+        (r3, "2026-08-03T00:00:00Z"),
+    ] {
+        conn.execute(
+            "UPDATE memory_revisions SET captured_at=?2 WHERE id=?1",
+            rusqlite::params![id, at],
+        )
+        .unwrap();
+    }
+    work::pin_record(&conn, pid, "project_document", &format!("file:{fid}:{r3}")).unwrap();
+    let pack = home.path().join("all-work-assets.tar.gz");
+    bundle::create(&conn, home.path(), &pack, &bundle::BundleFilter::default()).unwrap();
+    drop(conn);
+
+    let target = tempfile::tempdir().unwrap();
+    let tc = db::open(target.path()).unwrap();
+    db::add_project(&tc, "/tmp/target-first").unwrap();
+    let target_pid = db::add_project(&tc, "/tmp/proj-x").unwrap().0;
+    drop(tc);
+    bundle::restore(&pack, target.path(), true).unwrap();
+    let tc = db::open(target.path()).unwrap();
+    assert_eq!(work::task(&tc, &task).unwrap()["project_id"], target_pid);
+    assert_eq!(work::task(&tc, &task).unwrap()["status"], "completed");
+    assert_eq!(
+        tc.query_row::<i64, _, _>("SELECT COUNT(*) FROM task_state_proposals", [], |r| r
+            .get(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        tc.query_row::<i64, _, _>("SELECT COUNT(*) FROM task_steps", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        tc.query_row::<i64, _, _>("SELECT COUNT(*) FROM artifact_events", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        tc.query_row::<i64, _, _>("SELECT COUNT(*) FROM artifact_occurrences", [], |r| r
+            .get(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        tc.query_row::<i64, _, _>("SELECT project_id FROM artifact_events", [], |r| r.get(0))
+            .unwrap(),
+        target_pid
+    );
+    assert_eq!(
+        tc.query_row::<i64, _, _>("SELECT COUNT(*) FROM memory_events", [], |r| r.get(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        tc.query_row::<i64, _, _>("SELECT COUNT(*) FROM memory_labels", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    assert!(!tc
+        .query_row::<String, _, _>("SELECT normalized_path FROM artifact_events", [], |r| r
+            .get(0))
+        .unwrap()
+        .is_empty());
+    let evidence: (String,String,i64) = tc.query_row("SELECT m.kind,m.native_tool_call_id,m.tool_success FROM task_verifications v JOIN messages m ON m.id=v.source_message_id",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(evidence, ("tool_result".into(), "verify-call".into(), 1));
+    let memory_evidence: i64 = tc
+        .query_row(
+            "SELECT m.line_no FROM memory_events e JOIN messages m ON m.id=e.source_message_id",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(memory_evidence, 3);
+    assert_eq!(
+        tc.query_row::<String, _, _>("SELECT uuid FROM handoffs", [], |r| r.get(0))
+            .unwrap(),
+        handoff_uuid
+    );
+    assert_eq!(
+        tc.query_row::<String, _, _>("SELECT task_id FROM handoffs", [], |r| r.get(0))
+            .unwrap(),
+        task
+    );
+    let new_handoff: i64 = tc
+        .query_row("SELECT id FROM handoffs", [], |r| r.get(0))
+        .unwrap();
+    let new_revision: i64 = tc
+        .query_row(
+            "SELECT id FROM memory_revisions ORDER BY captured_at DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tc.query_row::<String, _, _>(
+            "SELECT record_id FROM project_record_pins WHERE record_kind='handoff'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        format!("handoff:{new_handoff}")
+    );
+    assert_eq!(
+        tc.query_row::<String, _, _>(
+            "SELECT record_id FROM project_record_pins WHERE record_kind='project_document'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        format!(
+            "file:{}:{new_revision}",
+            tc.query_row::<i64, _, _>("SELECT id FROM memory_files", [], |r| r.get(0))
+                .unwrap()
+        )
+    );
+    let hashes: Vec<String> = tc
+        .prepare("SELECT hash FROM memory_revisions ORDER BY captured_at,id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        hashes,
+        vec![hash_a.clone(), hash_b, hash_a],
+        "A→B→A 三个 revision UUID 都必须保留"
+    );
+    assert_eq!(
+        tc.query_row::<i64, _, _>(
+            "SELECT COUNT(DISTINCT revision_uuid) FROM memory_revisions",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        3
+    );
+    drop(tc);
+
+    bundle::restore(&pack, target.path(), true).unwrap();
+    let tc = db::open(target.path()).unwrap();
+    for table in [
+        "tasks",
+        "task_events",
+        "task_steps",
+        "artifact_events",
+        "artifact_occurrences",
+        "handoffs",
+        "memory_revisions",
+    ] {
+        let before = match table {
+            "tasks" => 2,
+            "task_events" => 4,
+            "memory_revisions" => 3,
+            _ => 1,
+        };
+        assert_eq!(
+            tc.query_row::<i64, _, _>(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap(),
+            before,
+            "{table} 重跑不幂等"
+        );
+    }
+}
+
+#[test]
+fn session_replacement_remaps_work_message_pointers() {
+    let (home, src) = make_src();
+    let conn = db::open(home.path()).unwrap();
+    let pid: i64 = conn
+        .query_row(
+            "SELECT id FROM projects WHERE path='/tmp/proj-x'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let task = work::create_task(&conn, pid, "替换指针", None, false).unwrap()["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    db::save_memory(
+        &conn,
+        &db::MemoryInput {
+            project_id: Some(pid),
+            scope: "project",
+            r#type: "fact",
+            content: "指针记忆",
+            status: None,
+            source_session_id: None,
+            source_message_id: None,
+        },
+    )
+    .unwrap();
+    let memory: String = conn
+        .query_row(
+            "SELECT id FROM memories WHERE content='指针记忆'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let pack = home.path().join("replace-work-base.tar.gz");
+    bundle::create(&conn, home.path(), &pack, &bundle::BundleFilter::default()).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    bundle::restore(&pack, target.path(), false).unwrap();
+    let tc = db::open(target.path()).unwrap();
+    let mid: i64 = tc
+        .query_row(
+            "SELECT id FROM messages WHERE session_id='claude:aaaa' AND line_no=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    tc.execute("INSERT INTO task_verifications(id,task_id,kind,result,evidence,session_id,source_message_id,task_revision,created_at)
+        VALUES('local-verification',?1,'external','unknown','本地验证','claude:aaaa',?2,1,'2026-08-01')",rusqlite::params![task,mid]).unwrap();
+    tc.execute("INSERT INTO memory_events(id,memory_id,session_id,change_kind,occurred_at,source_message_id)
+        VALUES('local-memory-event',?1,'claude:aaaa','confirmed','2026-08-01',?2)",rusqlite::params![memory,mid]).unwrap();
+    drop(tc);
+    std::fs::write(src.path().join("claude/aaaa.jsonl"),std::fs::read_to_string(src.path().join("claude/aaaa.jsonl")).unwrap()
+        + r#"{"type":"user","cwd":"/tmp/proj-x","uuid":"a3","timestamp":"2026-08-01T11:00:00Z","message":{"role":"user","content":"替换会话"}}"# + "\n").unwrap();
+    let mut sc = db::open(home.path()).unwrap();
+    ingest::import_all(
+        &mut sc,
+        home.path(),
+        &[(adapters::AGENT_CLAUDE, src.path().join("claude"))],
+        None,
+        None,
+    )
+    .unwrap();
+    let second = home.path().join("replace-work-second.tar.gz");
+    bundle::create(&sc, home.path(), &second, &bundle::BundleFilter::default()).unwrap();
+    drop(sc);
+    bundle::restore(&second, target.path(), true).unwrap();
+    let tc = db::open(target.path()).unwrap();
+    assert_eq!(tc.query_row::<i64,_,_>("SELECT m.line_no FROM task_verifications v JOIN messages m ON m.id=v.source_message_id WHERE v.id='local-verification'",[],|r|r.get(0)).unwrap(),1);
+    assert_eq!(tc.query_row::<i64,_,_>("SELECT m.line_no FROM memory_events e JOIN messages m ON m.id=e.source_message_id WHERE e.id='local-memory-event'",[],|r|r.get(0)).unwrap(),1);
+    assert_eq!(
+        tc.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM task_sessions WHERE task_id=?1",
+            [&task],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        tc.query_row::<i64, _, _>("PRAGMA foreign_key_check", [], |r| r.get(0))
+            .unwrap_or(0),
+        0
+    );
+}
+
+#[test]
+fn unknown_extra_table_is_fail_closed() {
+    let (home, _src) = make_src();
+    let pack = home.path().join("unknown-work-table.tar.gz");
+    bundle::create(
+        &db::open(home.path()).unwrap(),
+        home.path(),
+        &pack,
+        &bundle::BundleFilter::default(),
+    )
+    .unwrap();
+    rewrite_bundle(&pack, |_, conn| {
+        conn.execute(
+            "CREATE TABLE future_private_assets(id TEXT, payload TEXT)",
+            [],
+        )
+        .unwrap();
+    });
+    let report = bundle::verify(&pack).unwrap();
+    assert_eq!(report["ok"], false);
+    assert!(report["database_errors"]
+        .to_string()
+        .contains("future_private_assets"));
+    let target = tempfile::tempdir().unwrap();
+    db::open(target.path()).unwrap();
+    assert!(bundle::restore(&pack, target.path(), true).is_err());
+    assert_eq!(
+        db::recent_sessions(&db::open(target.path()).unwrap(), None, 10)
+            .unwrap()
+            .len(),
+        0
+    );
 }

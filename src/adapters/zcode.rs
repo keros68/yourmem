@@ -22,15 +22,13 @@
 //!
 //! parse 防御式：未知行/损坏行跳过，永不 panic（AGENTS.md adapter 契约）。
 
-use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use serde_json::Value;
 
 use crate::models::{MessageKind, NewArtifact, NewMessage, ParseOutput, SessionMetaPatch};
-
-
 
 /// harness 上下文压缩的摘要前缀（0.3.8 真机验证：本会话压缩后 34 处命中——
 /// 压缩之后每个携带全量历史的请求，其首条 user 消息都以它开头）。
@@ -74,18 +72,50 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
         // 1) 本行产出：response.text（assistant）+ toolCalls
         if let Some(resp) = v.get("response") {
             if let Some(text) = resp.get("text").and_then(Value::as_str) {
-                push(&mut out.messages, *line_no, MessageKind::Assistant, text, ts.clone());
+                push(
+                    &mut out.messages,
+                    *line_no,
+                    MessageKind::Assistant,
+                    text,
+                    ts.clone(),
+                );
             }
             if let Some(calls) = resp.get("toolCalls").and_then(Value::as_array) {
                 for call in calls {
                     let name = call.get("name").and_then(Value::as_str).unwrap_or("?");
                     let input = call.get("input").cloned().unwrap_or(Value::Null);
                     let display = serde_json::to_string(&input).unwrap_or_default();
-                    push(&mut out.messages, *line_no, MessageKind::ToolCall,
-                        &format!("[{name}] {display}"), ts.clone());
+                    push(
+                        &mut out.messages,
+                        *line_no,
+                        MessageKind::ToolCall,
+                        &format!("[{name}] {display}"),
+                        ts.clone(),
+                    );
+                    if let Some(last) = out.messages.last_mut() {
+                        last.native_tool_call_id =
+                            call.get("id").and_then(Value::as_str).map(str::to_string);
+                    }
                     if super::FILE_TOOLS.contains(&name) {
                         if let Some(fp) = input.get("file_path").and_then(Value::as_str) {
-                            out.artifacts.push(NewArtifact { path: fp.to_string(), tool: name.to_string() });
+                            out.artifacts.push(NewArtifact {
+                                path: fp.to_string(),
+                                from_path: None,
+                                tool: name.to_string(),
+                                operation: if name == "Write" { "create" } else { "edit" }
+                                    .to_string(),
+                                native_tool_call_id: call
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                timestamp: ts.clone(),
+                                line_no: *line_no,
+                                ord: out
+                                    .artifacts
+                                    .iter()
+                                    .filter(|a| a.line_no == *line_no)
+                                    .count() as u32,
+                            });
                         }
                     }
                 }
@@ -101,7 +131,10 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
             .pointer("/request/messages")
             .and_then(Value::as_array)
             .filter(|a| !a.is_empty())
-            .or_else(|| v.pointer("/request/body/messages").and_then(Value::as_array))
+            .or_else(|| {
+                v.pointer("/request/body/messages")
+                    .and_then(Value::as_array)
+            })
             .filter(|a| !a.is_empty());
         if let Some(msgs) = hist_msgs {
             out.history_resync = true;
@@ -115,17 +148,18 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                 }
                 let head = match m.get("content") {
                     Some(Value::String(s)) => Some(s.as_str()),
-                    Some(Value::Array(items)) => items.iter().find_map(|b| {
-                        match b.get("type").and_then(Value::as_str) {
-                            Some("text") => b.get("text").and_then(Value::as_str),
-                            _ => None,
-                        }
-                    }),
+                    Some(Value::Array(items)) => {
+                        items
+                            .iter()
+                            .find_map(|b| match b.get("type").and_then(Value::as_str) {
+                                Some("text") => b.get("text").and_then(Value::as_str),
+                                _ => None,
+                            })
+                    }
                     _ => None,
                 };
                 if let Some(t) = head.filter(|t| t.starts_with(COMPACT_SUMMARY_PREFIX)) {
-                    out.compact_line =
-                        Some(out.compact_line.map_or(*line_no, |l| l.min(*line_no)));
+                    out.compact_line = Some(out.compact_line.map_or(*line_no, |l| l.min(*line_no)));
                     // 新摘要 = 一次新的压缩：快照从摘要重新起算，出现序号随之归零，
                     // 旧的已入账集合不再适用（否则压缩后与压缩前同文的消息会被吞掉）
                     let mut h = DefaultHasher::new();
@@ -143,11 +177,33 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
             for m in msgs {
                 let role = m.get("role").and_then(Value::as_str).unwrap_or("");
                 match role {
-                    "user" => extract_user_blocks(&m["content"], *line_no, &ts, &mut occ, &mut seen, &mut out.messages),
-                    "tool" => extract_tool_blocks(&m["content"], *line_no, &ts, &mut occ, &mut seen, &mut out.messages),
+                    "user" => extract_user_blocks(
+                        &m["content"],
+                        *line_no,
+                        &ts,
+                        &mut occ,
+                        &mut seen,
+                        &mut out.messages,
+                    ),
+                    "tool" => extract_tool_blocks(
+                        &m["content"],
+                        *line_no,
+                        &ts,
+                        &mut occ,
+                        &mut seen,
+                        &mut out.messages,
+                    ),
                     "system" => {
                         if let Some(text) = m.get("content").and_then(Value::as_str) {
-                            push_dedup(&mut out.messages, *line_no, MessageKind::System, text, ts.clone(), &mut occ, &mut seen);
+                            push_dedup(
+                                &mut out.messages,
+                                *line_no,
+                                MessageKind::System,
+                                text,
+                                ts.clone(),
+                                &mut occ,
+                                &mut seen,
+                            );
                         }
                     }
                     _ => {}
@@ -195,7 +251,15 @@ fn extract_tool_blocks(
 ) {
     match content {
         Value::String(s) => {
-            push_dedup(out, line_no, MessageKind::ToolResult, s, ts.clone(), occ, seen);
+            push_dedup(
+                out,
+                line_no,
+                MessageKind::ToolResult,
+                s,
+                ts.clone(),
+                occ,
+                seen,
+            );
         }
         Value::Array(items) => {
             for item in items {
@@ -209,12 +273,38 @@ fn extract_tool_blocks(
                                 other => serde_json::to_string(other).unwrap_or_default(),
                             })
                             .unwrap_or_default();
-                        push_dedup(out, line_no, MessageKind::ToolResult,
-                            &format!("[{name}] {value}"), ts.clone(), occ, seen);
+                        push_dedup(
+                            out,
+                            line_no,
+                            MessageKind::ToolResult,
+                            &format!("[{name}] {value}"),
+                            ts.clone(),
+                            occ,
+                            seen,
+                        );
+                        if let Some(last) = out.last_mut() {
+                            last.native_tool_call_id = ["toolCallId", "toolUseId", "id"]
+                                .iter()
+                                .find_map(|key| item.get(*key).and_then(Value::as_str))
+                                .map(str::to_string);
+                            last.tool_success = item
+                                .get("is_error")
+                                .or_else(|| item.get("isError"))
+                                .and_then(Value::as_bool)
+                                .map(|error| !error);
+                        }
                     }
                     Some("text") => {
                         if let Some(t) = item.get("text").and_then(Value::as_str) {
-                            push_dedup(out, line_no, MessageKind::ToolResult, t, ts.clone(), occ, seen);
+                            push_dedup(
+                                out,
+                                line_no,
+                                MessageKind::ToolResult,
+                                t,
+                                ts.clone(),
+                                occ,
+                                seen,
+                            );
                         }
                     }
                     // image / 未知块：跳过（防御式）
@@ -252,11 +342,14 @@ fn push_dedup(
 /// session.directory（尽力而为，任何失败都返回原 meta——文件解析不依赖它）。
 pub fn enrich_meta_from_db(meta: &SessionMetaPatch, session_id: &str) -> SessionMetaPatch {
     let mut meta = meta.clone();
-    let db = crate::home_dir().join(".zcode").join("cli").join("db").join("db.sqlite");
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
-        &db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) else {
+    let db = crate::home_dir()
+        .join(".zcode")
+        .join("cli")
+        .join("db")
+        .join("db.sqlite");
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
         return meta;
     };
     let native_id = session_id.rsplit(':').next().unwrap_or(session_id);
@@ -273,7 +366,13 @@ pub fn enrich_meta_from_db(meta: &SessionMetaPatch, session_id: &str) -> Session
     meta
 }
 
-fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, text: &str, ts: Option<String>) {
+fn push(
+    out: &mut Vec<NewMessage>,
+    line_no: u64,
+    kind: MessageKind,
+    text: &str,
+    ts: Option<String>,
+) {
     super::push_message(out, line_no, kind, text.to_string(), ts, None);
 }
 

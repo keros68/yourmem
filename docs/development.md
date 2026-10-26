@@ -39,6 +39,16 @@ export YOUMEM_HOME=$PWD/.sandbox
 ./target/debug/yourmem import
 ./target/debug/yourmem search "关键词"
 ./target/debug/yourmem memory list
+./target/debug/yourmem task list --status all
+./target/debug/yourmem task create "验证跨 Agent 任务节点"
+./target/debug/yourmem task show P-1
+./target/debug/yourmem task close P-1 --next "复核并记录验证结果"
+./target/debug/yourmem timeline --task P-1 --limit 50
+./target/debug/yourmem changes --cursor '{"database_generation":"generation-id","seq":0}'
+./target/debug/yourmem task export P-1 -o task-evidence.md
+./target/debug/yourmem task conflicts
+./target/debug/yourmem task resolve-merge <conflict-id> --local   # 或 --incoming
+./target/debug/yourmem bundle restore-config backup.tar.gz --map '{"源路径":"/目标路径"}'
 ./target/debug/yourmem doctor
 ```
 

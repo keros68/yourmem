@@ -7,8 +7,7 @@
 //! - 按 id 打补丁：hermes `[todo]` 的 `merge:true` 变体只携带变化项；空对象 `{}` 忽略
 //! - 隐式编号增量：claude `TaskCreate`（无 id 字段，按创建顺序编号）/`TaskUpdate`
 //!   （按 taskId 改状态/主题）
-//! - codex `update_plan` 按样本门禁留空（本库 0/76，原始 rollout 零命中）——刻意
-//!   不匹配，防正文提及 "plan" 误报
+//! - codex `update_plan`：只匹配原生工具调用前缀和 `plan` 数组，不匹配正文提及
 //!
 //! 解析防御式：坏 JSON / 未知形状 / 缺字段一律跳过，绝不 panic（参照 zcode 格式
 //! 漂移教训：形态走样时宁可漏一条，不可错一条）。fixture 全部来自真机样本脱敏。
@@ -18,14 +17,14 @@ use serde_json::Value;
 /// 归一化任务项。status 统一为 pending | in_progress | completed（kimi 的 done
 /// 折算成 completed，其余原样透传——未知状态宁可显示出来，不可猜）。
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct TaskItem {
+pub(crate) struct TaskItem {
     pub id: Option<String>,
     pub content: String,
     pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(super) enum TaskEvent {
+pub(crate) enum TaskEvent {
     /// 全量覆盖快照（zcode/kimi/opencode/claude TodoWrite/hermes merge 非 true）
     Snapshot(Vec<TaskItem>),
     /// hermes merge:true：按 id upsert 的部分补丁
@@ -42,7 +41,7 @@ pub(super) enum TaskEvent {
 
 /// 一个变化点（相邻同状态快照去重后）
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct ChangePoint {
+pub(crate) struct ChangePoint {
     pub line_no: i64,
     pub timestamp: Option<String>,
     pub todos: Vec<TaskItem>,
@@ -50,21 +49,38 @@ pub(super) struct ChangePoint {
 
 /// project_dossier 的 SQL 过滤片段：agent 门控的前缀匹配，防跨源误配
 /// （kimi 也用方括号格式，若不按 agent 圈定，`[todo]` 会撞上未来其他源的同类工具）。
-pub(super) const MATCHER_SQL: &str = "\
+pub(crate) const MATCHER_SQL: &str = "\
     (s.agent='zcode' AND m.content LIKE '[TodoWrite] {%') \
     OR (s.agent='kimi' AND m.content LIKE '[TodoList] {%') \
     OR (s.agent='hermes' AND m.content LIKE '[todo] {%') \
     OR (s.agent='opencode' AND m.content LIKE 'todowrite: {%') \
+    OR (s.agent='codex' AND m.content LIKE 'update_plan: {%') \
     OR (s.agent='claude' AND (m.content LIKE 'TaskCreate: {%' \
         OR m.content LIKE 'TaskUpdate: {%' OR m.content LIKE 'TodoWrite: {%'))";
 
 /// 单条 tool_call → 任务事件。agent/前缀不认识、JSON 坏、形状不对 → None。
-pub(super) fn parse_event(agent: &str, content: &str) -> Option<TaskEvent> {
+pub(crate) fn parse_event(agent: &str, content: &str) -> Option<TaskEvent> {
     let body = json_body(content)?;
     match agent {
         "zcode" => snapshot_event(&body, "content"),
         "kimi" => snapshot_event(&body, "title"),
         "opencode" => snapshot_event(&body, "content"),
+        "codex" if content.starts_with("update_plan: {") => {
+            let plan = body["plan"].as_array()?;
+            Some(TaskEvent::Snapshot(
+                plan.iter()
+                    .map(|step| TaskItem {
+                        id: step["id"].as_str().map(str::to_string),
+                        content: step["step"].as_str().unwrap_or("").to_string(),
+                        status: step["status"]
+                            .as_str()
+                            .map(normalize_status)
+                            .unwrap_or_else(|| "pending".into()),
+                    })
+                    .filter(|step| !step.content.is_empty())
+                    .collect(),
+            ))
+        }
         "hermes" => {
             if body["merge"].as_bool() == Some(true) {
                 Some(TaskEvent::Patch(extract_todos(&body, "content")?))
@@ -102,7 +118,7 @@ pub(super) fn parse_event(agent: &str, content: &str) -> Option<TaskEvent> {
 /// 折叠一个会话的事件流（调用方保证已按 line_no, ord 排序）为变化点序列：
 /// 全量快照直接替换状态；hermes 补丁按 id upsert；claude 增量按创建顺序编号重放；
 /// 相邻同状态去重——末个变化点即最终任务状态。
-pub(super) fn fold(events: Vec<(i64, Option<String>, TaskEvent)>) -> Vec<ChangePoint> {
+pub(crate) fn fold(events: Vec<(i64, Option<String>, TaskEvent)>) -> Vec<ChangePoint> {
     let mut state: Vec<TaskItem> = Vec::new();
     let mut seq: u64 = 0;
     let mut out: Vec<ChangePoint> = Vec::new();
@@ -115,7 +131,10 @@ pub(super) fn fold(events: Vec<(i64, Option<String>, TaskEvent)>) -> Vec<ChangeP
             TaskEvent::Patch(items) => {
                 for it in items {
                     let Some(id) = it.id.clone() else { continue }; // 无 id 无法锚定：丢弃
-                    if let Some(slot) = state.iter_mut().find(|s| s.id.as_deref() == Some(id.as_str())) {
+                    if let Some(slot) = state
+                        .iter_mut()
+                        .find(|s| s.id.as_deref() == Some(id.as_str()))
+                    {
                         slot.content = it.content;
                         slot.status = it.status;
                     } else {
@@ -176,11 +195,16 @@ fn extract_todos(body: &Value, field: &str) -> Option<Vec<TaskItem>> {
     let arr = body["todos"].as_array()?;
     let mut items = Vec::new();
     for t in arr {
-        let Some(text) = t[field].as_str() else { continue };
+        let Some(text) = t[field].as_str() else {
+            continue;
+        };
         items.push(TaskItem {
             id: t["id"].as_str().map(str::to_string),
             content: text.to_string(),
-            status: t["status"].as_str().map(normalize_status).unwrap_or_else(|| "pending".into()),
+            status: t["status"]
+                .as_str()
+                .map(normalize_status)
+                .unwrap_or_else(|| "pending".into()),
         });
     }
     Some(items)
@@ -205,7 +229,9 @@ mod tests {
             "zcode",
             r#"[TodoWrite] {"todos":[{"content":"任务A","priority":"high","status":"completed"},{"content":"任务B","priority":"high","status":"in_progress"}]}"#,
         ).unwrap();
-        let TaskEvent::Snapshot(items) = ev else { panic!("应为快照") };
+        let TaskEvent::Snapshot(items) = ev else {
+            panic!("应为快照")
+        };
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].content, "任务A");
         assert_eq!(items[0].status, "completed");
@@ -219,9 +245,14 @@ mod tests {
             "kimi",
             r#"[TodoList] {"todos":[{"status":"done","title":"任务A"},{"status":"pending","title":"任务B"}]}"#,
         ).unwrap();
-        let TaskEvent::Snapshot(items) = ev else { panic!("应为快照") };
+        let TaskEvent::Snapshot(items) = ev else {
+            panic!("应为快照")
+        };
         assert_eq!(items[0].content, "任务A");
-        assert_eq!(items[0].status, "completed", "kimi 的 done 应归一化为 completed");
+        assert_eq!(
+            items[0].status, "completed",
+            "kimi 的 done 应归一化为 completed"
+        );
         assert_eq!(items[1].status, "pending");
     }
 
@@ -231,7 +262,9 @@ mod tests {
             "opencode",
             r#"todowrite: {"todos":[{"content":"Create index.html","priority":"high","status":"pending"}]}"#,
         ).unwrap();
-        let TaskEvent::Snapshot(items) = ev else { panic!("应为快照") };
+        let TaskEvent::Snapshot(items) = ev else {
+            panic!("应为快照")
+        };
         assert_eq!(items[0].content, "Create index.html");
     }
 
@@ -246,10 +279,7 @@ mod tests {
             "hermes",
             r#"[todo] {"merge": true, "todos": [{"content": "任务A", "id": "1", "status": "completed"}]}"#,
         ).unwrap();
-        let changes = fold(vec![
-            (10, None, full),
-            (20, None, patch),
-        ]);
+        let changes = fold(vec![(10, None, full), (20, None, patch)]);
         assert_eq!(changes.len(), 2);
         let final_items = &changes.last().unwrap().todos;
         assert_eq!(final_items.len(), 2, "补丁不应清掉未提及的任务");
@@ -274,14 +304,34 @@ mod tests {
         let changes = fold(vec![
             (1, None, mk("甲")),
             (2, None, mk("乙")),
-            (3, None, parse_event("claude", r#"TaskUpdate: {"status":"in_progress","taskId":"1"}"#).unwrap()),
-            (4, None, parse_event("claude", r#"TaskUpdate: {"status":"completed","taskId":"1"}"#).unwrap()),
+            (
+                3,
+                None,
+                parse_event(
+                    "claude",
+                    r#"TaskUpdate: {"status":"in_progress","taskId":"1"}"#,
+                )
+                .unwrap(),
+            ),
+            (
+                4,
+                None,
+                parse_event(
+                    "claude",
+                    r#"TaskUpdate: {"status":"completed","taskId":"1"}"#,
+                )
+                .unwrap(),
+            ),
         ]);
         // 创建×2 + 状态改×2，每次都改变状态 → 4 个变化点
         assert_eq!(changes.len(), 4);
         let final_items = &changes.last().unwrap().todos;
         assert_eq!(final_items.len(), 2);
-        assert_eq!(final_items[0].id.as_deref(), Some("1"), "隐式编号按创建顺序");
+        assert_eq!(
+            final_items[0].id.as_deref(),
+            Some("1"),
+            "隐式编号按创建顺序"
+        );
         assert_eq!(final_items[0].status, "completed");
         assert_eq!(final_items[1].status, "pending");
     }
@@ -291,7 +341,11 @@ mod tests {
         let changes = fold(vec![(
             1,
             None,
-            parse_event("claude", r#"TaskUpdate: {"status":"completed","taskId":"9"}"#).unwrap(),
+            parse_event(
+                "claude",
+                r#"TaskUpdate: {"status":"completed","taskId":"9"}"#,
+            )
+            .unwrap(),
         )]);
         assert!(changes.is_empty(), "未知 taskId 不应产生任何状态");
     }
@@ -299,7 +353,11 @@ mod tests {
     #[test]
     fn adjacent_identical_snapshots_dedupe() {
         let snap = |st: &str| {
-            parse_event("kimi", &format!(r#"[TodoList] {{"todos":[{{"status":"{st}","title":"任务A"}}]}}"#)).unwrap()
+            parse_event(
+                "kimi",
+                &format!(r#"[TodoList] {{"todos":[{{"status":"{st}","title":"任务A"}}]}}"#),
+            )
+            .unwrap()
         };
         let changes = fold(vec![
             (1, None, snap("in_progress")),
@@ -311,29 +369,56 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_other_tools_never_match() {
-        // codex 按样本门禁刻意不匹配（正文含 update_plan 也不行）
+    fn codex_plan_matches_only_native_tool_shape() {
+        let event = parse_event(
+            "codex",
+            r#"update_plan: {"plan":[{"step":"任务A","status":"completed"}]}"#,
+        )
+        .unwrap();
+        let TaskEvent::Snapshot(items) = event else {
+            panic!("应为 plan 快照")
+        };
+        assert_eq!(items[0].content, "任务A");
         assert_eq!(
-            parse_event("codex", r#"update_plan: {"plan":[{"step":"任务A","status":"completed"}]}"#),
+            parse_event("codex", r#"Bash: {"command":"echo update_plan"}"#),
             None
         );
         // claude 的普通工具不误配
-        assert_eq!(parse_event("claude", r#"Bash: {"command":"ls TaskCreate: {}"}"#), None);
-        assert_eq!(parse_event("hermes", r#"[terminal] {"command":"todo"}"#), None);
+        assert_eq!(
+            parse_event("claude", r#"Bash: {"command":"ls TaskCreate: {}"}"#),
+            None
+        );
+        assert_eq!(
+            parse_event("hermes", r#"[terminal] {"command":"todo"}"#),
+            None
+        );
     }
 
     #[test]
     fn malformed_json_and_unknown_shapes_are_defensive() {
-        assert_eq!(parse_event("kimi", "[TodoList] {\"todos\":"), None, "坏 JSON");
+        assert_eq!(
+            parse_event("kimi", "[TodoList] {\"todos\":"),
+            None,
+            "坏 JSON"
+        );
         assert_eq!(parse_event("kimi", "[TodoList] null"), None);
-        assert_eq!(parse_event("kimi", "[TodoList] {\"other\":1}"), None, "缺 todos 键");
-        assert_eq!(parse_event("codex", "[TodoWrite] {\"todos\":[]}"), None, "agent 门控");
+        assert_eq!(
+            parse_event("kimi", "[TodoList] {\"other\":1}"),
+            None,
+            "缺 todos 键"
+        );
+        assert_eq!(
+            parse_event("codex", "[TodoWrite] {\"todos\":[]}"),
+            None,
+            "agent 门控"
+        );
     }
 
     #[test]
     fn integration_through_project_dossier() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(&format!("{}{}", crate::db::SCHEMA, crate::db::TRIGGERS_SQL)).unwrap();
+        conn.execute_batch(&format!("{}{}", crate::db::SCHEMA, crate::db::TRIGGERS_SQL))
+            .unwrap();
         conn.execute(
             "INSERT INTO projects(path, name, created_at, updated_at) VALUES ('/tmp/p', 'p', '2026-08-31T00:00:00Z', '2026-08-31T00:00:00Z')",
             [],
@@ -355,31 +440,65 @@ mod tests {
             .unwrap();
         };
         session("kimi:s1", "kimi");
-        msg("kimi:s1", 1, r#"[TodoList] {"todos":[{"status":"in_progress","title":"任务A"},{"status":"pending","title":"任务B"}]}"#);
-        msg("kimi:s1", 2, r#"[TodoList] {"todos":[{"status":"in_progress","title":"任务A"},{"status":"pending","title":"任务B"}]}"#);
-        msg("kimi:s1", 3, r#"[TodoList] {"todos":[{"status":"done","title":"任务A"},{"status":"in_progress","title":"任务B"}]}"#);
+        msg(
+            "kimi:s1",
+            1,
+            r#"[TodoList] {"todos":[{"status":"in_progress","title":"任务A"},{"status":"pending","title":"任务B"}]}"#,
+        );
+        msg(
+            "kimi:s1",
+            2,
+            r#"[TodoList] {"todos":[{"status":"in_progress","title":"任务A"},{"status":"pending","title":"任务B"}]}"#,
+        );
+        msg(
+            "kimi:s1",
+            3,
+            r#"[TodoList] {"todos":[{"status":"done","title":"任务A"},{"status":"in_progress","title":"任务B"}]}"#,
+        );
         // 证据分层：kimi 会话内有产物与 git commit 调用；claude 会话什么都没有
         conn.execute(
             "INSERT INTO session_artifacts(session_id, project_id, path, tool, created_at)
              VALUES ('kimi:s1', 1, '/tmp/p/out.txt', 'Write', '2026-08-31T00:00:00Z')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         msg("kimi:s1", 4, r#"Bash: {"command":"git commit -m wip"}"#);
         session("claude:s2", "claude");
-        msg("claude:s2", 1, r#"TaskCreate: {"activeForm":"表单","description":"d","subject":"任务甲"}"#);
-        msg("claude:s2", 2, r#"TaskUpdate: {"status":"completed","taskId":"1"}"#);
+        msg(
+            "claude:s2",
+            1,
+            r#"TaskCreate: {"activeForm":"表单","description":"d","subject":"任务甲"}"#,
+        );
+        msg(
+            "claude:s2",
+            2,
+            r#"TaskUpdate: {"status":"completed","taskId":"1"}"#,
+        );
         session("codex:s3", "codex");
-        msg("codex:s3", 1, r#"update_plan: {"plan":[{"step":"任务X","status":"completed"}]}"#);
+        msg(
+            "codex:s3",
+            1,
+            r#"update_plan: {"plan":[{"step":"任务X","status":"completed"}]}"#,
+        );
 
         let d = super::super::project_dossier(&conn, 1).unwrap();
         let tl = d["task_timeline"].as_array().unwrap();
-        assert_eq!(tl.len(), 2, "codex 不得出现，两条带任务调用的会话各一条");
+        assert_eq!(tl.len(), 3, "三种带 Todo/plan 调用的会话各一条");
+        let codex = tl.iter().find(|t| t["agent"] == "codex").unwrap();
+        assert_eq!(codex["final"]["todos"][0]["content"], "任务X");
         let kimi = tl.iter().find(|t| t["agent"] == "kimi").unwrap();
-        assert_eq!(kimi["changes"].as_array().unwrap().len(), 2, "相邻重复快照折叠");
+        assert_eq!(
+            kimi["changes"].as_array().unwrap().len(),
+            2,
+            "相邻重复快照折叠"
+        );
         assert_eq!(kimi["final"]["todos"][0]["status"], "completed");
         assert_eq!(kimi["done"], 1);
         assert_eq!(kimi["total"], 2);
-        assert!(kimi["final"]["line_no"].as_i64().unwrap() > 0, "可溯源：带行号");
+        assert!(
+            kimi["final"]["line_no"].as_i64().unwrap() > 0,
+            "可溯源：带行号"
+        );
         let claude = tl.iter().find(|t| t["agent"] == "claude").unwrap();
         assert_eq!(claude["final"]["todos"][0]["status"], "completed");
         assert_eq!(claude["final"]["todos"][0]["id"], "1");
@@ -393,8 +512,14 @@ mod tests {
         assert!(md.contains("## 任务状态"), "markdown 有任务状态章节\n{md}");
         assert!(md.contains("- [x] 任务A"), "checkbox 列表\n{md}");
         assert!(md.contains("任务B（进行中）"), "in_progress 标注\n{md}");
-        assert!(!md.contains("任务X"), "codex 不误报\n{md}");
-        assert!(md.contains("佐证：产物×1、提交×1"), "有佐证的会话标注佐证\n{md}");
-        assert!(md.contains("自报，会话内未见产物或提交佐证"), "无佐证的会话如实标注\n{md}");
+        assert!(md.contains("- [x] 任务X"), "codex plan 进入会话步骤\n{md}");
+        assert!(
+            md.contains("佐证：产物×1、提交×1"),
+            "有佐证的会话标注佐证\n{md}"
+        );
+        assert!(
+            md.contains("自报，会话内未见产物或提交佐证"),
+            "无佐证的会话如实标注\n{md}"
+        );
     }
 }

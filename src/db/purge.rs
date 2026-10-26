@@ -1,9 +1,9 @@
 //! 回收站清除的数据库事务与对象归档。生产入口由 crate::trash 持锁编排。
-use std::path::Path;
+use crate::now_iso;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use crate::now_iso;
+use std::path::Path;
 
 /// 回收站默认保留期（§6）：软删后 30 天内拒绝物理清除。
 pub const TRASH_RETENTION_DAYS: i64 = 30;
@@ -20,7 +20,9 @@ fn trash_age(conn: &Connection, session_id: &str) -> Result<Option<(String, i64,
     let Some((deleted_at, messages)) = row else {
         anyhow::bail!("session not found: {session_id}");
     };
-    let Some(deleted_at) = deleted_at else { return Ok(None) };
+    let Some(deleted_at) = deleted_at else {
+        return Ok(None);
+    };
     let deleted_ts = chrono::DateTime::parse_from_rfc3339(&deleted_at)
         .context("invalid deleted_at")?
         .with_timezone(&chrono::Utc);
@@ -84,7 +86,13 @@ pub fn purge_plan(conn: &Connection, home: &Path, session_id: &str) -> Result<Va
 fn slug_session_id(session_id: &str) -> String {
     session_id
         .chars()
-        .map(|c| if matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|' | '/' | '\\') { '_' } else { c })
+        .map(|c| {
+            if matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|' | '/' | '\\') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -94,18 +102,30 @@ fn slug_session_id(session_id: &str) -> String {
 /// drop_archive=true 在清除完成后把本次归档目录一并移除（1.0.0，「真删」：
 /// 主库与磁盘字节都不再保留；过程仍是先归档再删——中途崩溃只会留下本应被
 /// 删的档案，不会丢数据，残留目录可在设置页档案管理清理）。
-pub fn purge_session(conn: &mut Connection, home: &Path, session_id: &str, force: bool, drop_archive: bool) -> Result<Value> {
+pub fn purge_session(
+    conn: &mut Connection,
+    home: &Path,
+    session_id: &str,
+    force: bool,
+    drop_archive: bool,
+) -> Result<Value> {
     // 只读门控所需的两列；完整预览（独占对象全表扫描）由调用方按需取
     let Some((_, age_days, _)) = trash_age(conn, session_id)? else {
         anyhow::bail!("会话不在回收站：{session_id}");
     };
     if !force {
-        anyhow::ensure!(age_days >= TRASH_RETENTION_DAYS,
-            "保留期内：还剩 {} 天（回收站默认保留 {} 天）", TRASH_RETENTION_DAYS - age_days, TRASH_RETENTION_DAYS);
+        anyhow::ensure!(
+            age_days >= TRASH_RETENTION_DAYS,
+            "保留期内：还剩 {} 天（回收站默认保留 {} 天）",
+            TRASH_RETENTION_DAYS - age_days,
+            TRASH_RETENTION_DAYS
+        );
     }
 
     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f");
-    let backup_dir = crate::backups_dir(home).join("purge").join(format!("{}-{ts}", slug_session_id(session_id)));
+    let backup_dir = crate::backups_dir(home)
+        .join("purge")
+        .join(format!("{}-{ts}", slug_session_id(session_id)));
     std::fs::create_dir_all(&backup_dir)?;
 
     let (agent, file_path): (String, String) = conn.query_row(
@@ -117,7 +137,10 @@ pub fn purge_session(conn: &mut Connection, home: &Path, session_id: &str, force
     let tx = conn.transaction()?;
     // (a) 备份：被删的库行导出 JSON（恢复的原料；CAS 对象随后 rename 进同目录）
     let dump = dump_session_rows(&tx, session_id)?;
-    std::fs::write(backup_dir.join("rows.json"), serde_json::to_string_pretty(&dump)?)?;
+    std::fs::write(
+        backup_dir.join("rows.json"),
+        serde_json::to_string_pretty(&dump)?,
+    )?;
     // (b) 候选对象入 GC 队列（删行后清单就没了）
     let candidates: Vec<String> = {
         let mut stmt = tx.prepare("SELECT DISTINCT hash FROM vault_lines WHERE session_id = ?1")?;
@@ -126,10 +149,16 @@ pub fn purge_session(conn: &mut Connection, home: &Path, session_id: &str, force
     };
     let now = now_iso();
     for h in &candidates {
-        tx.execute("INSERT OR IGNORE INTO gc_pending(hash, added_at) VALUES (?1, ?2)", params![h, now])?;
+        tx.execute(
+            "INSERT OR IGNORE INTO gc_pending(hash, added_at) VALUES (?1, ?2)",
+            params![h, now],
+        )?;
     }
     let removed_messages: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM messages WHERE session_id = ?1", params![session_id], |r| r.get(0))?;
+        "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+        params![session_id],
+        |r| r.get(0),
+    )?;
     // (c) 删行（FTS 触发器联动；session_links 两端清；记忆的消息指针置空）
     crate::db::delete_session_data(&tx, session_id)?;
     // (d) 游标清 + 墓碑立（阻止 import 完整重导复活）。游标按 (agent, path)：
@@ -240,7 +269,9 @@ fn archive_objects(conn: &Connection, home: &Path, backup_dir: &Path) -> Result<
             |r| r.get(0),
         )?;
         if referenced > 0 || !store.contains(&hash)? {
-            if referenced > 0 { kept += 1; }
+            if referenced > 0 {
+                kept += 1;
+            }
             conn.execute("DELETE FROM gc_pending WHERE hash = ?1", params![hash])?;
             continue;
         }
@@ -267,7 +298,9 @@ pub fn gc_sweep(conn: &Connection, home: &Path) -> Result<Value> {
         return Ok(json!({ "swept": 0 }));
     }
     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f");
-    let dir = crate::backups_dir(home).join("purge").join(format!("sweep-{ts}"));
+    let dir = crate::backups_dir(home)
+        .join("purge")
+        .join(format!("sweep-{ts}"));
     std::fs::create_dir_all(&dir)?;
     let (removed, kept) = archive_objects(conn, home, &dir.join("objects"))?;
     if removed == 0 {
@@ -283,9 +316,8 @@ pub fn trash_overdue_plan(conn: &Connection, home: &Path) -> Result<Value> {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(TRASH_RETENTION_DAYS))
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let overdue: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM sessions WHERE deleted_at IS NOT NULL AND deleted_at <= ?1",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT id FROM sessions WHERE deleted_at IS NOT NULL AND deleted_at <= ?1")?;
         let rows = stmt.query_map(params![cutoff], |r| r.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
@@ -335,8 +367,6 @@ pub fn purge_trash(conn: &mut Connection, home: &Path, ids: &[String]) -> Result
     Ok(json!({ "purged_sessions": results.len(), "results": results }))
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,7 +381,10 @@ mod tests {
         archive_object(&store, &hash, &dst).unwrap();
         assert!(!store.contains(&hash).unwrap());
         assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
-        assert_eq!(std::fs::read_dir(dst.parent().unwrap()).unwrap().count(), 1, "无 tmp 残留");
+        assert_eq!(
+            std::fs::read_dir(dst.parent().unwrap()).unwrap().count(),
+            1,
+            "无 tmp 残留"
+        );
     }
-
 }

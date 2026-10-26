@@ -48,7 +48,13 @@ fn claude_project_encodings(cwd: &str) -> Vec<String> {
         // 当前版本：每个非 ASCII 字母数字的 UTF-16 码元都换成 '-'（中文、空格、冒号都在内）
         String::from_utf16_lossy(
             &cwd.encode_utf16()
-                .map(|u| if u < 128 && (u as u8).is_ascii_alphanumeric() { u } else { u16::from(b'-') })
+                .map(|u| {
+                    if u < 128 && (u as u8).is_ascii_alphanumeric() {
+                        u
+                    } else {
+                        u16::from(b'-')
+                    }
+                })
                 .collect::<Vec<_>>(),
         ),
         cwd.replace(['/', '\\', ':'], "-"), // Windows 全量归一（盘符冒号不入目录名）
@@ -66,7 +72,11 @@ fn claude_project_encodings(cwd: &str) -> Vec<String> {
 /// discovered from imported sessions' cwd (never a proactive disk scan).
 /// OpenCode: 本机实测其配置目录只有 json 配置、无 markdown 形态的 memory/
 /// instruction 文件，无可备份对象，暂不监控（DESIGN-0.3 §2.2 "实施时确认"的结论）。
-fn discover_targets(conn: &Connection, home: &Path, dirs: &SourceDirs) -> Result<Vec<(String, String, PathBuf)>> {
+fn discover_targets(
+    conn: &Connection,
+    home: &Path,
+    dirs: &SourceDirs,
+) -> Result<Vec<(String, String, PathBuf)>> {
     let mut targets: Vec<(String, String, PathBuf)> = Vec::new(); // (agent, scope, path)
 
     for (agent, path) in [
@@ -95,14 +105,26 @@ fn discover_targets(conn: &Connection, home: &Path, dirs: &SourceDirs) -> Result
         }
 
         let project_claude_md = Path::new(&cwd).join("CLAUDE.md");
-        if project_claude_md.is_file() && crate::project_docs::inside_root(Path::new(&cwd), &project_claude_md) {
-            targets.push((crate::adapters::AGENT_CLAUDE.to_string(), scope.clone(), project_claude_md));
+        if project_claude_md.is_file()
+            && crate::project_docs::inside_root(Path::new(&cwd), &project_claude_md)
+        {
+            targets.push((
+                crate::adapters::AGENT_CLAUDE.to_string(),
+                scope.clone(),
+                project_claude_md,
+            ));
         }
 
         // Codex project instructions use AGENTS.md, independently of CLAUDE.md.
         let project_agents = Path::new(&cwd).join("AGENTS.md");
-        if project_agents.is_file() && crate::project_docs::inside_root(Path::new(&cwd), &project_agents) {
-            targets.push((crate::adapters::AGENT_CODEX.to_string(), scope.clone(), project_agents));
+        if project_agents.is_file()
+            && crate::project_docs::inside_root(Path::new(&cwd), &project_agents)
+        {
+            targets.push((
+                crate::adapters::AGENT_CODEX.to_string(),
+                scope.clone(),
+                project_agents,
+            ));
         }
 
         for enc in claude_project_encodings(&cwd) {
@@ -130,8 +152,14 @@ fn discover_targets(conn: &Connection, home: &Path, dirs: &SourceDirs) -> Result
     let project_paths: Vec<String> = stmt
         .query_map([], |r| r.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    for project in project_paths.into_iter().chain(tracked.iter().map(|(p, _)| p.clone())) {
-        if !roots.iter().any(|r| db::path_key(r) == db::path_key(&project)) {
+    for project in project_paths
+        .into_iter()
+        .chain(tracked.iter().map(|(p, _)| p.clone()))
+    {
+        if !roots
+            .iter()
+            .any(|r| db::path_key(r) == db::path_key(&project))
+        {
             roots.push(project);
         }
     }
@@ -153,6 +181,21 @@ fn discover_targets(conn: &Connection, home: &Path, dirs: &SourceDirs) -> Result
 /// Snapshot every monitored file whose content changed since the last import.
 /// Files are all KB-scale, so we read + hash unconditionally instead of
 /// maintaining mtime/size state — simpler and immune to mtime games.
+pub(crate) fn collection_state_key(path: &Path) -> String {
+    format!("document_collection:{}", path.to_string_lossy())
+}
+
+fn record_collection_error(conn: &Connection, path: &Path, error: Option<&str>) -> Result<()> {
+    let key = collection_state_key(path);
+    if let Some(error) = error {
+        conn.execute("INSERT INTO work_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![key,json!({"error":error,"observed_at":crate::now_iso()}).to_string()])?;
+    } else {
+        conn.execute("DELETE FROM work_meta WHERE key=?1", [key])?;
+    }
+    Ok(())
+}
+
 pub fn collect(conn: &Connection, home: &Path, dirs: &SourceDirs) -> Result<MemfilesOutcome> {
     let mut out = MemfilesOutcome::default();
     let off = crate::ingest::disabled_agents(home);
@@ -160,23 +203,41 @@ pub fn collect(conn: &Connection, home: &Path, dirs: &SourceDirs) -> Result<Memf
         // 项目目录里的文档（CLAUDE.md、AGENTS.md、进度文档）由多个 agent 共用，
         // 不随单个 agent 停用而停止备份；停用只影响全局文件与 agent 自己的记忆目录
         // （~/.claude/projects 下的自动记忆）。项目本身位于 agent 配置目录内也按项目处理。
-        let in_project = scope.starts_with("project:") && !path.starts_with(dirs.claude.join("projects"));
+        let in_project =
+            scope.starts_with("project:") && !path.starts_with(dirs.claude.join("projects"));
         if !in_project && off.iter().any(|a| *a == agent) {
             continue;
         }
-        if std::fs::metadata(&path).map_or(false, |m| m.len() > crate::project_docs::MAX_DOC_BYTES) {
+        if std::fs::metadata(&path).map_or(false, |m| m.len() > crate::project_docs::MAX_DOC_BYTES)
+        {
+            record_collection_error(conn, &path, Some("文件超过 1 MiB，最新内容尚未备份"))?;
             eprintln!("yourmem memfiles: 跳过超过 1 MiB 的 {}", path.display());
             continue;
         }
         out.files_monitored += 1;
-        // 单文件读失败只跳过该文件不连坐整轮采集（与 UTF-8 不完整"留到下一轮"
-        // 同口径，自检 C1）——权限/占位锁这类瞬时问题下轮自愈
-        let Ok(bytes) = std::fs::read(&path) else {
-            eprintln!("yourmem memfiles: 跳过读不了的 {}（下轮重试）", path.display());
-            continue;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                record_collection_error(
+                    conn,
+                    &path,
+                    Some(&format!("读取失败，最新内容尚未备份：{error}")),
+                )?;
+                eprintln!(
+                    "yourmem memfiles: 跳过读不了的 {}（下轮重试）",
+                    path.display()
+                );
+                continue;
+            }
         };
-        // UTF-8 完整性校验：agent 正在写的文件（多字节字符被切断）留到下一轮。
-        let Ok(text) = std::str::from_utf8(&bytes) else { continue };
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                record_collection_error(conn, &path, Some("内容不是完整 UTF-8，最新内容尚未备份"))?;
+                continue;
+            }
+        };
+        record_collection_error(conn, &path, None)?;
         let hash = vault::hash_bytes(&bytes);
         let path_str = path.to_string_lossy().to_string();
         // 先落 vault 再动库：内容寻址，重复写同一对象无害；若 upsert 先行而
@@ -208,7 +269,9 @@ pub fn show(conn: &Connection, home: &Path, file_id: i64, revision: Option<i64>)
             .iter()
             .find(|r| r["id"].as_i64() == Some(rid))
             .ok_or_else(|| anyhow::anyhow!("revision not found: {rid}"))?,
-        None => revisions.first().ok_or_else(|| anyhow::anyhow!("no revisions yet"))?,
+        None => revisions
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no revisions yet"))?,
     };
     let bytes = vault::read_object(home, chosen["hash"].as_str().unwrap_or_default(), true)?;
     Ok(json!({
@@ -247,7 +310,8 @@ pub fn diff(conn: &Connection, home: &Path, file_id: i64, last: usize) -> Result
 /// matches vault contents directly (trigram cannot index shorter tokens;
 /// same convention as `db::search`).
 pub fn search(conn: &Connection, home: &Path, query: &str, limit: u32) -> Result<Vec<Value>> {
-    let use_fts = query.split_whitespace().all(|t| t.chars().count() >= 3) && !query.trim().is_empty();
+    let use_fts =
+        query.split_whitespace().all(|t| t.chars().count() >= 3) && !query.trim().is_empty();
     if use_fts {
         return db::search_memory_files_fts(conn, query, limit);
     }
@@ -256,10 +320,15 @@ pub fn search(conn: &Connection, home: &Path, query: &str, limit: u32) -> Result
     for f in db::list_memory_files(conn)? {
         // 搜索是索引性扫描：不校验哈希（show/diff 才做保真校验），单文件对象
         // 缺失跳过不炸整次搜索（自检 C1）
-        let Ok(bytes) = vault::read_object(home, f["current_hash"].as_str().unwrap_or_default(), false) else {
+        let Ok(bytes) =
+            vault::read_object(home, f["current_hash"].as_str().unwrap_or_default(), false)
+        else {
             continue;
         };
-        if String::from_utf8_lossy(&bytes).to_lowercase().contains(&needle) {
+        if String::from_utf8_lossy(&bytes)
+            .to_lowercase()
+            .contains(&needle)
+        {
             hits.push(json!({
                 "id": f["id"], "agent": f["agent"], "scope": f["scope"],
                 "path": f["path"], "updated_at": f["updated_at"],
@@ -274,7 +343,12 @@ pub fn search(conn: &Connection, home: &Path, query: &str, limit: u32) -> Result
 
 /// MCP `read_native_memory`: latest verified content + revision metadata for
 /// one agent's monitored files (optionally narrowed to a single path suffix).
-pub fn read_native(conn: &Connection, home: &Path, agent: &str, path: Option<&str>) -> Result<Value> {
+pub fn read_native(
+    conn: &Connection,
+    home: &Path,
+    agent: &str,
+    path: Option<&str>,
+) -> Result<Value> {
     let files: Vec<Value> = db::list_memory_files(conn)?
         .into_iter()
         .filter(|f| f["agent"].as_str() == Some(agent))

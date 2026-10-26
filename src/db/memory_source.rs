@@ -22,7 +22,9 @@ pub fn link_memory_sources(conn: &Connection) -> Result<u64> {
              WHERE source_session_id IS NULL
                AND julianday(created_at) >= julianday('now') - ?1",
         )?;
-        let rows = stmt.query_map(params![LOOKBACK_DAYS], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        let rows = stmt.query_map(params![LOOKBACK_DAYS], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     if pending.is_empty() {
@@ -45,9 +47,14 @@ pub fn link_memory_sources(conn: &Connection) -> Result<u64> {
     )?;
     let mut linked = 0;
     for (rowid, project_id, content, created_at) in pending {
-        let Some(needle) = needle(&content) else { continue };
+        let Some(needle) = needle(&content) else {
+            continue;
+        };
         let hit: Option<(i64, String)> = find
-            .query_map(params![project_id, needle, created_at, BEFORE_DAYS, AFTER_DAYS], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(
+                params![project_id, needle, created_at, BEFORE_DAYS, AFTER_DAYS],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?
             .next()
             .transpose()?;
         if let Some((message_id, session_id)) = hit {
@@ -82,9 +89,15 @@ mod tests {
 
     #[test]
     fn needle_skips_escaped_characters() {
-        assert_eq!(needle("登录 token 由前端保存在 localStorage，接口通过 Authorization 头鉴权").as_deref(),
-                   Some("登录 token 由前端保存在 localSto"));
-        assert_eq!(needle("短\n这一行才足够长，可以用来匹配").as_deref(), Some("这一行才足够长，可以用来匹配"));
+        assert_eq!(
+            needle("登录 token 由前端保存在 localStorage，接口通过 Authorization 头鉴权")
+                .as_deref(),
+            Some("登录 token 由前端保存在 localSto")
+        );
+        assert_eq!(
+            needle("短\n这一行才足够长，可以用来匹配").as_deref(),
+            Some("这一行才足够长，可以用来匹配")
+        );
         assert_eq!(needle("太短"), None);
     }
 }

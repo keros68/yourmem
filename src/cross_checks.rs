@@ -43,7 +43,8 @@ fn scalar(raw: &str) -> String {
         return String::new();
     }
     if value.starts_with('"') {
-        return serde_json::from_str::<String>(value).unwrap_or_else(|_| value.trim_matches('"').to_string());
+        return serde_json::from_str::<String>(value)
+            .unwrap_or_else(|_| value.trim_matches('"').to_string());
     }
     if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
         return value[1..value.len() - 1].replace("''", "'");
@@ -71,7 +72,9 @@ fn parse_header(header: &str) -> Option<TraceMeta> {
             }
             continue;
         }
-        let Some((key, raw)) = line.split_once(':') else { continue };
+        let Some((key, raw)) = line.split_once(':') else {
+            continue;
+        };
         let key = key.trim();
         if key.is_empty() || key.starts_with('#') || line.starts_with([' ', '\t']) {
             in_materials = false;
@@ -88,10 +91,22 @@ fn parse_header(header: &str) -> Option<TraceMeta> {
             values.insert(key, vec![scalar(raw)]);
         }
     }
-    if !closed || values.get("schema").and_then(|v| v.first()).map(String::as_str) != Some("aicross-dispatch/1") {
+    if !closed
+        || values
+            .get("schema")
+            .and_then(|v| v.first())
+            .map(String::as_str)
+            != Some("aicross-dispatch/1")
+    {
         return None;
     }
-    let get = |key: &str| values.get(key).and_then(|v| v.first()).cloned().unwrap_or_default();
+    let get = |key: &str| {
+        values
+            .get(key)
+            .and_then(|v| v.first())
+            .cloned()
+            .unwrap_or_default()
+    };
     let meta = TraceMeta {
         run_id: get("run_id"),
         role: get("role"),
@@ -134,15 +149,30 @@ fn read_trace(path: &Path) -> Option<(TraceMeta, String)> {
 }
 
 fn known_projects(conn: &Connection, home: &Path) -> Result<Vec<(i64, String)>> {
-    let mut stmt = conn.prepare("SELECT id, path, archived_at FROM projects ORDER BY archived_at IS NOT NULL, id")?;
-    let projects = stmt.query_map([], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
-    })?.collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, path, archived_at FROM projects ORDER BY archived_at IS NOT NULL, id",
+    )?;
+    let projects = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut by_path = HashMap::new();
     for (id, path, _) in &projects {
-        by_path.entry(db::path_key(path)).or_insert((*id, path.clone()));
+        by_path
+            .entry(db::path_key(path))
+            .or_insert((*id, path.clone()));
     }
-    fn push_root(roots: &mut Vec<(i64, String)>, seen: &mut HashSet<(i64, String)>, id: i64, root: String) {
+    fn push_root(
+        roots: &mut Vec<(i64, String)>,
+        seen: &mut HashSet<(i64, String)>,
+        id: i64,
+        root: String,
+    ) {
         if seen.insert((id, db::path_key(&root))) {
             roots.push((id, root));
         }
@@ -155,7 +185,8 @@ fn known_projects(conn: &Connection, home: &Path) -> Result<Vec<(i64, String)>> 
         }
     };
     let mut stmt = conn.prepare("SELECT DISTINCT cwd FROM sessions WHERE cwd IS NOT NULL")?;
-    let cwds = stmt.query_map([], |r| r.get::<_, String>(0))?
+    let cwds = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     for cwd in cwds {
         let (root, _) = db::project_root_for_conn(conn, &cwd)?;
@@ -172,13 +203,19 @@ fn known_projects(conn: &Connection, home: &Path) -> Result<Vec<(i64, String)>> 
     // 项目合并后记录改挂父项目，但原文件仍在子目录；从记录自身恢复扫描根。
     let trace_paths = {
         let mut stmt = conn.prepare("SELECT DISTINCT project_id, path FROM cross_checks")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     };
     for (id, path) in trace_paths {
         if let Some(root) = Path::new(&path).parent().and_then(Path::parent) {
-            push_root(&mut roots, &mut seen, id, root.to_string_lossy().to_string());
+            push_root(
+                &mut roots,
+                &mut seen,
+                id,
+                root.to_string_lossy().to_string(),
+            );
         }
     }
     Ok(roots)
@@ -209,7 +246,10 @@ pub fn collect(conn: &Connection, home: &Path) -> Result<CollectOutcome> {
                 };
                 let path = entry.path();
                 if !entry.file_type().map(|t| t.is_file()).unwrap_or(false)
-                    || !path.extension().map(|e| e.eq_ignore_ascii_case("md")).unwrap_or(false)
+                    || !path
+                        .extension()
+                        .map(|e| e.eq_ignore_ascii_case("md"))
+                        .unwrap_or(false)
                 {
                     continue;
                 }
@@ -222,17 +262,21 @@ pub fn collect(conn: &Connection, home: &Path) -> Result<CollectOutcome> {
         }
         let existing = {
             let mut stmt = conn.prepare("SELECT path FROM cross_checks WHERE project_id = ?1")?;
-            let rows = stmt.query_map([project_id], |r| r.get::<_, String>(0))?
+            let rows = stmt
+                .query_map([project_id], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             rows
         };
         let tx = conn.unchecked_transaction()?;
         for (path, meta, hash) in traces {
             outcome.files_seen += 1;
-            let old_hash = tx.query_row(
-                "SELECT header_hash FROM cross_checks WHERE project_id = ?1 AND path = ?2",
-                params![project_id, path], |r| r.get::<_, String>(0),
-            ).optional()?;
+            let old_hash = tx
+                .query_row(
+                    "SELECT header_hash FROM cross_checks WHERE project_id = ?1 AND path = ?2",
+                    params![project_id, path],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
             if old_hash.as_deref() == Some(&hash) {
                 continue;
             }
@@ -258,8 +302,11 @@ pub fn collect(conn: &Connection, home: &Path) -> Result<CollectOutcome> {
         }
         if complete {
             for path in existing.into_iter().filter(|p| {
-                let owner = known.iter()
-                    .filter(|(id, root)| id == project_id && crate::is_under_dir(p, Path::new(root)))
+                let owner = known
+                    .iter()
+                    .filter(|(id, root)| {
+                        id == project_id && crate::is_under_dir(p, Path::new(root))
+                    })
                     .max_by_key(|(_, root)| db::path_key(root).len())
                     .map(|(_, root)| db::path_key(root));
                 owner == Some(db::path_key(root)) && !disk_paths.contains(p)
@@ -282,26 +329,28 @@ pub fn for_project(conn: &Connection, project_id: i64) -> Result<Value> {
          FROM cross_checks WHERE project_id = ?1
          ORDER BY julianday(COALESCE(started_at, ended_at)) DESC, run_id DESC, id",
     )?;
-    let rows = stmt.query_map([project_id], |r| {
-        let materials = r.get::<_, String>(14)?;
-        Ok(json!({
-            "id": r.get::<_, i64>(0)?,
-            "run_id": r.get::<_, String>(1)?,
-            "path": r.get::<_, String>(2)?,
-            "role": r.get::<_, String>(3)?,
-            "agent": r.get::<_, String>(4)?,
-            "provider": r.get::<_, String>(5)?,
-            "model": r.get::<_, String>(6)?,
-            "vendor": r.get::<_, String>(7)?,
-            "visibility": r.get::<_, String>(8)?,
-            "isolation": r.get::<_, String>(9)?,
-            "identity": r.get::<_, String>(10)?,
-            "status": r.get::<_, String>(11)?,
-            "started_at": r.get::<_, String>(12)?,
-            "ended_at": r.get::<_, String>(13)?,
-            "materials": serde_json::from_str::<Vec<String>>(&materials).unwrap_or_default(),
-        }))
-    })?.collect::<std::result::Result<Vec<_>, _>>()?;
+    let rows = stmt
+        .query_map([project_id], |r| {
+            let materials = r.get::<_, String>(14)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "run_id": r.get::<_, String>(1)?,
+                "path": r.get::<_, String>(2)?,
+                "role": r.get::<_, String>(3)?,
+                "agent": r.get::<_, String>(4)?,
+                "provider": r.get::<_, String>(5)?,
+                "model": r.get::<_, String>(6)?,
+                "vendor": r.get::<_, String>(7)?,
+                "visibility": r.get::<_, String>(8)?,
+                "isolation": r.get::<_, String>(9)?,
+                "identity": r.get::<_, String>(10)?,
+                "status": r.get::<_, String>(11)?,
+                "started_at": r.get::<_, String>(12)?,
+                "ended_at": r.get::<_, String>(13)?,
+                "materials": serde_json::from_str::<Vec<String>>(&materials).unwrap_or_default(),
+            }))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut groups: Vec<Value> = Vec::new();
     let mut indices = HashMap::new();
     for row in rows {
@@ -310,7 +359,10 @@ pub fn for_project(conn: &Connection, project_id: i64) -> Result<Value> {
             groups.push(json!({ "run_id": run_id, "checks": [] }));
             groups.len() - 1
         });
-        groups[index]["checks"].as_array_mut().expect("checks is an array").push(row);
+        groups[index]["checks"]
+            .as_array_mut()
+            .expect("checks is an array")
+            .push(row);
     }
     Ok(Value::Array(groups))
 }
@@ -321,7 +373,8 @@ mod tests {
 
     #[test]
     fn parses_real_shaped_front_matter_without_reading_a_verdict() {
-        let meta = parse_header(include_str!("../tests/fixtures/dispatch/blind-review.md")).unwrap();
+        let meta =
+            parse_header(include_str!("../tests/fixtures/dispatch/blind-review.md")).unwrap();
         assert_eq!(meta.run_id, "run-blind-20260913");
         assert_eq!(meta.role, "风险审查");
         assert_eq!(meta.model, "model-luna");

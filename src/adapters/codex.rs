@@ -9,7 +9,6 @@ use serde_json::Value;
 
 use crate::models::{MessageKind, NewArtifact, NewMessage, ParseOutput, SessionMetaPatch};
 
-
 pub fn parse_lines(lines: &[(u64, String)], prior_saw_response_items: bool) -> ParseOutput {
     let mut output = ParseOutput::default();
     let meta = &mut output.meta;
@@ -39,7 +38,10 @@ pub fn parse_lines(lines: &[(u64, String)], prior_saw_response_items: bool) -> P
             Ok(v) => v,
             Err(_) => continue,
         };
-        let ts = v.get("timestamp").and_then(Value::as_str).map(str::to_string);
+        let ts = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         track_ts(meta, ts.as_deref());
 
         let line_type = v.get("type").and_then(Value::as_str).unwrap_or("");
@@ -51,7 +53,8 @@ pub fn parse_lines(lines: &[(u64, String)], prior_saw_response_items: bool) -> P
                 }
             }
             "response_item" => parse_response_item(payload, *line_no, &ts, out, artifacts),
-            "event_msg" if !has_response_items => match payload.get("type").and_then(Value::as_str) {
+            "event_msg" if !has_response_items => match payload.get("type").and_then(Value::as_str)
+            {
                 Some("user_message") => {
                     if let Some(t) = payload.get("message").and_then(Value::as_str) {
                         push(out, *line_no, MessageKind::User, t.to_string(), ts);
@@ -113,7 +116,10 @@ fn parse_response_item(
             }
         }
         Some("function_call") | Some("custom_tool_call") | Some("local_shell_call") => {
-            let name = payload.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
             let args = payload
                 .get("arguments")
                 .or_else(|| payload.get("input"))
@@ -126,15 +132,63 @@ fn parse_response_item(
                         .or_else(|| line.strip_prefix("*** Update File: "))
                         .or_else(|| line.strip_prefix("*** Delete File: "))
                     {
-                        artifacts.push(NewArtifact { path: p.trim().to_string(), tool: name.to_string() });
+                        let operation = if line.starts_with("*** Add File:") {
+                            "create"
+                        } else if line.starts_with("*** Delete File:") {
+                            "delete"
+                        } else {
+                            "edit"
+                        };
+                        artifacts.push(NewArtifact {
+                            path: p.trim().to_string(),
+                            from_path: None,
+                            tool: name.to_string(),
+                            operation: operation.to_string(),
+                            native_tool_call_id: payload
+                                .get("call_id")
+                                .or_else(|| payload.get("id"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            timestamp: ts.clone(),
+                            line_no,
+                            ord: artifacts.iter().filter(|a| a.line_no == line_no).count() as u32,
+                        });
+                    } else if let Some(new_path) = line.strip_prefix("*** Move to: ") {
+                        if let Some(last) = artifacts.last_mut() {
+                            last.from_path = Some(std::mem::replace(
+                                &mut last.path,
+                                new_path.trim().to_string(),
+                            ));
+                            last.operation = "rename".into();
+                        }
                     }
                 }
             }
-            push(out, line_no, MessageKind::ToolCall, format!("{name}: {args}"), ts.clone());
+            push(
+                out,
+                line_no,
+                MessageKind::ToolCall,
+                format!("{name}: {args}"),
+                ts.clone(),
+            );
+            if let Some(last) = out.last_mut() {
+                last.native_tool_call_id = payload
+                    .get("call_id")
+                    .or_else(|| payload.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
         }
         Some("function_call_output") | Some("custom_tool_call_output") => {
             let text = payload.get("output").map(stringify).unwrap_or_default();
             push(out, line_no, MessageKind::ToolResult, text, ts.clone());
+            if let Some(last) = out.last_mut() {
+                last.native_tool_call_id = payload
+                    .get("call_id")
+                    .or_else(|| payload.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
         }
         Some("web_search_call") => {
             let q = payload
@@ -142,7 +196,13 @@ fn parse_response_item(
                 .and_then(|a| a.get("query"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            push(out, line_no, MessageKind::ToolCall, format!("web_search: {q}"), ts.clone());
+            push(
+                out,
+                line_no,
+                MessageKind::ToolCall,
+                format!("web_search: {q}"),
+                ts.clone(),
+            );
         }
         _ => {}
     }
@@ -167,7 +227,13 @@ fn stringify(v: &Value) -> String {
     }
 }
 
-fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, content: String, ts: Option<String>) {
+fn push(
+    out: &mut Vec<NewMessage>,
+    line_no: u64,
+    kind: MessageKind,
+    content: String,
+    ts: Option<String>,
+) {
     super::push_message(out, line_no, kind, content, ts, None);
 }
 
@@ -186,7 +252,10 @@ mod tests {
     use super::*;
 
     fn lines(raw: &[&str]) -> Vec<(u64, String)> {
-        raw.iter().enumerate().map(|(i, s)| ((i + 1) as u64, s.to_string())).collect()
+        raw.iter()
+            .enumerate()
+            .map(|(i, s)| ((i + 1) as u64, s.to_string()))
+            .collect()
     }
 
     #[test]
@@ -203,9 +272,23 @@ mod tests {
         let out = parse_lines(&input, false);
         assert_eq!(out.meta.cwd.as_deref(), Some("/tmp/proj"));
         let kinds: Vec<_> = out.messages.iter().map(|m| m.kind).collect();
-        assert_eq!(kinds, vec![MessageKind::User, MessageKind::Thinking, MessageKind::ToolCall, MessageKind::ToolResult]);
+        assert_eq!(
+            kinds,
+            vec![
+                MessageKind::User,
+                MessageKind::Thinking,
+                MessageKind::ToolCall,
+                MessageKind::ToolResult
+            ]
+        );
         // event_msg duplicate must not appear
-        assert_eq!(out.messages.iter().filter(|m| m.kind == MessageKind::User).count(), 1);
+        assert_eq!(
+            out.messages
+                .iter()
+                .filter(|m| m.kind == MessageKind::User)
+                .count(),
+            1
+        );
         assert_eq!(out.artifacts.len(), 1);
         assert_eq!(out.artifacts[0].path, "src/main.rs");
     }

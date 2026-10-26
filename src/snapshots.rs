@@ -353,9 +353,11 @@ pub fn create_within(home: &Path, wait: std::time::Duration) -> Result<Value> {
     } else {
         json!({"removed":0,"reclaimed_bytes":0})
     };
-    Ok(json!({"id":s.id,"new_objects":new_objects,"new_bytes":new_bytes,"repaired_objects":repaired,
+    Ok(
+        json!({"id":s.id,"new_objects":new_objects,"new_bytes":new_bytes,"repaired_objects":repaired,
         "auto_removed":cleaned["removed"],"auto_reclaimed_bytes":cleaned["reclaimed_bytes"],
-        "cleanup_error":cleanup_error}))
+        "cleanup_error":cleanup_error}),
+    )
 }
 fn inspect_db(repo: &Path, s: &Snapshot, tmp: &Path) -> Result<()> {
     decode(repo, &s.db_hash, tmp)?;

@@ -32,13 +32,20 @@ const WRITE_TOOLS: [&str; 2] = ["write_to_file", "replace_file_content"];
 
 /// 只认 `<brain>/<uuid>/.system_generated/logs/transcript_full.jsonl`。
 pub fn is_transcript(path: &Path) -> bool {
-    path.file_name().is_some_and(|n| n == "transcript_full.jsonl")
-        && path.parent().and_then(Path::file_name).is_some_and(|n| n == "logs")
+    path.file_name()
+        .is_some_and(|n| n == "transcript_full.jsonl")
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == "logs")
 }
 
 /// 会话 id = brain 下的目录名。
 pub fn native_id(path: &Path) -> Option<String> {
-    path.ancestors().nth(3)?.file_name().map(|n| n.to_string_lossy().to_string())
+    path.ancestors()
+        .nth(3)?
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
 }
 
 pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
@@ -47,25 +54,65 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
         let Ok(v) = serde_json::from_str::<Value>(raw) else {
             continue; // partial / corrupt line: vault still has it
         };
-        let ts = v.get("created_at").and_then(Value::as_str).map(str::to_string);
+        let ts = v
+            .get("created_at")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         if let Some(t) = ts.as_deref() {
             track_ts(&mut out.meta, t);
         }
         let text = |key: &str| v.get(key).and_then(Value::as_str).unwrap_or("");
         let msgs = &mut out.messages;
         match v.get("type").and_then(Value::as_str) {
-            Some("USER_INPUT") => push(msgs, *line_no, MessageKind::User, user_request(text("content")), &ts),
+            Some("USER_INPUT") => push(
+                msgs,
+                *line_no,
+                MessageKind::User,
+                user_request(text("content")),
+                &ts,
+            ),
             Some("PLANNER_RESPONSE") => {
                 push(msgs, *line_no, MessageKind::Thinking, text("thinking"), &ts);
                 push(msgs, *line_no, MessageKind::Assistant, text("content"), &ts);
-                for call in v.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+                for call in v
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
                     let name = call.get("name").and_then(Value::as_str).unwrap_or("?");
                     let args = decode_args(call.get("args"));
                     let display = serde_json::to_string(&args).unwrap_or_default();
-                    push(msgs, *line_no, MessageKind::ToolCall, &format!("[{name}] {display}"), &ts);
+                    push(
+                        msgs,
+                        *line_no,
+                        MessageKind::ToolCall,
+                        &format!("[{name}] {display}"),
+                        &ts,
+                    );
+                    if let Some(last) = msgs.last_mut() {
+                        last.native_tool_call_id =
+                            call.get("id").and_then(Value::as_str).map(str::to_string);
+                    }
                     if WRITE_TOOLS.contains(&name) {
                         if let Some(fp) = args.get("TargetFile").and_then(Value::as_str) {
-                            out.artifacts.push(NewArtifact { path: fp.to_string(), tool: name.to_string() });
+                            out.artifacts.push(NewArtifact {
+                                path: fp.to_string(),
+                                from_path: None,
+                                tool: name.to_string(),
+                                operation: "edit".to_string(),
+                                native_tool_call_id: call
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                timestamp: ts.clone(),
+                                line_no: *line_no,
+                                ord: out
+                                    .artifacts
+                                    .iter()
+                                    .filter(|a| a.line_no == *line_no)
+                                    .count() as u32,
+                            });
                         }
                     }
                     if name == "run_command" && out.meta.cwd.is_none() {
@@ -73,10 +120,30 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                     }
                 }
             }
-            Some("GENERIC") => push(msgs, *line_no, MessageKind::ToolResult, text("content"), &ts),
-            Some("SYSTEM_MESSAGE") => push(msgs, *line_no, MessageKind::System, text("content"), &ts),
+            Some("GENERIC") => {
+                push(
+                    msgs,
+                    *line_no,
+                    MessageKind::ToolResult,
+                    text("content"),
+                    &ts,
+                );
+                if let Some(last) = msgs.last_mut() {
+                    last.native_tool_call_id = ["tool_call_id", "toolCallId", "toolUseId", "id"]
+                        .iter()
+                        .find_map(|key| v.get(*key).and_then(Value::as_str))
+                        .map(str::to_string);
+                }
+            }
+            Some("SYSTEM_MESSAGE") => {
+                push(msgs, *line_no, MessageKind::System, text("content"), &ts)
+            }
             Some("ERROR_MESSAGE") => {
-                let body = if text("content").is_empty() { text("error") } else { text("content") };
+                let body = if text("content").is_empty() {
+                    text("error")
+                } else {
+                    text("content")
+                };
                 push(msgs, *line_no, MessageKind::System, body, &ts);
             }
             Some("CHECKPOINT") => {
@@ -105,7 +172,10 @@ fn decode_args(args: Option<&Value>) -> Value {
     let decoded: Map<String, Value> = map
         .iter()
         .map(|(k, v)| {
-            let d = v.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or_else(|| v.clone());
+            let d = v
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or_else(|| v.clone());
             (k.clone(), d)
         })
         .collect();
@@ -125,14 +195,24 @@ pub fn enrich_meta_from_history(meta: &SessionMetaPatch, transcript: &Path) -> S
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .find(|v| v.get("conversationId").and_then(Value::as_str) == Some(id.as_str()))
-        .and_then(|v| v.get("workspace").and_then(Value::as_str).map(str::to_string));
+        .and_then(|v| {
+            v.get("workspace")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
     if workspace.is_some() {
         meta.cwd = workspace;
     }
     meta
 }
 
-fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, text: &str, ts: &Option<String>) {
+fn push(
+    out: &mut Vec<NewMessage>,
+    line_no: u64,
+    kind: MessageKind,
+    text: &str,
+    ts: &Option<String>,
+) {
     super::push_message(out, line_no, kind, text.to_string(), ts.clone(), None);
 }
 

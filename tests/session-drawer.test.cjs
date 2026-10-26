@@ -132,3 +132,12 @@ test('opening a session shows the last page and pages back to earlier messages',
   assert.equal(f.requests.at(-1).command,'session_window');
   assert.equal(f.requests.at(-1).args.offset,600);
 });
+
+test('session-local steps stay visible outside the project task board', async () => {
+  const f=fixture();
+  const open=f.drawer.showSession('A');
+  f.requests[0].resolve({...data('A'),messages:[],task_steps:[{content:'实现接口',status:'in_progress',source_line_no:9,observed_at:'2026-10-25'}]});
+  await open;
+  assert.match(f.content.innerHTML,/执行步骤（Agent Todo \/ plan，不是项目任务）/);
+  assert.match(f.content.innerHTML,/实现接口/);
+});

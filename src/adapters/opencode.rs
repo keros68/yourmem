@@ -19,10 +19,13 @@ use crate::vault;
 
 pub const AGENT_OPENCODE: &str = "opencode";
 
-
 pub fn default_db_path() -> PathBuf {
     // Windows 布局未验证（无真实样本，拿到样本再改），用 YOUMEM_OPENCODE_DB 覆盖。
-    crate::home_dir().join(".local").join("share").join("opencode").join("opencode.db")
+    crate::home_dir()
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db")
 }
 
 #[derive(Default)]
@@ -53,9 +56,8 @@ pub fn import(conn: &mut Connection, home: &Path, db_path: &Path) -> Result<Open
     src.busy_timeout(std::time::Duration::from_secs(5))?;
 
     let sessions: Vec<OcSession> = {
-        let mut stmt = src.prepare(
-            "SELECT id, parent_id, directory, time_created, time_updated FROM session",
-        )?;
+        let mut stmt = src
+            .prepare("SELECT id, parent_id, directory, time_created, time_updated FROM session")?;
         let rows = stmt.query_map([], |r| {
             Ok(OcSession {
                 id: r.get(0)?,
@@ -185,7 +187,16 @@ fn import_session(
     // 对象先于引用它的清单行落盘（对象库独立提交），一次打开整批写入
     let hashes = vault::Store::open(home)?.put_many(units.iter().map(|(_, raw)| raw.as_slice()))?;
     let tx = conn.transaction()?;
-    db::upsert_session(&tx, &session_key, AGENT_OPENCODE, native_id, project_id, &src_key, &meta, messages.len() as u64)?;
+    db::upsert_session(
+        &tx,
+        &session_key,
+        AGENT_OPENCODE,
+        native_id,
+        project_id,
+        &src_key,
+        &meta,
+        messages.len() as u64,
+    )?;
     db::insert_messages(&tx, &session_key, &messages)?;
     db::insert_artifacts(&tx, &session_key, project_id, &artifacts)?;
 
@@ -212,7 +223,18 @@ fn import_session(
         params![session_key],
     )?;
 
-    db::update_source_file(&tx, &src_key, AGENT_OPENCODE, max_ts as u64, line_no, Some(&max_id))?;
+    db::update_source_file(
+        &tx,
+        &src_key,
+        AGENT_OPENCODE,
+        max_ts as u64,
+        line_no,
+        Some(&max_id),
+    )?;
+    crate::work::infer_artifact_outcomes(&tx, &session_key)?;
+    crate::work::process_session_evidence(&tx, &session_key)?;
+    crate::work::record_session_steps(&tx, &session_key)?;
+    crate::work::mark_session_evidence_processed(&tx, &session_key)?;
     tx.commit()?;
     Ok((messages.len() as u64, units.len() as u64))
 }
@@ -229,7 +251,11 @@ fn parse_part(
     let ts = iso.clone();
     match part.get("type").and_then(Value::as_str) {
         Some("text") => {
-            let kind = if role == "user" { MessageKind::User } else { MessageKind::Assistant };
+            let kind = if role == "user" {
+                MessageKind::User
+            } else {
+                MessageKind::Assistant
+            };
             if let Some(t) = part.get("text").and_then(Value::as_str) {
                 push(out, line_no, kind, t.to_string(), ts);
             }
@@ -241,25 +267,94 @@ fn parse_part(
         }
         Some("tool") => {
             let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
-            let input = part.pointer("/state/input").map(compact).unwrap_or_default();
-            push(out, line_no, MessageKind::ToolCall, format!("{tool}: {input}"), ts.clone());
+            let input = part
+                .pointer("/state/input")
+                .map(compact)
+                .unwrap_or_default();
+            push(
+                out,
+                line_no,
+                MessageKind::ToolCall,
+                format!("{tool}: {input}"),
+                ts.clone(),
+            );
+            if let Some(last) = out.last_mut() {
+                last.native_tool_call_id = part
+                    .get("callID")
+                    .or_else(|| part.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
             if let Some(file_path) = part
                 .pointer("/state/input/filePath")
                 .or_else(|| part.pointer("/state/input/file_path"))
                 .and_then(Value::as_str)
             {
-                if matches!(tool, "write" | "edit" | "multiedit" | "apply_patch" | "Write" | "Edit") {
-                    artifacts.push(NewArtifact { path: file_path.to_string(), tool: tool.to_string() });
+                if matches!(
+                    tool,
+                    "write" | "edit" | "multiedit" | "apply_patch" | "Write" | "Edit"
+                ) {
+                    artifacts.push(NewArtifact {
+                        path: file_path.to_string(),
+                        from_path: None,
+                        tool: tool.to_string(),
+                        operation: if tool.eq_ignore_ascii_case("write") {
+                            "create"
+                        } else {
+                            "edit"
+                        }
+                        .to_string(),
+                        native_tool_call_id: part
+                            .get("callID")
+                            .or_else(|| part.get("id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        timestamp: ts.clone(),
+                        line_no,
+                        ord: artifacts.iter().filter(|a| a.line_no == line_no).count() as u32,
+                    });
                 }
             }
             if let Some(output) = part.pointer("/state/output").and_then(Value::as_str) {
-                push(out, line_no, MessageKind::ToolResult, output.to_string(), ts);
+                push(
+                    out,
+                    line_no,
+                    MessageKind::ToolResult,
+                    output.to_string(),
+                    ts,
+                );
+                if let Some(last) = out.last_mut() {
+                    last.native_tool_call_id = part
+                        .get("callID")
+                        .or_else(|| part.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    last.tool_success = match part.pointer("/state/status").and_then(Value::as_str)
+                    {
+                        Some("completed" | "success") => Some(true),
+                        Some("error" | "failed") => Some(false),
+                        _ => None,
+                    };
+                }
             }
         }
         Some("patch") => {
             if let Some(files) = part.get("files").and_then(Value::as_array) {
                 for f in files.iter().filter_map(Value::as_str) {
-                    artifacts.push(NewArtifact { path: f.to_string(), tool: "patch".to_string() });
+                    artifacts.push(NewArtifact {
+                        path: f.to_string(),
+                        from_path: None,
+                        tool: "patch".to_string(),
+                        operation: "edit".to_string(),
+                        native_tool_call_id: part
+                            .get("callID")
+                            .or_else(|| part.get("id"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        timestamp: ts.clone(),
+                        line_no,
+                        ord: artifacts.iter().filter(|a| a.line_no == line_no).count() as u32,
+                    });
                 }
             }
         }
@@ -267,7 +362,13 @@ fn parse_part(
     }
 }
 
-fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, content: String, ts: Option<String>) {
+fn push(
+    out: &mut Vec<NewMessage>,
+    line_no: u64,
+    kind: MessageKind,
+    content: String,
+    ts: Option<String>,
+) {
     super::push_message(out, line_no, kind, content, ts, None);
 }
 
@@ -318,9 +419,16 @@ mod tests {
         assert_eq!(outcome.messages_added, 4);
 
         // searchable
-        let hits = db::search(&conn, &db::SearchOpts {
-            query: "内涝".into(), project: None, agent: Some("opencode".into()), kind: None, limit: 10,
-        })
+        let hits = db::search(
+            &conn,
+            &db::SearchOpts {
+                query: "内涝".into(),
+                project: None,
+                agent: Some("opencode".into()),
+                kind: None,
+                limit: 10,
+            },
+        )
         .unwrap();
         assert_eq!(hits.len(), 1);
 

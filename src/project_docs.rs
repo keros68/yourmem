@@ -32,7 +32,10 @@ const PROGRESS_NAMES: [&str; 4] = ["progress.md", "handoff.md", "handsoff.md", "
 pub fn root_candidates(tracked: &[(String, String)], root: &str) -> Vec<(String, PathBuf, bool)> {
     let root_path = Path::new(root);
     let mut out = Vec::new();
-    for (agent, name) in [(crate::adapters::AGENT_CLAUDE, "CLAUDE.md"), (crate::adapters::AGENT_CODEX, "AGENTS.md")] {
+    for (agent, name) in [
+        (crate::adapters::AGENT_CLAUDE, "CLAUDE.md"),
+        (crate::adapters::AGENT_CODEX, "AGENTS.md"),
+    ] {
         let p = root_path.join(name);
         if p.is_file() && inside_root(root_path, &p) {
             out.push((agent.to_string(), p, false));
@@ -69,7 +72,10 @@ pub fn root_candidates(tracked: &[(String, String)], root: &str) -> Vec<(String,
 
 /// 只由普通路径段组成（无 ..、盘符、根）。
 fn is_plain_rel(rel: &str) -> bool {
-    !rel.is_empty() && Path::new(rel).components().all(|c| matches!(c, Component::Normal(_)))
+    !rel.is_empty()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
 }
 
 /// 文件（解析符号链接后）仍位于项目根目录内。文件不存在时视为在内——
@@ -89,7 +95,12 @@ pub fn tracked(home: &Path) -> Vec<(String, String)> {
         .cloned()
         .unwrap_or_default()
         .iter()
-        .filter_map(|v| Some((v["project"].as_str()?.to_string(), v["path"].as_str()?.to_string())))
+        .filter_map(|v| {
+            Some((
+                v["project"].as_str()?.to_string(),
+                v["path"].as_str()?.to_string(),
+            ))
+        })
         .collect()
 }
 
@@ -103,7 +114,9 @@ fn normalize_rel(root: &str, input: &str) -> Result<String> {
     let rel = if p.is_absolute() {
         let (pk, rk) = (db::path_key(input), db::path_key(root));
         let sep = if cfg!(windows) { '\\' } else { '/' };
-        let rest = pk.strip_prefix(&rk).filter(|r| r.starts_with(sep))
+        let rest = pk
+            .strip_prefix(&rk)
+            .filter(|r| r.starts_with(sep))
             .ok_or_else(|| anyhow::anyhow!("文件不在项目目录内：{input}"))?;
         // 取原输入的同长度尾段，保留原有大小写
         input[input.len() - rest.len() + 1..].to_string()
@@ -116,7 +129,11 @@ fn normalize_rel(root: &str, input: &str) -> Result<String> {
 }
 
 fn project_path(conn: &Connection, project_id: i64) -> Result<String> {
-    Ok(conn.query_row("SELECT path FROM projects WHERE id = ?1", params![project_id], |r| r.get(0))?)
+    Ok(conn.query_row(
+        "SELECT path FROM projects WHERE id = ?1",
+        params![project_id],
+        |r| r.get(0),
+    )?)
 }
 
 /// 登记项比对：项目与相对路径都按路径键（Windows 不区分大小写与分隔符）。
@@ -129,22 +146,32 @@ pub fn track(conn: &Connection, home: &Path, project_id: i64, input: &str) -> Re
     let root = project_path(conn, project_id)?;
     let rel = normalize_rel(&root, input)?;
     let abs = Path::new(&root).join(&rel);
-    let meta = std::fs::metadata(&abs).map_err(|_| anyhow::anyhow!("文件不存在：{}", abs.display()))?;
+    let meta =
+        std::fs::metadata(&abs).map_err(|_| anyhow::anyhow!("文件不存在：{}", abs.display()))?;
     anyhow::ensure!(meta.is_file(), "不是文件：{}", abs.display());
-    anyhow::ensure!(meta.len() <= MAX_DOC_BYTES, "文件超过 1 MiB，不适合作为进度文档跟踪");
-    anyhow::ensure!(inside_root(Path::new(&root), &abs), "文件链接到项目目录之外：{rel}");
+    anyhow::ensure!(
+        meta.len() <= MAX_DOC_BYTES,
+        "文件超过 1 MiB，不适合作为进度文档跟踪"
+    );
+    anyhow::ensure!(
+        inside_root(Path::new(&root), &abs),
+        "文件链接到项目目录之外：{rel}"
+    );
     // 已被自动识别的文件不重复登记
     let abs_key = db::path_key(&abs.to_string_lossy());
-    let auto = root_candidates(&[], &root).iter().any(|(_, p, _)| db::path_key(&p.to_string_lossy()) == abs_key);
-    let exists = auto || ingest::update_config(home, |cfg| {
-        let mut list = cfg["tracked_docs"].as_array().cloned().unwrap_or_default();
-        if list.iter().any(|v| same_entry(v, &root, &rel)) {
-            return Ok(true);
-        }
-        list.push(json!({ "project": root, "path": rel }));
-        cfg["tracked_docs"] = Value::Array(list);
-        Ok(false)
-    })?;
+    let auto = root_candidates(&[], &root)
+        .iter()
+        .any(|(_, p, _)| db::path_key(&p.to_string_lossy()) == abs_key);
+    let exists = auto
+        || ingest::update_config(home, |cfg| {
+            let mut list = cfg["tracked_docs"].as_array().cloned().unwrap_or_default();
+            if list.iter().any(|v| same_entry(v, &root, &rel)) {
+                return Ok(true);
+            }
+            list.push(json!({ "project": root, "path": rel }));
+            cfg["tracked_docs"] = Value::Array(list);
+            Ok(false)
+        })?;
     Ok(json!({ "ok": true, "project": root, "path": rel, "already_tracked": exists }))
 }
 
@@ -153,7 +180,11 @@ pub fn untrack(conn: &Connection, home: &Path, project_id: i64, input: &str) -> 
     let rel = normalize_rel(&root, input)?;
     ingest::update_config(home, |cfg| {
         let list = cfg["tracked_docs"].as_array().cloned().unwrap_or_default();
-        let kept: Vec<Value> = list.iter().filter(|v| !same_entry(v, &root, &rel)).cloned().collect();
+        let kept: Vec<Value> = list
+            .iter()
+            .filter(|v| !same_entry(v, &root, &rel))
+            .cloned()
+            .collect();
         anyhow::ensure!(kept.len() < list.len(), "未登记该文件：{rel}");
         cfg["tracked_docs"] = Value::Array(kept);
         Ok(())
@@ -163,7 +194,10 @@ pub fn untrack(conn: &Connection, home: &Path, project_id: i64, input: &str) -> 
 
 fn mtime_iso(path: &Path) -> Option<String> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    Some(chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    Some(
+        chrono::DateTime::<chrono::Utc>::from(modified)
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
 }
 
 /// 项目文档状态：每个候选文件的最后更新时间、备份修订数、写过它的对话、
@@ -177,12 +211,26 @@ pub fn status(conn: &Connection, home: &Path, project_id: i64) -> Result<Value> 
     for (agent, abs, manual) in root_candidates(&tracked(home), &root) {
         let abs_str = abs.to_string_lossy().to_string();
         let key = db::path_key(&abs_str);
-        let rel = abs.strip_prefix(&root).unwrap_or(&abs).to_string_lossy().replace('\\', "/");
-        let backup = backups.iter()
+        let rel = abs
+            .strip_prefix(&root)
+            .unwrap_or(&abs)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let backup = backups
+            .iter()
             .filter(|f| f["path"].as_str().map(db::path_key).as_deref() == Some(key.as_str()))
             .max_by(|a, b| a["updated_at"].as_str().cmp(&b["updated_at"].as_str()));
         let exists = abs.is_file();
         let too_large = std::fs::metadata(&abs).map_or(false, |m| m.len() > MAX_DOC_BYTES);
+        let collection_error = conn
+            .query_row(
+                "SELECT value FROM work_meta WHERE key=?1",
+                [crate::memfiles::collection_state_key(&abs)],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+            .and_then(|value| value["error"].as_str().map(str::to_string));
         let last_updated = mtime_iso(&abs)
             .or_else(|| backup.and_then(|f| f["updated_at"].as_str().map(str::to_string)));
 
@@ -199,14 +247,19 @@ pub fn status(conn: &Connection, home: &Path, project_id: i64) -> Result<Value> 
             )?,
             None => 0,
         };
-        let days_since = last_updated.as_deref()
+        let days_since = last_updated
+            .as_deref()
             .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
             .map(|t| (now - t.with_timezone(&chrono::Utc)).num_days());
         let stale = exists
             && (sessions_since >= STALE_SESSIONS
                 || (days_since.unwrap_or(0) >= STALE_DAYS && sessions_since >= 1));
 
-        let edited: Vec<&Value> = writes.iter().filter(|(k, _)| *k == key).map(|(_, v)| v).collect();
+        let edited: Vec<&Value> = writes
+            .iter()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, v)| v)
+            .collect();
         docs.push(json!({
             "name": rel,
             "path": abs_str,
@@ -214,6 +267,7 @@ pub fn status(conn: &Connection, home: &Path, project_id: i64) -> Result<Value> 
             "manual": manual,
             "exists": exists,
             "too_large": too_large,
+            "collection_error": collection_error,
             "file_id": backup.map(|f| f["id"].clone()),
             "revisions": backup.map(|f| f["revisions"].clone()).unwrap_or(json!(0)),
             "last_updated": last_updated,
@@ -296,14 +350,26 @@ mod tests {
     fn normalize_rel_rejects_escape_and_accepts_inside_absolute() {
         assert!(normalize_rel("/p/x", "../secret.md").is_err());
         assert!(normalize_rel("/p/x", "").is_err());
-        assert_eq!(normalize_rel("/p/x", "docs\\plan.md").unwrap(), "docs/plan.md");
+        assert_eq!(
+            normalize_rel("/p/x", "docs\\plan.md").unwrap(),
+            "docs/plan.md"
+        );
         if cfg!(unix) {
-            assert_eq!(normalize_rel("/p/x", "/p/x/docs/plan.md").unwrap(), "docs/plan.md");
+            assert_eq!(
+                normalize_rel("/p/x", "/p/x/docs/plan.md").unwrap(),
+                "docs/plan.md"
+            );
             assert_eq!(normalize_rel("/p/x", "/p/x/plan.md/").unwrap(), "plan.md");
             assert!(normalize_rel("/p/x", "/p/xy/plan.md").is_err());
         } else {
-            assert_eq!(normalize_rel(r"D:\p\x", r"d:\P\x\docs\plan.md").unwrap(), "docs/plan.md");
-            assert_eq!(normalize_rel(r"D:\p\x", r"D:\p\x\plan.md\").unwrap(), "plan.md");
+            assert_eq!(
+                normalize_rel(r"D:\p\x", r"d:\P\x\docs\plan.md").unwrap(),
+                "docs/plan.md"
+            );
+            assert_eq!(
+                normalize_rel(r"D:\p\x", r"D:\p\x\plan.md\").unwrap(),
+                "plan.md"
+            );
             assert!(normalize_rel(r"D:\p\x", r"D:\p\xy\plan.md").is_err());
         }
     }

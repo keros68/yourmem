@@ -9,7 +9,11 @@ use serde_json::{json, Value};
 use crate::{db, ingest::ImportLockTx};
 
 pub fn purge_cli(
-    conn: &mut Connection, home: &Path, id: &str, force: bool, keep_archive: bool,
+    conn: &mut Connection,
+    home: &Path,
+    id: &str,
+    force: bool,
+    keep_archive: bool,
     confirm: impl FnOnce(&Value) -> Result<()>,
 ) -> Result<Value> {
     let _lock = ImportLockTx::acquire(home, Duration::from_secs(30))?;
@@ -27,7 +31,12 @@ pub fn purge_desktop(conn: &mut Connection, home: &Path, id: &str, force: bool) 
     Ok(result)
 }
 
-pub fn purge_selected(conn: &mut Connection, home: &Path, ids: &[String], force: bool) -> Result<Value> {
+pub fn purge_selected(
+    conn: &mut Connection,
+    home: &Path,
+    ids: &[String],
+    force: bool,
+) -> Result<Value> {
     let _lock = ImportLockTx::acquire(home, Duration::from_secs(120))?;
     let _ = db::log_usage(conn, "app", "trash purge selected");
     let mut purged = 0usize;
@@ -53,7 +62,9 @@ fn sweep_and_drop(conn: &Connection, home: &Path) -> Result<()> {
 }
 
 pub fn empty_cli(
-    conn: &mut Connection, home: &Path, confirm: impl FnOnce(&Value) -> Result<()>,
+    conn: &mut Connection,
+    home: &Path,
+    confirm: impl FnOnce(&Value) -> Result<()>,
 ) -> Result<Value> {
     empty_overdue(conn, home, Duration::from_secs(30), false, false, confirm)
 }
@@ -67,21 +78,34 @@ pub fn empty_on_startup(conn: &mut Connection, home: &Path) -> Result<Value> {
 }
 
 fn empty_overdue(
-    conn: &mut Connection, home: &Path, timeout: Duration, sweep_after: bool, log: bool,
+    conn: &mut Connection,
+    home: &Path,
+    timeout: Duration,
+    sweep_after: bool,
+    log: bool,
     confirm: impl FnOnce(&Value) -> Result<()>,
 ) -> Result<Value> {
     let _lock = ImportLockTx::acquire(home, timeout)?;
     db::gc_sweep(conn, home)?;
-    if log { let _ = db::log_usage(conn, "app", "trash empty"); }
+    if log {
+        let _ = db::log_usage(conn, "app", "trash empty");
+    }
     let plan = db::trash_overdue_plan(conn, home)?;
-    let ids: Vec<String> = plan["overdue_ids"].as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+    let ids: Vec<String> = plan["overdue_ids"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     if ids.is_empty() {
         return Ok(json!({ "purged_sessions": 0, "note": "回收站没有超期会话" }));
     }
     confirm(&plan)?;
     let result = db::purge_trash(conn, home, &ids)?;
-    if sweep_after { db::gc_sweep(conn, home)?; }
+    if sweep_after {
+        db::gc_sweep(conn, home)?;
+    }
     Ok(result)
 }

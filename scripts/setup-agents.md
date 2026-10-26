@@ -20,12 +20,13 @@ MCP 注册只解决"能用"，这段指令解决"知道什么时候该用"。实
 不要静默推翻；重新引入已被取代或归档的方案时，先说明当初被否的原因。
 
 - `search_history`：搜所有 agent（Codex/Claude/OpenCode/ZCode/Kimi/Hermes）的历史会话，命中后用 `read_session` 钻取
-- `get_project_context` / `get_recent_work`：项目背景、已确认记忆、最新 handoff、待办
+- `get_project_context` / `list_tasks` / `get_task_context`：项目背景与持久任务节点；开始或换对话时读取，读取不会自动关联会话
 - `read_native_memory`：查你自己 memory 文件（MEMORY.md / AGENTS.md）的历史版本与修订
 - `save_memory`：重要决定/规则/待办主动记录（decision/rule 会进入待确认队列）；
   保存前注意结果里的 similar 提示——疑似重复时更新/取代旧条而非再存一条；
   decision 写清问题、决定理由、被否方案与后果；lesson/preference 写清 Why 与 How to apply；git/代码/CLAUDE.md 已记录的不存
-- `create_handoff`：一段工作收尾时写交接，注明 session_id
+- `create_handoff`：不属于特定任务的普通工作也可写交接；`get_recent_work` 可查看近期工作
+- `close_work`：一段任务收尾时写任务交接并取得一次性 claim token；紧接着把 token 传给 `get_task_context`，让原生工具记录可认领会话。不知道 session_id 时不要编造；无法自动认领时请用户用桌面或 CLI 显式关联。自报完成不等于验证通过
 
 科研写入时机：定下分析方法或参数、某个数值或图表定稿、回应审稿意见的处理决定、放弃某条路线时，
 用 `save_memory` 的 decision 模板记录，被否方案一栏写明放弃的路线与否决原因。

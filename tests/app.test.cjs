@@ -21,6 +21,8 @@ function app() {
   vm.runInContext(ui('session-drawer.js').replace('export function', 'function'), context);
   vm.runInContext(ui('project-recall.js').replace('export async function', 'async function'), context);
   vm.runInContext(ui('graph-layout.js').replaceAll('export function', 'function'), context);
+  vm.runInContext(ui('project-workspace.js').replaceAll('export function', 'function').replace('const option =', 'const workspaceOption =').replaceAll('option(', 'workspaceOption('), context);
+  vm.runInContext(ui('asset-governance.js').replaceAll('export function', 'function').replace('const option =', 'const governanceOption =').replaceAll('option(', 'governanceOption('), context);
   const bundleCode = ui('app.js').slice(ui('app.js').indexOf('  let bundleBusy = false'), ui('app.js').indexOf('  $("#auto-purge").onchange'));
   vm.runInContext(ui('app.js').replace(/^import .*;\r?\n/gm, '') + '\nfunction bindBundleForTest() { ' + bundleCode + ' }\nglobalThis.testApp = { fmtTime, refreshAfterCollect, renderToday, foldSubtasks, bindBundleForTest, renderSearch, renderMemory, renderProjects, projectMergeSummary, crossChecksHtml, armButton, memoryGraphHtml, lineageGraphHtml, bindMemoryGraph, showActivityAi, showProjectAi, setMemoryView: v => { memView = v; } };', context);
   return { ...context.testApp, context, get, lists, requests, notices };

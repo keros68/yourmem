@@ -13,7 +13,7 @@ use std::sync::{
 };
 use tauri::{Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
-use yourmem::{data_home, db};
+use yourmem::{data_home, db, work};
 
 mod tray;
 
@@ -111,7 +111,11 @@ fn open_in_finder(path: String, reveal: Option<bool>) -> Result<Value, String> {
     } else if cfg!(target_os = "linux") {
         let mut c = std::process::Command::new("xdg-open");
         if reveal {
-            c.arg(std::path::Path::new(&p).parent().unwrap_or(std::path::Path::new(&p)));
+            c.arg(
+                std::path::Path::new(&p)
+                    .parent()
+                    .unwrap_or(std::path::Path::new(&p)),
+            );
         } else {
             c.arg(&p);
         }
@@ -124,7 +128,8 @@ fn open_in_finder(path: String, reveal: Option<bool>) -> Result<Value, String> {
         c.arg(&p);
         c
     };
-    cmd.spawn().map_err(|e| format!("打开文件管理器失败：{e}"))?;
+    cmd.spawn()
+        .map_err(|e| format!("打开文件管理器失败：{e}"))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -134,6 +139,377 @@ fn context(project_id: i64) -> Result<Value, String> {
     let mut d = db::project_context(&conn, project_id).map_err(|e| e.to_string())?;
     d["project_docs"] = yourmem::project_docs::attach(&conn, &data_home(), project_id);
     Ok(d)
+}
+
+// ------------------------------------------------ 项目任务与工作资产
+
+fn desktop_task_id(
+    conn: &rusqlite::Connection,
+    ident: &str,
+    project_id: Option<i64>,
+) -> Result<String, String> {
+    work::resolve_task(conn, ident, project_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_tasks(
+    project_id: Option<i64>,
+    status: Option<String>,
+    agent: Option<String>,
+) -> Result<Value, String> {
+    let conn = open()?;
+    let mut tasks = work::list_tasks(&conn, project_id, status.as_deref(), agent.as_deref(), 200)
+        .map_err(|e| e.to_string())?;
+    for task in &mut tasks {
+        let id = task["id"].as_str().unwrap_or("").to_string();
+        let mut sessions = conn.prepare("SELECT DISTINCT s.agent FROM task_sessions ts JOIN sessions s ON s.id=ts.session_id WHERE ts.task_id=?1 AND ts.state='active' ORDER BY s.agent").map_err(|e| e.to_string())?;
+        let agents = sessions
+            .query_map([&id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        task["agents"] = json!(agents);
+        task["session_count"] = conn.query_row("SELECT COUNT(DISTINCT session_id) FROM task_sessions WHERE task_id=?1 AND state='active'", [&id], |r| r.get::<_,i64>(0)).map_err(|e| e.to_string())?.into();
+        let current_passed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM task_verifications v LEFT JOIN messages m ON m.id=v.source_message_id WHERE v.task_id=?1 AND v.kind IN ('test','manual') AND v.result='passed' AND NOT EXISTS(SELECT 1 FROM artifact_events a JOIN task_sessions ts ON ts.session_id=a.session_id WHERE ts.task_id=v.task_id AND ts.state='active' AND COALESCE(julianday(a.occurred_at),julianday(a.observed_at))>COALESCE(julianday(m.timestamp),julianday(v.created_at))))", [&id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let stale_passed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM task_verifications v LEFT JOIN messages m ON m.id=v.source_message_id WHERE v.task_id=?1 AND v.kind IN ('test','manual') AND v.result='passed' AND EXISTS(SELECT 1 FROM artifact_events a JOIN task_sessions ts ON ts.session_id=a.session_id WHERE ts.task_id=v.task_id AND ts.state='active' AND COALESCE(julianday(a.occurred_at),julianday(a.observed_at))>COALESCE(julianday(m.timestamp),julianday(v.created_at))))", [&id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let failed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM task_verifications WHERE task_id=?1 AND kind IN ('test','manual') AND result='failed')", [&id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let (text, class) = if current_passed {
+            ("已验证", "verified")
+        } else if stale_passed {
+            ("验证早于后续修改", "stale")
+        } else if failed {
+            ("验证失败", "failed")
+        } else if task["status"] == "completed" && task["status_source"] == "agent_reported" {
+            ("Agent 自报完成 · 未验证", "unverified")
+        } else {
+            ("未验证", "unverified")
+        };
+        task["verification"] = json!({"text":text,"className":class,"verified":current_passed});
+    }
+    let mut stmt = conn.prepare(
+        "SELECT p.id,p.task_id,p.proposed_status,p.created_at,t.alias FROM task_state_proposals p
+         JOIN (SELECT id,project_id,task_no,'P-' || task_no AS alias FROM tasks) t ON t.id=p.task_id
+         WHERE p.status='pending' AND (?1 IS NULL OR t.project_id=?1) ORDER BY p.created_at",
+    ).map_err(|e| e.to_string())?;
+    let proposals = stmt.query_map([project_id], |r| Ok(json!({
+        "id":r.get::<_,String>(0)?,"task_id":r.get::<_,String>(1)?,
+        "proposed_status":r.get::<_,String>(2)?,"created_at":r.get::<_,String>(3)?,"alias":r.get::<_,String>(4)?
+    }))).map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
+    Ok(
+        json!({"tasks":tasks,"proposals":proposals,"merge_conflicts":work::merge_conflicts(&conn,true).map_err(|e|e.to_string())?,"claims":work::pending_claims(&conn,project_id).map_err(|e|e.to_string())?}),
+    )
+}
+
+#[tauri::command]
+fn work_claim_resolve(claim_id: String, session_id: String) -> Result<Value, String> {
+    work::resolve_claim(&open()?, &claim_id, &session_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_merge_resolve(conflict_id: String, choice: String) -> Result<Value, String> {
+    work::resolve_merge_conflict(&open()?, &conflict_id, &choice).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_task_create(
+    project_id: i64,
+    title: String,
+    session_id: Option<String>,
+    allow_duplicates: Option<bool>,
+) -> Result<Value, String> {
+    work::create_task(
+        &open()?,
+        project_id,
+        &title,
+        session_id.as_deref(),
+        allow_duplicates.unwrap_or(false),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_task(task_id: String, project_id: Option<i64>) -> Result<Value, String> {
+    let conn = open()?;
+    let id = desktop_task_id(&conn, &task_id, project_id)?;
+    work::task(&conn, &id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_task_context(task_id: String, project_id: Option<i64>) -> Result<Value, String> {
+    let conn = open()?;
+    let id = desktop_task_id(&conn, &task_id, project_id)?;
+    work::task_context(&conn, &data_home(), &id, 100).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_task_update(
+    task_id: String,
+    project_id: Option<i64>,
+    title: Option<String>,
+    status: Option<String>,
+    expected_revision: Option<i64>,
+) -> Result<Value, String> {
+    let conn = open()?;
+    let id = desktop_task_id(&conn, &task_id, project_id)?;
+    work::update_task(
+        &conn,
+        &id,
+        title.as_deref(),
+        status.as_deref(),
+        expected_revision,
+        None,
+        true,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_task_continuation(task_id: String, project_id: Option<i64>) -> Result<Value, String> {
+    let conn = open()?;
+    let id = desktop_task_id(&conn, &task_id, project_id)?;
+    let context = work::task_context(&conn, &data_home(), &id, 20).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "task_id":id,"task":context["task"],"continuation_prompt":context["continuation_prompt"],
+        "data_notice":context["data_notice"],"freshness":context["freshness"],
+        "starts_agent":false
+    }))
+}
+
+#[tauri::command]
+fn work_session_link(
+    task_id: String,
+    session_id: String,
+    relation: Option<String>,
+    project_id: Option<i64>,
+) -> Result<Value, String> {
+    let conn = open()?;
+    let id = desktop_task_id(&conn, &task_id, project_id)?;
+    work::link_session(
+        &conn,
+        &id,
+        &session_id,
+        relation.as_deref().unwrap_or("continuation"),
+        "user_confirmed",
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_session_unlink(
+    task_id: String,
+    session_id: String,
+    project_id: Option<i64>,
+) -> Result<Value, String> {
+    let conn = open()?;
+    let id = desktop_task_id(&conn, &task_id, project_id)?;
+    work::unlink_session(&conn, &id, &session_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_proposal_resolve(proposal_id: String, accept: bool) -> Result<Value, String> {
+    work::resolve_proposal(&open()?, &proposal_id, accept).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_timeline(
+    project_id: Option<i64>,
+    task_id: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    kinds: Option<Vec<String>>,
+    cursor: Option<String>,
+    limit: Option<i64>,
+) -> Result<Value, String> {
+    let conn = open()?;
+    let resolved = task_id
+        .map(|id| desktop_task_id(&conn, &id, project_id))
+        .transpose()?;
+    work::timeline(
+        &conn,
+        project_id,
+        resolved.as_deref(),
+        from.as_deref(),
+        to.as_deref(),
+        &kinds.unwrap_or_default(),
+        cursor.as_deref(),
+        limit.unwrap_or(100),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_project_records(project_id: i64) -> Result<Value, String> {
+    Ok(json!({"records":work::project_records(&open()?, project_id).map_err(|e| e.to_string())?}))
+}
+
+#[tauri::command]
+fn work_record_pin(
+    project_id: i64,
+    record_kind: String,
+    record_id: String,
+) -> Result<Value, String> {
+    work::pin_record(&open()?, project_id, &record_kind, &record_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_manual_verification(
+    task_id: String,
+    result: String,
+    evidence: String,
+    project_id: Option<i64>,
+) -> Result<Value, String> {
+    let conn = open()?;
+    let id = desktop_task_id(&conn, &task_id, project_id)?;
+    work::add_verification(&conn, &id, "manual", &result, None, &evidence, true)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn work_task_link(
+    source_task_id: String,
+    target_task_id: String,
+    relation: String,
+    confirmed: Option<bool>,
+    project_id: Option<i64>,
+) -> Result<Value, String> {
+    let conn = open()?;
+    let source = desktop_task_id(&conn, &source_task_id, project_id)?;
+    let target = desktop_task_id(&conn, &target_task_id, project_id)?;
+    let source_project =
+        work::task(&conn, &source).map_err(|e| e.to_string())?["project_id"].as_i64();
+    let target_project =
+        work::task(&conn, &target).map_err(|e| e.to_string())?["project_id"].as_i64();
+    if source_project != target_project {
+        return Err("任务关系只支持同一项目内的任务".into());
+    }
+    work::add_task_link(
+        &conn,
+        &source,
+        &target,
+        &relation,
+        confirmed.unwrap_or(true),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn work_handoff_save(
+    project_id: i64,
+    task_id: Option<String>,
+    title: String,
+    done: Option<String>,
+    state: Option<String>,
+    decisions: Option<String>,
+    files_changed: Option<String>,
+    open_issues: Option<String>,
+    next_steps: Option<String>,
+    session_id: Option<String>,
+) -> Result<Value, String> {
+    let conn = open()?;
+    let resolved = task_id
+        .map(|id| desktop_task_id(&conn, &id, Some(project_id)))
+        .transpose()?;
+    let fields = db::HandoffFields {
+        title: &title,
+        done: done.as_deref().unwrap_or(""),
+        state: state.as_deref().unwrap_or(""),
+        decisions: decisions.as_deref().unwrap_or(""),
+        files_changed: files_changed.as_deref().unwrap_or(""),
+        open_issues: open_issues.as_deref().unwrap_or(""),
+        next_steps: next_steps.as_deref().unwrap_or(""),
+        session_id: session_id.as_deref(),
+    };
+    work::create_handoff(&conn, project_id, &fields, resolved.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn labels() -> Result<Value, String> {
+    let conn = open()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT l.id,l.name,l.scope,l.project_id,p.name,l.created_at,COUNT(ml.memory_id)
+         FROM labels l LEFT JOIN projects p ON p.id=l.project_id
+         LEFT JOIN memory_labels ml ON ml.label_id=l.id
+         GROUP BY l.id ORDER BY l.scope,l.name",
+        )
+        .map_err(|e| e.to_string())?;
+    let labels = stmt.query_map([], |r| Ok(json!({
+        "id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"scope":r.get::<_,String>(2)?,
+        "project_id":r.get::<_,Option<i64>>(3)?,"project":r.get::<_,Option<String>>(4)?,
+        "created_at":r.get::<_,String>(5)?,"memory_count":r.get::<_,i64>(6)?
+    }))).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
+    Ok(json!({"labels":labels}))
+}
+
+#[tauri::command]
+fn label_create(name: String, scope: String, project_id: Option<i64>) -> Result<Value, String> {
+    work::create_label(&open()?, &name, &scope, project_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn label_attach(memory_id: String, label_id: String) -> Result<Value, String> {
+    work::label_memory(&open()?, &memory_id, &label_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn label_merge(from_label_id: String, to_label_id: String) -> Result<Value, String> {
+    work::merge_labels(&open()?, &from_label_id, &to_label_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn label_rename(label_id: String, name: String) -> Result<Value, String> {
+    work::rename_label(&open()?, &label_id, &name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn label_delete(label_id: String) -> Result<Value, String> {
+    work::delete_label(&open()?, &label_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn labels_export() -> Result<Value, String> {
+    let conn = open()?;
+    let mut stmt = conn.prepare(
+        "SELECT l.id,l.name,l.scope,l.project_id,p.name,l.created_at,m.id,m.content,m.type,m.status
+         FROM labels l LEFT JOIN projects p ON p.id=l.project_id
+         LEFT JOIN memory_labels ml ON ml.label_id=l.id LEFT JOIN memories m ON m.id=ml.memory_id
+         ORDER BY l.name,m.id",
+    ).map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], |r| Ok(json!({
+        "label_id":r.get::<_,String>(0)?,"label":r.get::<_,String>(1)?,"scope":r.get::<_,String>(2)?,
+        "project_id":r.get::<_,Option<i64>>(3)?,"project":r.get::<_,Option<String>>(4)?,"created_at":r.get::<_,String>(5)?,
+        "memory_id":r.get::<_,Option<String>>(6)?,"memory":r.get::<_,Option<String>>(7)?,
+        "memory_type":r.get::<_,Option<String>>(8)?,"memory_status":r.get::<_,Option<String>>(9)?
+    }))).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
+    let dir = yourmem::backups_dir(&data_home()).join("export");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!(
+        "memory-labels-{}.json",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({"labels":rows})).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(json!({"path":path,"format":"json"}))
+}
+
+#[tauri::command]
+fn preference_revise(
+    id: String,
+    content: String,
+    expected_updated_at: Option<String>,
+) -> Result<Value, String> {
+    if content.trim().is_empty() {
+        return Err("偏好内容不能为空".into());
+    }
+    let conn = open()?;
+    let replacement = db::revise_preference(&conn, &id, &content, expected_updated_at.as_deref())
+        .map_err(|e| e.to_string())?;
+    Ok(json!({"memory_id":replacement,"superseded":id}))
 }
 
 #[tauri::command]
@@ -147,12 +523,14 @@ fn project_dossier(project_id: i64) -> Result<Value, String> {
 
 #[tauri::command]
 fn project_doc_track(project_id: i64, path: String) -> Result<Value, String> {
-    yourmem::project_docs::track(&open()?, &data_home(), project_id, &path).map_err(|e| e.to_string())
+    yourmem::project_docs::track(&open()?, &data_home(), project_id, &path)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn project_doc_untrack(project_id: i64, path: String) -> Result<Value, String> {
-    yourmem::project_docs::untrack(&open()?, &data_home(), project_id, &path).map_err(|e| e.to_string())
+    yourmem::project_docs::untrack(&open()?, &data_home(), project_id, &path)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -162,7 +540,8 @@ async fn daily_digest(day: Option<String>) -> Result<Value, String> {
         let _ = db::log_usage(&conn, "app", "digest");
         let day = day.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
         yourmem::dossier::daily_digest(&conn, &day).map_err(|e| e.to_string())
-    }).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -179,7 +558,8 @@ async fn daily_digest_export(day: Option<String>) -> Result<Value, String> {
             .map_err(|e| format!("写入日报失败：{e}"))?;
         let _ = db::log_usage(&conn, "app", "digest_export");
         Ok(json!({ "path": path }))
-    }).await
+    })
+    .await
 }
 
 // ------------------------------------------------ 可选 AI 整理（API key 只进系统凭据库）
@@ -230,7 +610,11 @@ async fn ai_settings_save(
     clear_key: Option<bool>,
 ) -> Result<Value, String> {
     run_blocking(move || {
-        let settings = yourmem::organizer::AiSettings { base_url, model, max_input_chars };
+        let settings = yourmem::organizer::AiSettings {
+            base_url,
+            model,
+            max_input_chars,
+        };
         yourmem::organizer::validate_settings(&settings).map_err(|e| e.to_string())?;
         if clear_key.unwrap_or(false) {
             match ai_key_entry()?.delete_credential() {
@@ -238,7 +622,8 @@ async fn ai_settings_save(
                 Err(e) => return Err(format!("移除 API Key 失败：{e}")),
             }
         } else if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
-            ai_key_entry()?.set_password(key.trim())
+            ai_key_entry()?
+                .set_password(key.trim())
                 .map_err(|e| format!("保存 API Key 失败：{e}"))?;
         }
         yourmem::organizer::save_settings(&data_home(), &settings).map_err(|e| e.to_string())?;
@@ -261,7 +646,8 @@ async fn ai_organize_day(day: Option<String>) -> Result<Value, String> {
         out["day"] = json!(day);
         let _ = db::log_usage(&conn, "app", "ai_organize_day");
         Ok(out)
-    }).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -271,12 +657,14 @@ async fn ai_organize_project(project_id: i64) -> Result<Value, String> {
         let settings = yourmem::organizer::load_settings(&home);
         let (key, _) = ai_key_from_store()?.ok_or_else(|| "尚未配置 API Key".to_string())?;
         let conn = db::open(&home).map_err(|e| e.to_string())?;
-        let activity = yourmem::dossier::project_activity(&conn, project_id).map_err(|e| e.to_string())?;
+        let activity =
+            yourmem::dossier::project_activity(&conn, project_id).map_err(|e| e.to_string())?;
         let out = yourmem::organizer::organize_with_api(&settings, &key, &activity)
             .map_err(|e| format!("{e:#}"))?;
         let _ = db::log_usage(&conn, "app", "ai_organize_project");
         Ok(out)
-    }).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -300,12 +688,26 @@ async fn sessions(project_id: Option<i64>, limit: Option<u32>) -> Result<Value, 
 }
 
 #[tauri::command]
-fn session_window(session_id: String, line: Option<i64>, offset: Option<u32>, message_id: Option<i64>, before_compact: Option<bool>) -> Result<Value, String> {
+fn session_window(
+    session_id: String,
+    line: Option<i64>,
+    offset: Option<u32>,
+    message_id: Option<i64>,
+    before_compact: Option<bool>,
+) -> Result<Value, String> {
     let conn = open()?;
     if line.is_none() && offset.is_none() && message_id.is_none() {
         let _ = db::log_usage(&conn, "app", "session");
     }
-    db::session_window(&conn, &session_id, line, offset, message_id, before_compact.unwrap_or(false)).map_err(|e| e.to_string())
+    db::session_window(
+        &conn,
+        &session_id,
+        line,
+        offset,
+        message_id,
+        before_compact.unwrap_or(false),
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -315,7 +717,10 @@ fn message_content(session_id: String, message_id: i64) -> Result<Value, String>
 
 // ------------------------------------- 资产证明卡（UI-DESIGN §3，0.4.1）
 
-fn session_agent_path(conn: &rusqlite::Connection, session_id: &str) -> Result<(String, String), String> {
+fn session_agent_path(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<(String, String), String> {
     conn.query_row(
         "SELECT agent, file_path FROM sessions WHERE id = ?1",
         rusqlite::params![session_id],
@@ -331,12 +736,14 @@ async fn session_proof(session_id: String) -> Result<Value, String> {
         let home = data_home();
         let conn = open()?;
         let (agent, file_path) = session_agent_path(&conn, &session_id)?;
-        let mut p = yourmem::vault::session_proof(&conn, &home, &session_id).map_err(|e| e.to_string())?;
+        let mut p =
+            yourmem::vault::session_proof(&conn, &home, &session_id).map_err(|e| e.to_string())?;
         p["agent"] = json!(agent);
         p["file_path"] = json!(file_path);
         p["source_exists"] = json!(std::path::Path::new(&file_path).is_file());
         // 写回仅限文件型 agent（restore::FILE_BASED_AGENTS）——SQLite 型不给入口
-        p["writeback_supported"] = json!(yourmem::restore::FILE_BASED_AGENTS.contains(&agent.as_str()));
+        p["writeback_supported"] =
+            json!(yourmem::restore::FILE_BASED_AGENTS.contains(&agent.as_str()));
         Ok(p)
     })
     .await
@@ -389,7 +796,8 @@ async fn session_writeback(session_id: String, force: bool) -> Result<Value, Str
         let conn = open()?;
         let _ = db::log_usage(&conn, "app", "session writeback");
         let (agent, _) = session_agent_path(&conn, &session_id)?;
-        yourmem::restore::execute(&conn, &home, &agent, &session_id, force).map_err(|e| e.to_string())
+        yourmem::restore::execute(&conn, &home, &agent, &session_id, force)
+            .map_err(|e| e.to_string())
     })
     .await
 }
@@ -435,7 +843,8 @@ async fn trash_purge(session_id: String, force: Option<bool>) -> Result<Value, S
     run_blocking(move || {
         let home = data_home();
         let mut conn = db::open(&home).map_err(|e| e.to_string())?;
-        yourmem::trash::purge_desktop(&mut conn, &home, &session_id, force.unwrap_or(false)).map_err(|e| e.to_string())
+        yourmem::trash::purge_desktop(&mut conn, &home, &session_id, force.unwrap_or(false))
+            .map_err(|e| e.to_string())
     })
     .await
 }
@@ -447,7 +856,8 @@ async fn trash_purge_selected(ids: Vec<String>, force: Option<bool>) -> Result<V
     run_blocking(move || {
         let home = data_home();
         let mut conn = db::open(&home).map_err(|e| e.to_string())?;
-        yourmem::trash::purge_selected(&mut conn, &home, &ids, force.unwrap_or(false)).map_err(|e| e.to_string())
+        yourmem::trash::purge_selected(&mut conn, &home, &ids, force.unwrap_or(false))
+            .map_err(|e| e.to_string())
     })
     .await
 }
@@ -479,7 +889,8 @@ fn auto_purge_set(enabled: bool) -> Result<Value, String> {
     yourmem::ingest::update_config(&home, |cfg| {
         cfg["auto_purge_trash"] = json!(enabled);
         Ok(())
-    }).map_err(|e| e.to_string())?;
+    })
+    .map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true, "auto_purge_trash": enabled }))
 }
 
@@ -497,7 +908,9 @@ fn first_run_state() -> Result<Value, String> {
         .then(|| suggest_storage_dir("yourmem-data"))
         .flatten()
         .filter(|_| !cfg!(target_os = "macos"));
-    let suggested_backup = first_run.then(|| suggest_storage_dir("yourmem-backup")).flatten();
+    let suggested_backup = first_run
+        .then(|| suggest_storage_dir("yourmem-backup"))
+        .flatten();
     let agents = if first_run {
         yourmem::setup::detected_setup_agents(&yourmem::setup::Targets::default())
     } else {
@@ -514,7 +927,11 @@ fn first_run_state() -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn first_run_configure(data_path: String, backup_path: String, agents: Vec<String>) -> Result<Value, String> {
+async fn first_run_configure(
+    data_path: String,
+    backup_path: String,
+    agents: Vec<String>,
+) -> Result<Value, String> {
     run_blocking(move || {
         let data = std::path::PathBuf::from(data_path.trim());
         let backup = std::path::PathBuf::from(backup_path.trim());
@@ -522,15 +939,26 @@ async fn first_run_configure(data_path: String, backup_path: String, agents: Vec
         if !valid(&data) || !valid(&backup) {
             return Err("核心数据和备份都必须选择非磁盘根目录的绝对路径".into());
         }
-        let key = |p: &std::path::Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+        let key = |p: &std::path::Path| {
+            p.to_string_lossy()
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_lowercase()
+        };
         let dk = key(&data);
         let bk = key(&backup);
-        if dk == bk || dk.starts_with(&(bk.clone() + "\\")) || bk.starts_with(&(dk.clone() + "\\")) {
+        if dk == bk || dk.starts_with(&(bk.clone() + "\\")) || bk.starts_with(&(dk.clone() + "\\"))
+        {
             return Err("核心数据与备份位置不能相同或互相包含".into());
         }
         let nonempty = |p: &std::path::Path| -> Result<bool, String> {
-            if !p.exists() { return Ok(false); }
-            Ok(std::fs::read_dir(p).map_err(|e| e.to_string())?.next().is_some())
+            if !p.exists() {
+                return Ok(false);
+            }
+            Ok(std::fs::read_dir(p)
+                .map_err(|e| e.to_string())?
+                .next()
+                .is_some())
         };
         if nonempty(&data)? || nonempty(&backup)? {
             return Err("核心数据和备份都需要选择空目录".into());
@@ -538,7 +966,9 @@ async fn first_run_configure(data_path: String, backup_path: String, agents: Vec
         std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&backup).map_err(|e| e.to_string())?;
         let probe = backup.join(format!(".write-test-{}", std::process::id()));
-        std::fs::write(&probe, b"yourmem").and_then(|_| std::fs::remove_file(&probe)).map_err(|e| e.to_string())?;
+        std::fs::write(&probe, b"yourmem")
+            .and_then(|_| std::fs::remove_file(&probe))
+            .map_err(|e| e.to_string())?;
         let cfg = json!({
             "backup_dir": backup,
             "index_tool_output": false,
@@ -574,7 +1004,10 @@ fn suggest_storage_dir(name: &str) -> Option<String> {
         // 单盘系统，没有"非系统盘"概念：核心数据默认 ~/.yourmem 已合适，
         // 这里只给备份一个家目录下独立文件夹的建议（快照/导出与数据物理分开）。
         // 返回绝对路径（home_dir 展开后的原文），向导不做 ~ 展开。
-        let home = yourmem::home_dir().to_string_lossy().trim_end_matches('/').to_string();
+        let home = yourmem::home_dir()
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string();
         return Some(format!("{home}/{name}"));
     }
     if !cfg!(target_os = "windows") {
@@ -632,7 +1065,11 @@ mod tests {
             pick_suggestion(&letters(&["C:", "D:", "E:"]), "C:", "yourmem-backup"),
             Some("D:\\yourmem-backup".into())
         );
-        assert_eq!(pick_suggestion(&letters(&["C:"]), "C:", "yourmem-backup"), None, "只有系统盘不建议");
+        assert_eq!(
+            pick_suggestion(&letters(&["C:"]), "C:", "yourmem-backup"),
+            None,
+            "只有系统盘不建议"
+        );
         assert_eq!(
             pick_suggestion(&letters(&["C:", "c:", "D:"]), "C:", "yourmem-backup"),
             Some("D:\\yourmem-backup".into()),
@@ -718,9 +1155,7 @@ fn open_url(url: String) -> Result<Value, String> {
         return Err(format!("只支持打开 http(s) 链接"));
     }
     if cfg!(target_os = "windows") {
-        std::process::Command::new("explorer")
-            .arg(url)
-            .spawn()
+        std::process::Command::new("explorer").arg(url).spawn()
     } else if cfg!(target_os = "linux") {
         std::process::Command::new("xdg-open").arg(url).spawn()
     } else {
@@ -736,15 +1171,26 @@ fn open_url(url: String) -> Result<Value, String> {
 async fn backup_dir_pick(window: tauri::WebviewWindow, path: String) -> Result<Value, String> {
     use tauri_plugin_dialog::DialogExt;
     run_blocking(move || {
-        let mut dialog = window.dialog().file().set_title("选择文件夹").set_parent(&window);
+        let mut dialog = window
+            .dialog()
+            .file()
+            .set_title("选择文件夹")
+            .set_parent(&window);
         let initial = std::path::PathBuf::from(yourmem::expand_home(path.trim()));
         if initial.is_absolute() && initial.is_dir() {
             dialog = dialog.set_directory(initial);
         }
-        dialog.blocking_pick_folder()
-            .map(|p| p.into_path().map(|p| p.to_string_lossy().into_owned()).map_err(|e| e.to_string()))
-            .transpose().map(|path| json!(path))
-    }).await
+        dialog
+            .blocking_pick_folder()
+            .map(|p| {
+                p.into_path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()
+            .map(|path| json!(path))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -759,23 +1205,43 @@ fn backup_dir_get() -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn bundle_path_pick(window: tauri::WebviewWindow, path: String, save: bool) -> Result<Value, String> {
+async fn bundle_path_pick(
+    window: tauri::WebviewWindow,
+    path: String,
+    save: bool,
+) -> Result<Value, String> {
     use tauri_plugin_dialog::DialogExt;
     run_blocking(move || {
-        let mut dialog = window.dialog().file().set_parent(&window)
-            .set_title(if save { "选择备份保存位置" } else { "选择完整备份" })
+        let mut dialog = window
+            .dialog()
+            .file()
+            .set_parent(&window)
+            .set_title(if save {
+                "选择备份保存位置"
+            } else {
+                "选择完整备份"
+            })
             .add_filter("yourmem 备份", &["gz"]);
         let initial = std::path::PathBuf::from(yourmem::expand_home(path.trim()));
         if let Some(parent) = initial.parent().filter(|p| p.is_absolute() && p.is_dir()) {
             dialog = dialog.set_directory(parent);
         }
         if save {
-            if let Some(name) = initial.file_name() { dialog = dialog.set_file_name(name.to_string_lossy()); }
+            if let Some(name) = initial.file_name() {
+                dialog = dialog.set_file_name(name.to_string_lossy());
+            }
         }
-        let selected = if save { dialog.blocking_save_file() } else { dialog.blocking_pick_file() };
-        selected.map(|p| p.into_path().map_err(|e| e.to_string()))
-            .transpose().map(|p| json!(p))
-    }).await
+        let selected = if save {
+            dialog.blocking_save_file()
+        } else {
+            dialog.blocking_pick_file()
+        };
+        selected
+            .map(|p| p.into_path().map_err(|e| e.to_string()))
+            .transpose()
+            .map(|p| json!(p))
+    })
+    .await
 }
 
 /// 设置备份位置：空串 = 回到默认（数据目录下的 backups）。已有备份先迁移并
@@ -792,14 +1258,19 @@ async fn backup_dir_set(path: String) -> Result<Value, String> {
 /// 启动时若开关开启则静默清一次超期项（尽力而为，失败只记 stderr）。
 fn auto_purge_if_enabled() {
     let home = data_home();
-    if !yourmem::ingest::read_config(&home)["auto_purge_trash"].as_bool().unwrap_or(false) {
+    if !yourmem::ingest::read_config(&home)["auto_purge_trash"]
+        .as_bool()
+        .unwrap_or(false)
+    {
         return;
     }
     let r = (|| -> anyhow::Result<()> {
         let mut conn = db::open(&home)?;
         let r = yourmem::trash::empty_on_startup(&mut conn, &home)?;
         let n = r["purged_sessions"].as_u64().unwrap_or(0);
-        if n > 0 { eprintln!("yourmem app: 自动清理了 {} 个超期回收站会话", n); }
+        if n > 0 {
+            eprintln!("yourmem app: 自动清理了 {} 个超期回收站会话", n);
+        }
         Ok(())
     })();
     if let Err(e) = r {
@@ -808,42 +1279,69 @@ fn auto_purge_if_enabled() {
 }
 
 #[tauri::command]
-async fn search(query: String, project: Option<String>, agent: Option<String>, kind: Option<String>, limit: Option<u32>) -> Result<Value, String> {
+async fn search(
+    query: String,
+    project: Option<String>,
+    agent: Option<String>,
+    kind: Option<String>,
+    limit: Option<u32>,
+) -> Result<Value, String> {
     run_blocking(move || {
         let result = (|| {
             let conn = open()?;
             let _ = db::log_usage(&conn, "app", "search");
-            db::search(&conn, &db::SearchOpts {
-                query,
-                project,
-                agent,
-                kind,
-                limit: limit.unwrap_or(50),
-            })
+            db::search(
+                &conn,
+                &db::SearchOpts {
+                    query,
+                    project,
+                    agent,
+                    kind,
+                    limit: limit.unwrap_or(50),
+                },
+            )
             .map_err(|e| e.to_string())
         })();
-        yourmem::recall_status::record(&data_home(), "app", "search", result.is_ok(), result.as_ref().ok().map(|v| v.len() as u64));
+        yourmem::recall_status::record(
+            &data_home(),
+            "app",
+            "search",
+            result.is_ok(),
+            result.as_ref().ok().map(|v| v.len() as u64),
+        );
         Ok(json!({ "results": result? }))
     })
     .await
 }
 
 #[tauri::command]
-fn memories(project: Option<String>, status: Option<String>, r#type: Option<String>, scope: Option<String>, agent: Option<String>, limit: Option<u32>) -> Result<Value, String> {
+fn memories(
+    project: Option<String>,
+    status: Option<String>,
+    r#type: Option<String>,
+    scope: Option<String>,
+    agent: Option<String>,
+    limit: Option<u32>,
+) -> Result<Value, String> {
     let conn = open()?;
     let pid = match &project {
-        Some(p) => db::resolve_project(&conn, Some(p), None).map_err(|e| e.to_string())?.map(|x| x.0),
+        Some(p) => db::resolve_project(&conn, Some(p), None)
+            .map_err(|e| e.to_string())?
+            .map(|x| x.0),
         None => None,
     };
-    let mems = db::list_memories(&conn, &db::MemoryFilter {
-        project_id: pid,
-        scope,
-        r#type,
-        status,
-        agent,
-        include_global: pid.is_some(),
-        limit: limit.unwrap_or(200),
-    })
+    let mems = db::list_memories(
+        &conn,
+        &db::MemoryFilter {
+            project_id: pid,
+            scope,
+            r#type,
+            status,
+            agent,
+            include_global: pid.is_some(),
+            limit: limit.unwrap_or(200),
+        },
+    )
     .map_err(|e| e.to_string())?;
     Ok(json!({ "memories": mems }))
 }
@@ -852,38 +1350,54 @@ fn memories(project: Option<String>, status: Option<String>, r#type: Option<Stri
 
 #[tauri::command]
 async fn agents_detect() -> Result<Value, String> {
-    run_blocking(|| yourmem::ingest::agent_sources(&data_home(), &open()?).map_err(|e| e.to_string())).await
+    run_blocking(|| {
+        yourmem::ingest::agent_sources(&data_home(), &open()?).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 fn agent_add_root(agent: String, path: String) -> Result<Value, String> {
     let conn = open()?;
     let _ = db::log_usage(&conn, "app", "agent_add_root");
-    yourmem::ingest::add_extra_root(&data_home(), &agent, std::path::Path::new(&path)).map_err(|e| e.to_string())
+    yourmem::ingest::add_extra_root(&data_home(), &agent, std::path::Path::new(&path))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn agent_remove_root(agent: String, path: String) -> Result<Value, String> {
     let conn = open()?;
     let _ = db::log_usage(&conn, "app", "agent_remove_root");
-    yourmem::ingest::remove_extra_root(&data_home(), &agent, std::path::Path::new(&path)).map_err(|e| e.to_string())
+    yourmem::ingest::remove_extra_root(&data_home(), &agent, std::path::Path::new(&path))
+        .map_err(|e| e.to_string())
 }
 
 /// 手动新增记忆：与 CLI memory add 同一写入规则（决策/规则默认待确认，保存前查重提示）。
 #[tauri::command]
-async fn memory_add(project_id: Option<i64>, r#type: String, content: String) -> Result<Value, String> {
+async fn memory_add(
+    project_id: Option<i64>,
+    r#type: String,
+    content: String,
+) -> Result<Value, String> {
     run_blocking(move || {
         let conn = open()?;
-        let scope = if project_id.is_some() { "project" } else { "global" };
-        let (id, similar) = db::save_memory_with_similar(&conn, &db::MemoryInput {
-            project_id,
-            scope,
-            r#type: &r#type,
-            content: &content,
-            status: None,
-            source_session_id: None,
-            source_message_id: None,
-        })
+        let scope = if project_id.is_some() {
+            "project"
+        } else {
+            "global"
+        };
+        let (id, similar) = db::save_memory_with_similar(
+            &conn,
+            &db::MemoryInput {
+                project_id,
+                scope,
+                r#type: &r#type,
+                content: &content,
+                status: None,
+                source_session_id: None,
+                source_message_id: None,
+            },
+        )
         .map_err(|e| e.to_string())?;
         let _ = db::log_usage(&conn, "app", "memory_add");
         Ok(json!({
@@ -896,8 +1410,20 @@ async fn memory_add(project_id: Option<i64>, r#type: String, content: String) ->
 }
 
 #[tauri::command]
-fn update_memory(id: String, action: String, superseded_by: Option<String>) -> Result<Value, String> {
-    db::update_memory_status(&open()?, &id, &action, superseded_by.as_deref()).map_err(|e| e.to_string())?;
+fn update_memory(
+    id: String,
+    action: String,
+    superseded_by: Option<String>,
+    expected_updated_at: Option<String>,
+) -> Result<Value, String> {
+    db::update_memory_status_at(
+        &open()?,
+        &id,
+        &action,
+        superseded_by.as_deref(),
+        expected_updated_at.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true }))
 }
 
@@ -968,7 +1494,8 @@ async fn orphan_cleanup_plan() -> Result<Value, String> {
     run_blocking(|| {
         let home = data_home();
         yourmem::vault::orphan_cleanup_plan(&open()?, &home).map_err(|e| e.to_string())
-    }).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -976,7 +1503,8 @@ async fn orphan_cleanup_run(token: String) -> Result<Value, String> {
     run_blocking(move || {
         let home = data_home();
         yourmem::vault::orphan_cleanup(&open()?, &home, &token).map_err(|e| e.to_string())
-    }).await
+    })
+    .await
 }
 
 /// 整理数据库空闲页（VACUUM）：索引切换 / 大量删除后的磁盘回收。
@@ -1002,15 +1530,24 @@ async fn bundle_create(out: String) -> Result<Value, String> {
         let home = data_home();
         let conn = open()?;
         let _ = db::log_usage(&conn, "app", "bundle_create");
-        yourmem::bundle::create(&conn, &home, std::path::Path::new(&out), &yourmem::bundle::BundleFilter::default())
-            .map_err(|e| e.to_string())
+        yourmem::bundle::create(
+            &conn,
+            &home,
+            std::path::Path::new(&out),
+            &yourmem::bundle::BundleFilter::default(),
+        )
+        .map_err(|e| e.to_string())
     })
     .await
 }
 
 #[tauri::command]
 async fn bundle_verify(path: String) -> Result<Value, String> {
-    run_blocking(move || yourmem::bundle::restore_plan(std::path::Path::new(&path), &data_home()).map_err(|e| e.to_string())).await
+    run_blocking(move || {
+        yourmem::bundle::restore_plan(std::path::Path::new(&path), &data_home())
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// 从 bundle 恢复到当前库（merge=true 合并；false 要求库不存在——UI 里常态是合并）。
@@ -1018,7 +1555,8 @@ async fn bundle_verify(path: String) -> Result<Value, String> {
 async fn bundle_restore(path: String, merge: bool) -> Result<Value, String> {
     run_blocking(move || {
         let home = data_home();
-        let restored = yourmem::bundle::restore(std::path::Path::new(&path), &home, merge).map_err(|e| format!("{e:#}"))?;
+        let restored = yourmem::bundle::restore(std::path::Path::new(&path), &home, merge)
+            .map_err(|e| format!("{e:#}"))?;
         if let Ok(conn) = open() {
             let _ = db::log_usage(&conn, "app", "bundle_restore");
         }
@@ -1028,8 +1566,31 @@ async fn bundle_restore(path: String, merge: bool) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn bundle_restore_config(
+    path: String,
+    path_mappings: std::collections::HashMap<String, String>,
+    overwrite_existing: bool,
+) -> Result<Value, String> {
+    run_blocking(move || {
+        let home = data_home();
+        yourmem::bundle::restore_config(
+            std::path::Path::new(&path),
+            &home,
+            &path_mappings,
+            overwrite_existing,
+        )
+        .map_err(|e| format!("{e:#}"))
+    })
+    .await
+}
+
+#[tauri::command]
 async fn setup_plan(agents: Vec<String>) -> Result<Value, String> {
-    run_blocking(move || yourmem::setup::plan_selected(&yourmem::setup::Targets::default(), &agents).map_err(|e| e.to_string())).await
+    run_blocking(move || {
+        yourmem::setup::plan_selected(&yourmem::setup::Targets::default(), &agents)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1037,9 +1598,14 @@ async fn project_review(project_id: i64, mark_reviewed: Option<bool>) -> Result<
     run_blocking(move || {
         let conn = open()?;
         let home = data_home();
-        if mark_reviewed.unwrap_or(false) { yourmem::project_review::mark_reviewed(&conn, &home, project_id) }
-        else { yourmem::project_review::status(&conn, &home, project_id) }.map_err(|e| e.to_string())
-    }).await
+        if mark_reviewed.unwrap_or(false) {
+            yourmem::project_review::mark_reviewed(&conn, &home, project_id)
+        } else {
+            yourmem::project_review::status(&conn, &home, project_id)
+        }
+        .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// UI 侧的"确认"由前端二次确认按钮承担（门控语义不变：预览→确认→备份→执行）。
@@ -1048,7 +1614,8 @@ async fn setup_run(agents: Vec<String>) -> Result<Value, String> {
     run_blocking(move || {
         let conn = open()?;
         let _ = db::log_usage(&conn, "app", "setup_run");
-        yourmem::setup::execute_selected(&yourmem::setup::Targets::default(), &agents).map_err(|e| e.to_string())
+        yourmem::setup::execute_selected(&yourmem::setup::Targets::default(), &agents)
+            .map_err(|e| e.to_string())
     })
     .await
 }
@@ -1059,27 +1626,48 @@ fn all_setup_agents() -> Vec<String> {
 
 #[tauri::command]
 async fn disconnect_plan() -> Result<Value, String> {
-    run_blocking(|| yourmem::setup::remove_plan_selected(&yourmem::setup::Targets::default(), &all_setup_agents()).map_err(|e| e.to_string())).await
+    run_blocking(|| {
+        yourmem::setup::remove_plan_selected(
+            &yourmem::setup::Targets::default(),
+            &all_setup_agents(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn disconnect_run() -> Result<Value, String> {
-    run_blocking(|| yourmem::setup::remove_execute_selected(&yourmem::setup::Targets::default(), &all_setup_agents()).map_err(|e| e.to_string())).await
+    run_blocking(|| {
+        yourmem::setup::remove_execute_selected(
+            &yourmem::setup::Targets::default(),
+            &all_setup_agents(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn local_cleanup_plan(include_backups: bool) -> Result<Value, String> {
-    run_blocking(move || yourmem::cleanup::plan(&data_home(), include_backups).map_err(|e| e.to_string())).await
+    run_blocking(move || {
+        yourmem::cleanup::plan(&data_home(), include_backups).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn local_cleanup_run(include_backups: bool, token: String) -> Result<Value, String> {
     run_blocking(move || {
-        yourmem::setup::remove_execute_selected(&yourmem::setup::Targets::default(), &all_setup_agents())
-            .map_err(|e| e.to_string())?;
+        yourmem::setup::remove_execute_selected(
+            &yourmem::setup::Targets::default(),
+            &all_setup_agents(),
+        )
+        .map_err(|e| e.to_string())?;
         let home = data_home();
         yourmem::cleanup::execute(&home, include_backups, &token).map_err(|e| e.to_string())
-    }).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1088,11 +1676,19 @@ fn app_uninstall() -> Result<(), String> {
         return Err("当前系统请从应用程序目录卸载 yourmem".into());
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let uninstaller = exe.parent().unwrap_or(std::path::Path::new(".")).join("uninstall.exe");
+    let uninstaller = exe
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("uninstall.exe");
     if !uninstaller.is_file() {
-        return Err(format!("未找到卸载程序：{}。可从 Windows 设置 → 应用卸载。", uninstaller.display()));
+        return Err(format!(
+            "未找到卸载程序：{}。可从 Windows 设置 → 应用卸载。",
+            uninstaller.display()
+        ));
     }
-    std::process::Command::new(uninstaller).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new(uninstaller)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     std::process::exit(0);
 }
 
@@ -1206,7 +1802,10 @@ async fn purge_archive_clear() -> Result<Value, String> {
     run_blocking(move || {
         let root = purge_archive_root();
         let mut removed = 0usize;
-        for e in std::fs::read_dir(&root).map_err(|e| e.to_string())?.filter_map(|e| e.ok()) {
+        for e in std::fs::read_dir(&root)
+            .map_err(|e| e.to_string())?
+            .filter_map(|e| e.ok())
+        {
             if e.path().is_dir() {
                 std::fs::remove_dir_all(e.path()).map_err(|e| e.to_string())?;
                 removed += 1;
@@ -1223,23 +1822,39 @@ async fn snapshot_list() -> Result<Value, String> {
 }
 #[tauri::command]
 async fn snapshot_create() -> Result<Value, String> {
-    run_blocking(|| yourmem::maintenance::snapshot_now(&data_home()).map_err(|e| format!("{e:#}"))).await
+    run_blocking(|| yourmem::maintenance::snapshot_now(&data_home()).map_err(|e| format!("{e:#}")))
+        .await
 }
 #[tauri::command]
 async fn snapshot_export(id: String) -> Result<Value, String> {
     run_blocking(move || {
         let home = data_home();
-        let out = yourmem::backups_dir(&home).join("export").join(format!("snapshot-{id}.tar.gz"));
-        yourmem::snapshots::export(&home, &id, &out).map_err(|e|format!("{e:#}"))
-    }).await
+        let out = yourmem::backups_dir(&home)
+            .join("export")
+            .join(format!("snapshot-{id}.tar.gz"));
+        yourmem::snapshots::export(&home, &id, &out).map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 #[tauri::command]
 async fn snapshot_cleanup_plan(keep_recent: usize, keep_monthly: usize) -> Result<Value, String> {
-    run_blocking(move || yourmem::snapshots::cleanup_plan(&data_home(),keep_recent,keep_monthly).map_err(|e|format!("{e:#}"))).await
+    run_blocking(move || {
+        yourmem::snapshots::cleanup_plan(&data_home(), keep_recent, keep_monthly)
+            .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 #[tauri::command]
-async fn snapshot_cleanup(keep_recent: usize, keep_monthly: usize, token: String) -> Result<Value, String> {
-    run_blocking(move || yourmem::snapshots::cleanup(&data_home(),keep_recent,keep_monthly,&token).map_err(|e|format!("{e:#}"))).await
+async fn snapshot_cleanup(
+    keep_recent: usize,
+    keep_monthly: usize,
+    token: String,
+) -> Result<Value, String> {
+    run_blocking(move || {
+        yourmem::snapshots::cleanup(&data_home(), keep_recent, keep_monthly, &token)
+            .map_err(|e| format!("{e:#}"))
+    })
+    .await
 }
 
 fn main() {
@@ -1277,7 +1892,9 @@ fn main() {
             if let Some(win) = app.get_webview_window("main") {
                 // 128px 源：32px 位图被任务栏/Alt-Tab 上采样会发虚（真机反馈
                 // "图标看着小一圈"），大图交给系统按需缩放
-                if let Ok(img) = tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png")) {
+                if let Ok(img) =
+                    tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png"))
+                {
                     let _ = win.set_icon(img);
                 }
                 // 深色标题栏（Win10 1809+ DWM；config theme 在部分 WebView2 版本
@@ -1297,24 +1914,117 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            session_window, message_content, maintenance_status, collect_progress, memory_add, stats, projects, context, project_dossier, project_doc_track, project_doc_untrack, daily_digest, daily_digest_export, sessions,
-            ai_settings_get, ai_settings_save, ai_organize_day, ai_organize_project, ai_summary_save,
-            project_add, project_archive, project_restore, project_merge_plan, project_merge, open_in_finder,
-            session_proof, session_verify, session_export, session_writeback_plan,
-            session_writeback, capability_matrix,
-            session_delete, session_restore, trash_list, trash_purge, trash_purge_selected,
-            trash_empty_overdue, purge_archives, purge_archive_delete, purge_archive_clear,
-            auto_purge_get, auto_purge_set, agent_set_enabled,
-            backup_dir_get, backup_dir_set, backup_dir_pick, bundle_path_pick,
-            first_run_state, first_run_configure, update_check, update_install, open_url,
-            search, memories, update_memory, import_now,
-            memory_files, memory_file_show,
-            agents_detect, agent_add_root, agent_remove_root,
-            bundle_create, bundle_verify, bundle_restore, project_review, setup_plan, setup_run,
-            disconnect_plan, disconnect_run, local_cleanup_plan, local_cleanup_run, app_uninstall, app_info,
-            snapshot_list, snapshot_create, snapshot_export, snapshot_cleanup_plan, snapshot_cleanup,
+            session_window,
+            message_content,
+            maintenance_status,
+            collect_progress,
+            memory_add,
+            stats,
+            projects,
+            context,
+            project_dossier,
+            project_doc_track,
+            project_doc_untrack,
+            daily_digest,
+            daily_digest_export,
+            sessions,
+            ai_settings_get,
+            ai_settings_save,
+            ai_organize_day,
+            ai_organize_project,
+            ai_summary_save,
+            project_add,
+            project_archive,
+            project_restore,
+            project_merge_plan,
+            project_merge,
+            open_in_finder,
+            session_proof,
+            session_verify,
+            session_export,
+            session_writeback_plan,
+            session_writeback,
+            capability_matrix,
+            session_delete,
+            session_restore,
+            trash_list,
+            trash_purge,
+            trash_purge_selected,
+            trash_empty_overdue,
+            purge_archives,
+            purge_archive_delete,
+            purge_archive_clear,
+            auto_purge_get,
+            auto_purge_set,
+            agent_set_enabled,
+            backup_dir_get,
+            backup_dir_set,
+            backup_dir_pick,
+            bundle_path_pick,
+            first_run_state,
+            first_run_configure,
+            update_check,
+            update_install,
+            open_url,
+            search,
+            memories,
+            update_memory,
+            preference_revise,
+            import_now,
+            work_tasks,
+            work_task_create,
+            work_task,
+            work_task_context,
+            work_task_update,
+            work_task_continuation,
+            work_session_link,
+            work_session_unlink,
+            work_proposal_resolve,
+            work_timeline,
+            work_project_records,
+            work_record_pin,
+            work_manual_verification,
+            work_task_link,
+            work_handoff_save,
+            work_merge_resolve,
+            work_claim_resolve,
+            labels,
+            label_create,
+            label_attach,
+            label_merge,
+            label_rename,
+            label_delete,
+            labels_export,
+            memory_files,
+            memory_file_show,
+            agents_detect,
+            agent_add_root,
+            agent_remove_root,
+            bundle_create,
+            bundle_verify,
+            bundle_restore,
+            bundle_restore_config,
+            project_review,
+            setup_plan,
+            setup_run,
+            disconnect_plan,
+            disconnect_run,
+            local_cleanup_plan,
+            local_cleanup_run,
+            app_uninstall,
+            app_info,
+            snapshot_list,
+            snapshot_create,
+            snapshot_export,
+            snapshot_cleanup_plan,
+            snapshot_cleanup,
             doctor,
-            index_status, index_set_tools, storage_usage, orphan_cleanup_plan, orphan_cleanup_run, compact_db,
+            index_status,
+            index_set_tools,
+            storage_usage,
+            orphan_cleanup_plan,
+            orphan_cleanup_run,
+            compact_db,
         ])
         .run(tauri::generate_context!())
         .expect("error while running yourmem app");

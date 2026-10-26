@@ -627,7 +627,7 @@ fn migrate_v3_to_v4_is_idempotent() {
     {
         // 模拟 0.3.1 的 v3 库：摘掉 deleted_at、版本号回写 3
         let conn = db::open(home.path()).unwrap();
-        conn.execute_batch("ALTER TABLE sessions DROP COLUMN deleted_at; PRAGMA user_version = 3;")
+        conn.execute_batch("DROP VIEW IF EXISTS work_events; ALTER TABLE sessions DROP COLUMN deleted_at; PRAGMA user_version = 3;")
             .unwrap();
     }
     let conn = db::open(home.path()).unwrap();
@@ -712,7 +712,7 @@ fn mcp_initialize_imports_and_stays_healthy() {
     let r = yourmem::mcp::handle(bad.path(), &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).unwrap();
     assert_eq!(r["result"]["serverInfo"]["name"], "yourmem");
     let l = yourmem::mcp::handle(bad.path(), &serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
-    assert_eq!(l["result"]["tools"].as_array().unwrap().len(), 13);
+    assert_eq!(l["result"]["tools"].as_array().unwrap().len(), 26);
 
     std::env::remove_var("YOUMEM_CLAUDE_DIR");
     std::env::remove_var("YOUMEM_CODEX_DIR");

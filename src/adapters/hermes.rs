@@ -26,7 +26,6 @@ use crate::vault;
 
 pub const AGENT_HERMES: &str = "hermes";
 
-
 /// hermes 压缩摘要行的内容特征前缀（按其自述摘要形态内置；
 /// 真机尚无样本，首例触发后校准）。
 pub const COMPACT_SUMMARY_PREFIXES: [&str; 3] = [
@@ -171,7 +170,16 @@ fn import_session(
     for (id, role, content, tool_call_id, tool_name, ts, tool_calls, active, compacted) in &rows {
         let line_no = *id as u64;
         let iso = secs_to_iso(*ts);
-        parse_message(role, content.as_deref(), tool_name.as_deref(), tool_calls.as_deref(), line_no, &iso, &mut messages, &mut artifacts);
+        parse_message(
+            role,
+            content.as_deref(),
+            tool_name.as_deref(),
+            tool_calls.as_deref(),
+            line_no,
+            &iso,
+            &mut messages,
+            &mut artifacts,
+        );
         // 压缩点：摘要行特征前缀（机制性检测，无真实样本；见模块注释）
         if let Some(c) = content {
             if COMPACT_SUMMARY_PREFIXES.iter().any(|p| c.starts_with(p)) {
@@ -199,7 +207,16 @@ fn import_session(
     // 对象先于引用它的清单行落盘（对象库独立提交），一次打开整批写入
     let hashes = vault::Store::open(home)?.put_many(units.iter().map(|(_, raw)| raw.as_slice()))?;
     let tx = conn.transaction()?;
-    db::upsert_session(&tx, &session_key, AGENT_HERMES, &sess.id, project_id, &src_key, &meta, messages.len() as u64)?;
+    db::upsert_session(
+        &tx,
+        &session_key,
+        AGENT_HERMES,
+        &sess.id,
+        project_id,
+        &src_key,
+        &meta,
+        messages.len() as u64,
+    )?;
     db::insert_messages(&tx, &session_key, &messages)?;
     db::insert_artifacts(&tx, &session_key, project_id, &artifacts)?;
 
@@ -212,7 +229,11 @@ fn import_session(
 
     // 谱系：subagent 显式标 subagent，其余 parent_session_id 记 continuation
     if let Some(parent) = &sess.parent_id {
-        let link_type = if sess.source.as_deref() == Some("subagent") { "subagent" } else { "continuation" };
+        let link_type = if sess.source.as_deref() == Some("subagent") {
+            "subagent"
+        } else {
+            "continuation"
+        };
         tx.execute(
             "INSERT OR IGNORE INTO session_links(child_session_id, parent_session_id, link_type, created_at)
              VALUES (?1,?2,?3,?4)",
@@ -235,6 +256,10 @@ fn import_session(
     let max_id = rows.last().map(|r| r.0).unwrap_or(cursor);
     count += rows.len() as u64;
     db::update_source_file(&tx, &src_key, AGENT_HERMES, max_id as u64, count, None)?;
+    crate::work::infer_artifact_outcomes(&tx, &session_key)?;
+    crate::work::process_session_evidence(&tx, &session_key)?;
+    crate::work::record_session_steps(&tx, &session_key)?;
+    crate::work::mark_session_evidence_processed(&tx, &session_key)?;
     tx.commit()?;
     Ok((messages.len() as u64, units.len() as u64))
 }
@@ -251,7 +276,11 @@ fn parse_message(
 ) {
     match role {
         "user" | "assistant" => {
-            let kind = if role == "user" { MessageKind::User } else { MessageKind::Assistant };
+            let kind = if role == "user" {
+                MessageKind::User
+            } else {
+                MessageKind::Assistant
+            };
             if let Some(c) = content {
                 push(out, line_no, kind, c.to_string(), ts.clone());
             }
@@ -276,14 +305,41 @@ fn parse_message(
                                     other => other.to_string(),
                                 })
                                 .unwrap_or_default();
-                            push(out, line_no, MessageKind::ToolCall, format!("[{name}] {args}"), ts.clone());
+                            push(
+                                out,
+                                line_no,
+                                MessageKind::ToolCall,
+                                format!("[{name}] {args}"),
+                                ts.clone(),
+                            );
+                            if let Some(last) = out.last_mut() {
+                                last.native_tool_call_id =
+                                    call.get("id").and_then(Value::as_str).map(str::to_string);
+                            }
                             if super::FILE_TOOLS.contains(&name) {
                                 if let Some(fp) = args_obj
                                     .as_ref()
                                     .and_then(|a| a.get("file_path"))
                                     .and_then(Value::as_str)
                                 {
-                                    artifacts.push(NewArtifact { path: fp.to_string(), tool: name.to_string() });
+                                    artifacts.push(NewArtifact {
+                                        path: fp.to_string(),
+                                        from_path: None,
+                                        tool: name.to_string(),
+                                        operation: if name == "Write" { "create" } else { "edit" }
+                                            .to_string(),
+                                        native_tool_call_id: call
+                                            .get("id")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_string),
+                                        timestamp: ts.clone(),
+                                        line_no,
+                                        ord: artifacts
+                                            .iter()
+                                            .filter(|a| a.line_no == line_no)
+                                            .count()
+                                            as u32,
+                                    });
                                 }
                             }
                         }
@@ -309,7 +365,13 @@ fn parse_message(
     }
 }
 
-fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, content: String, ts: Option<String>) {
+fn push(
+    out: &mut Vec<NewMessage>,
+    line_no: u64,
+    kind: MessageKind,
+    content: String,
+    ts: Option<String>,
+) {
     super::push_message(out, line_no, kind, content, ts, None);
 }
 

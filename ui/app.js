@@ -3,6 +3,8 @@ import { graphDepths, treeSlots } from "./graph-layout.js";
 import { createSessionDrawer } from "./session-drawer.js";
 import { snapshotPanelHtml, bindSnapshotPanel } from "./snapshot-panel.js";
 import { activityPageHtml, aiSummaryHtml } from "./workbench.js";
+import { createProjectWorkspace } from "./project-workspace.js";
+import { createAssetGovernance } from "./asset-governance.js";
 
 const { invoke } = window.__TAURI__.core;
 
@@ -470,7 +472,10 @@ function crossChecksHtml(groups) {
   }).join("");
 }
 
-async function showProject(pid) {
+const projectWorkspace = createProjectWorkspace({ invoke, drawer, $, esc, fmtTime, showSession, showMemoryFile, toast, armButton });
+async function showProject(pid) { return projectWorkspace.open(pid); }
+
+async function showLegacyProject(pid) {
   const request = drawer.begin();
   let d;
   try { d = await invoke("project_dossier", { projectId: pid }); }
@@ -950,6 +955,8 @@ async function renderMemory() {
         <option value="context">上下文 context</option>
       </select>
       <span style="flex:1"></span>
+      <button class="chip" id="mem-preferences">偏好治理</button>
+      <button class="chip" id="mem-labels">标签</button>
       <button class="chip ${memView === "graph" ? "on" : ""}" id="mem-graph-toggle">关系图</button>
     </div>
     <div class="pillrow" style="margin-bottom:10px">
@@ -1123,7 +1130,11 @@ async function renderMemory() {
     el.onclick = () => showMemoryFile(+el.dataset.mfid);
   });
   bindCopyButtons("#page-memory"); // 记忆 id chip：点击复制完整 id
+  $("#mem-preferences").onclick = () => assetGovernance.render("preferences");
+  $("#mem-labels").onclick = () => assetGovernance.render("labels");
 }
+
+const assetGovernance = createAssetGovernance({ invoke, $, esc, fmtTime, toast, armButton, showSession, showMemory: renderMemory });
 
 const memCard = (m) => {
   const active = m.status === "suggested" || m.status === "confirmed";

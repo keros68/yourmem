@@ -14,20 +14,22 @@ pub mod cross_checks;
 pub mod db;
 pub mod doctor;
 pub mod dossier;
-pub mod organizer;
 pub mod ingest;
-pub mod mcp;
 pub mod maintenance;
+pub mod mcp;
 pub mod memfiles;
 pub mod models;
-pub mod restore;
-pub mod recall_status;
+pub mod organizer;
 pub mod project_docs;
 pub mod project_review;
+pub mod recall_status;
+pub mod restore;
 pub mod setup;
 pub mod snapshots;
+pub mod time;
 pub mod trash;
 pub mod vault;
+pub mod work;
 
 use std::path::{Path, PathBuf};
 
@@ -103,7 +105,9 @@ pub fn set_data_home_pointer(path: &Path) -> anyhow::Result<()> {
 
 pub fn clear_data_home_pointer() -> anyhow::Result<()> {
     let pointer = data_home_pointer();
-    if pointer.exists() { std::fs::remove_file(pointer)?; }
+    if pointer.exists() {
+        std::fs::remove_file(pointer)?;
+    }
     Ok(())
 }
 
@@ -114,8 +118,9 @@ pub fn clear_data_home_pointer() -> anyhow::Result<()> {
 /// （`/c/Users/...`，Windows API 会错解成当前盘符根下的 `\c\...`），所以只能
 /// 排在 USERPROFILE 之后作回退。Unix 保持 HOME 最优先（macOS/Linux 语义不变）。
 pub fn home_dir() -> PathBuf {
-    resolve_home(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
-        .expect("HOME/USERPROFILE 均未设置（守护进程上下文？设 HOME 或用 YOUMEM_HOME/显式目录旗标）")
+    resolve_home(|k| std::env::var(k).ok().filter(|s| !s.is_empty())).expect(
+        "HOME/USERPROFILE 均未设置（守护进程上下文？设 HOME 或用 YOUMEM_HOME/显式目录旗标）",
+    )
 }
 
 /// HOME → USERPROFILE → HOMEDRIVE+HOMEPATH 回退链（Windows 上 USERPROFILE 最先，
@@ -157,7 +162,11 @@ pub fn is_under_dir(path: &str, root: &Path) -> bool {
             }
         }
         let s = parts.join("/");
-        if cfg!(windows) { s.to_lowercase() } else { s }
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
     };
     let (p, r) = (norm(path), norm(&root.to_string_lossy()));
     !r.is_empty() && (p == r || p.starts_with(&format!("{r}/")))
@@ -205,7 +214,13 @@ pub fn is_dispatch_site_path(path: &str) -> bool {
     let parts: Vec<String> = path
         .split('/')
         .filter(|p| !p.is_empty())
-        .map(|p| if cfg!(windows) { p.to_lowercase() } else { p.to_string() })
+        .map(|p| {
+            if cfg!(windows) {
+                p.to_lowercase()
+            } else {
+                p.to_string()
+            }
+        })
         .collect();
     MARKERS.iter().any(|m| {
         parts
@@ -229,7 +244,10 @@ pub fn staging_dir_near(path: &Path) -> std::io::Result<tempfile::TempDir> {
         .filter(|p| !p.as_os_str().is_empty())
         .and_then(|p| {
             std::fs::create_dir_all(p).ok()?;
-            tempfile::Builder::new().prefix(".yourmem-staging-").tempdir_in(p).ok()
+            tempfile::Builder::new()
+                .prefix(".yourmem-staging-")
+                .tempdir_in(p)
+                .ok()
         });
     match near {
         Some(dir) => Ok(dir),
@@ -241,10 +259,18 @@ pub fn staging_dir_near(path: &Path) -> std::io::Result<tempfile::TempDir> {
 /// appended when a backup from the same second already exists.
 pub fn fresh_backup_path(path: &Path) -> PathBuf {
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     let mut n = 1;
     loop {
-        let suffix = if n == 1 { String::new() } else { format!("-{n}") };
+        let suffix = if n == 1 {
+            String::new()
+        } else {
+            format!("-{n}")
+        };
         let candidate = path.with_file_name(format!("{name}.bak-{ts}{suffix}"));
         if !candidate.exists() {
             return candidate;
@@ -316,7 +342,10 @@ pub fn default_pi_root() -> PathBuf {
 
 /// Antigravity CLI 的会话根：`brain/<uuid>/.system_generated/logs/transcript_full.jsonl`。
 pub fn default_antigravity_root() -> PathBuf {
-    home_dir().join(".gemini").join("antigravity-cli").join("brain")
+    home_dir()
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("brain")
 }
 
 pub fn now_iso() -> String {
@@ -339,7 +368,10 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn resolve_home_prefers_home() {
-        let r = resolve_home(resolver(&[("HOME", "/u/a"), ("USERPROFILE", "C:\\Users\\a")]));
+        let r = resolve_home(resolver(&[
+            ("HOME", "/u/a"),
+            ("USERPROFILE", "C:\\Users\\a"),
+        ]));
         assert_eq!(r, Some(PathBuf::from("/u/a")));
     }
 
@@ -348,7 +380,10 @@ mod tests {
     fn resolve_home_windows_prefers_userprofile() {
         // MSYS/Git Bash 的 HOME 可能是 POSIX 风格（/c/...），Windows 侧必须让
         // 总是合法的 USERPROFILE 赢——HOME 只作 HOME 缺席时的回退。
-        let r = resolve_home(resolver(&[("HOME", "/c/Users/a"), ("USERPROFILE", "C:\\Users\\a")]));
+        let r = resolve_home(resolver(&[
+            ("HOME", "/c/Users/a"),
+            ("USERPROFILE", "C:\\Users\\a"),
+        ]));
         assert_eq!(r, Some(PathBuf::from("C:\\Users\\a")));
         let r = resolve_home(resolver(&[("HOME", "/c/Users/a")]));
         assert_eq!(r, Some(PathBuf::from("/c/Users/a")));
@@ -375,27 +410,55 @@ mod tests {
 
     #[test]
     fn dispatch_runs_and_worktrees_are_run_sites() {
-        assert!(is_dispatch_site_path(r"D:\work\p5b\.dispatch\runtime\runs\task-1\arb-kimi"));
+        assert!(is_dispatch_site_path(
+            r"D:\work\p5b\.dispatch\runtime\runs\task-1\arb-kimi"
+        ));
         // .dispatch 之下的任意子目录都算运行现场，不只 runtime/runs
-        assert!(is_dispatch_site_path(r"D:\work\p5b\.dispatch\runtime\runs\task-1"));
-        assert!(is_dispatch_site_path("/work/agentteam/.dispatch/kimi-ui-20260831"));
-        assert!(is_dispatch_site_path("/work/agentteam/.dispatch/traces/blind-1"));
-        assert!(is_dispatch_site_path("/work/poket/.claude/worktrees/agent-a065"));
-        assert!(!is_dispatch_site_path("/work/poket/.claude/worktrees"), "目录本身不算");
+        assert!(is_dispatch_site_path(
+            r"D:\work\p5b\.dispatch\runtime\runs\task-1"
+        ));
+        assert!(is_dispatch_site_path(
+            "/work/agentteam/.dispatch/kimi-ui-20260831"
+        ));
+        assert!(is_dispatch_site_path(
+            "/work/agentteam/.dispatch/traces/blind-1"
+        ));
+        assert!(is_dispatch_site_path(
+            "/work/poket/.claude/worktrees/agent-a065"
+        ));
+        assert!(
+            !is_dispatch_site_path("/work/poket/.claude/worktrees"),
+            "目录本身不算"
+        );
         assert!(!is_dispatch_site_path("/work/poket/.claude"));
-        assert!(!is_dispatch_site_path("/work/p5b/.dispatch"), ".dispatch 本身不算");
+        assert!(
+            !is_dispatch_site_path("/work/p5b/.dispatch"),
+            ".dispatch 本身不算"
+        );
         assert!(!is_dispatch_site_path("/work/p5b"));
         assert!(!is_dispatch_site_path("/work/runtime/runs/x"));
         assert!(!is_dispatch_site_path("/work/real-project"));
-        assert!(!is_dispatch_site_path("/work/p5b/dispatch/x"), "没有点前缀的不算");
+        assert!(
+            !is_dispatch_site_path("/work/p5b/dispatch/x"),
+            "没有点前缀的不算"
+        );
     }
 
     #[test]
     fn aicross_runs_and_scratch_are_run_sites() {
-        let roots = aicross_roots(resolver(&[("AICROSS_HOME", "/data/aicross"), ("HOME", "/u/a")]));
+        let roots = aicross_roots(resolver(&[
+            ("AICROSS_HOME", "/data/aicross"),
+            ("HOME", "/u/a"),
+        ]));
         // AICROSS_HOME 指向的数据根：runs 与 scratch 都算
-        assert!(is_run_site_path_in("/data/aicross/runs/0fcfa01e-da43", &roots));
-        assert!(is_run_site_path_in("/data/aicross/scratch/20261016-103711-blind/kimi.moonshot", &roots));
+        assert!(is_run_site_path_in(
+            "/data/aicross/runs/0fcfa01e-da43",
+            &roots
+        ));
+        assert!(is_run_site_path_in(
+            "/data/aicross/scratch/20261016-103711-blind/kimi.moonshot",
+            &roots
+        ));
         // ~/.aicross 始终认（用户可能中途改过 AICROSS_HOME）
         assert!(is_run_site_path_in("/u/a/.aicross/runs/x", &roots));
         assert!(is_run_site_path_in("/u/a/.aicross/scratch/x", &roots));
@@ -404,7 +467,10 @@ mod tests {
         assert!(!is_run_site_path_in("/data/aicross", &roots));
         assert!(!is_run_site_path_in("/data/aicross-scratch/x", &roots));
         // 未设 AICROSS_HOME（或为空）时只认 ~/.aicross
-        for vars in [&[("HOME", "/u/a")][..], &[("AICROSS_HOME", ""), ("HOME", "/u/a")][..]] {
+        for vars in [
+            &[("HOME", "/u/a")][..],
+            &[("AICROSS_HOME", ""), ("HOME", "/u/a")][..],
+        ] {
             let roots = aicross_roots(resolver(vars));
             assert!(is_run_site_path_in("/u/a/.aicross/scratch/x", &roots));
             assert!(!is_run_site_path_in("/data/aicross/scratch/x", &roots));
@@ -418,9 +484,15 @@ mod tests {
             ("AICROSS_HOME", r"D:\AICross-Data"),
             ("USERPROFILE", r"C:\Users\a"),
         ]));
-        assert!(is_run_site_path_in("d:/aicross-data/scratch/20261016-103711-blind", &roots));
+        assert!(is_run_site_path_in(
+            "d:/aicross-data/scratch/20261016-103711-blind",
+            &roots
+        ));
         assert!(is_run_site_path_in(r"D:\aicross-data\RUNS\x", &roots));
-        assert!(is_run_site_path_in(r"c:\USERS\a\.aicross\scratch\x", &roots));
+        assert!(is_run_site_path_in(
+            r"c:\USERS\a\.aicross\scratch\x",
+            &roots
+        ));
     }
 
     #[test]
@@ -459,8 +531,11 @@ mod tests {
         .unwrap();
         assert_eq!(backups_dir(home.path()), ext.path());
         // 相对路径视为无效配置，仍回落（用户手填错也不把备份写进工作目录）
-        crate::ingest::write_config(home.path(), &serde_json::json!({ "backup_dir": "rel/path" }))
-            .unwrap();
+        crate::ingest::write_config(
+            home.path(),
+            &serde_json::json!({ "backup_dir": "rel/path" }),
+        )
+        .unwrap();
         assert_eq!(backups_dir(home.path()), home.path().join("backups"));
     }
 

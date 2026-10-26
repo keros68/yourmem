@@ -11,6 +11,8 @@ pub struct NewMessage {
     pub content: String,
     pub timestamp: Option<String>,
     pub uuid: Option<String>,
+    pub native_tool_call_id: Option<String>,
+    pub tool_success: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +57,13 @@ pub struct SessionMetaPatch {
 #[derive(Debug, Clone)]
 pub struct NewArtifact {
     pub path: String,
+    pub from_path: Option<String>,
     pub tool: String,
+    pub operation: String,
+    pub native_tool_call_id: Option<String>,
+    pub timestamp: Option<String>,
+    pub line_no: u64,
+    pub ord: u32,
 }
 
 /// A uuid sighted on any source line, including non-content lines

@@ -26,30 +26,61 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
     checks.push(if schema == db::SCHEMA_VERSION {
         check("schema", "ok", format!("v{schema}（与代码期望一致）"))
     } else {
-        check("schema", "fail", format!("数据库 schema 为 v{schema}，代码要求 v{}", db::SCHEMA_VERSION))
+        check(
+            "schema",
+            "fail",
+            format!(
+                "数据库 schema 为 v{schema}，代码要求 v{}",
+                db::SCHEMA_VERSION
+            ),
+        )
     });
 
     // 2. FTS 与 messages 行数一致（不一致 = 搜索结果不可信）。
     // 轻量索引（1.0.1）分两张表对账：对话层 = 全部 - tool_result；全量态下
     // 工具表还要与 tool_result 行数对齐，轻量态下必须为空。
     let msgs: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
-    let tool_msgs: i64 =
-        conn.query_row("SELECT COUNT(*) FROM messages WHERE kind = 'tool_result'", [], |r| r.get(0))?;
+    let tool_msgs: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE kind = 'tool_result'",
+        [],
+        |r| r.get(0),
+    )?;
     // external content 的 FTS5 表 COUNT(*) 会穿透到内容表（恒等于 messages 行数，
     // 旧对账因此一直测不准）——已索引行数必须数 docsize 影子表。
-    let fts: i64 = conn.query_row("SELECT COUNT(*) FROM messages_fts_docsize", [], |r| r.get(0))?;
-    let tools_fts: i64 = conn.query_row("SELECT COUNT(*) FROM messages_tools_fts_docsize", [], |r| r.get(0))?;
+    let fts: i64 = conn.query_row("SELECT COUNT(*) FROM messages_fts_docsize", [], |r| {
+        r.get(0)
+    })?;
+    let tools_fts: i64 =
+        conn.query_row("SELECT COUNT(*) FROM messages_tools_fts_docsize", [], |r| {
+            r.get(0)
+        })?;
     let full = db::tool_index_enabled(conn)?;
     let (fts_status, fts_detail) = if fts != msgs - tool_msgs {
-        ("fail", format!("对话层索引 {fts} 行 vs messages {msgs} 行（工具输出 {tool_msgs} 行）——索引脱节"))
+        (
+            "fail",
+            format!(
+                "对话层索引 {fts} 行 vs messages {msgs} 行（工具输出 {tool_msgs} 行）——索引脱节"
+            ),
+        )
     } else if !full && tools_fts != 0 {
-        ("fail", format!("轻量模式下工具索引仍有 {tools_fts} 行——未清干净"))
+        (
+            "fail",
+            format!("轻量模式下工具索引仍有 {tools_fts} 行——未清干净"),
+        )
     } else if full && tools_fts != tool_msgs {
-        ("fail", format!("全量模式下工具索引 {tools_fts} 行 vs 工具输出 {tool_msgs} 行——索引脱节"))
+        (
+            "fail",
+            format!("全量模式下工具索引 {tools_fts} 行 vs 工具输出 {tool_msgs} 行——索引脱节"),
+        )
     } else if full {
         ("ok", format!("messages {msgs} 行（工具输出 {tool_msgs}），对话层 {fts} + 工具层 {tools_fts}，一致"))
     } else {
-        ("ok", format!("messages {msgs} 行，对话层索引 {fts} 行（工具输出 {tool_msgs} 行未索引），一致"))
+        (
+            "ok",
+            format!(
+                "messages {msgs} 行，对话层索引 {fts} 行（工具输出 {tool_msgs} 行未索引），一致"
+            ),
+        )
     };
     checks.push(check("fts", fts_status, fts_detail));
 
@@ -58,7 +89,11 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
     let page_size: i64 = conn.pragma_query_value(None, "page_size", |r| r.get(0))?;
     let page_count: i64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
     let freelist: i64 = conn.pragma_query_value(None, "freelist_count", |r| r.get(0))?;
-    let ratio = if page_count > 0 { freelist as f64 / page_count as f64 } else { 0.0 };
+    let ratio = if page_count > 0 {
+        freelist as f64 / page_count as f64
+    } else {
+        0.0
+    };
     checks.push(if ratio < 0.1 {
         check("db_free", "ok", format!("空闲页占比 {:.0}%，无需整理", ratio * 100.0))
     } else {
@@ -92,9 +127,17 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
         }
     }
     checks.push(if bad == 0 {
-        check("vault_sample", "ok", format!("抽验 {} 个对象，均与归档一致", sample.len()))
+        check(
+            "vault_sample",
+            "ok",
+            format!("抽验 {} 个对象，均与归档一致", sample.len()),
+        )
     } else {
-        check("vault_sample", "fail", format!("抽验 {} 个对象，{} 个与归档不符或缺失", sample.len(), bad))
+        check(
+            "vault_sample",
+            "fail",
+            format!("抽验 {} 个对象，{} 个与归档不符或缺失", sample.len(), bad),
+        )
     });
 
     // 4. 被引用对象磁盘缺失全量扫描（stat 级别，不重算哈希）
@@ -103,16 +146,31 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
         store.inventory()?.into_iter().map(|(h, _)| h).collect();
     let missing = referenced.iter().filter(|h| !stored.contains(*h)).count();
     checks.push(if missing == 0 {
-        check("vault_missing", "ok", format!("{} 个引用对象全部在盘", referenced.len()))
+        check(
+            "vault_missing",
+            "ok",
+            format!("{} 个引用对象全部在盘", referenced.len()),
+        )
     } else {
-        check("vault_missing", "fail", format!("{missing} / {} 个引用对象磁盘缺失，备份不完整", referenced.len()))
+        check(
+            "vault_missing",
+            "fail",
+            format!(
+                "{missing} / {} 个引用对象磁盘缺失，备份不完整",
+                referenced.len()
+            ),
+        )
     });
 
     let tmp_residue = vault::tmp_files(home).len();
     checks.push(if tmp_residue == 0 {
         check("tmp_residue", "ok", "无崩溃残留的 tmp 文件")
     } else {
-        check("tmp_residue", "warn", format!("{tmp_residue} 个 .tmp 残留（可手动删除，不影响完整性）"))
+        check(
+            "tmp_residue",
+            "warn",
+            format!("{tmp_residue} 个 .tmp 残留（可手动删除，不影响完整性）"),
+        )
     });
 
     // 5. 盘上未被引用的对象（泄漏：既不属 vault_lines 也不属 memory_revisions）。
@@ -133,11 +191,21 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
                 checks.push(if orphans == 0 {
                     check("orphan_objects", "ok", "磁盘无未被引用的对象")
                 } else {
-                    check("orphan_objects", "warn", format!("{orphans} 个对象无引用（GC 之外的泄漏；purge 归档在 backups/ 不计入）"))
+                    check(
+                        "orphan_objects",
+                        "warn",
+                        format!(
+                            "{orphans} 个对象无引用（GC 之外的泄漏；purge 归档在 backups/ 不计入）"
+                        ),
+                    )
                 });
             }
             Err(e) if crate::maintenance::is_busy(&e) => {
-                checks.push(check("orphan_objects", "skip", "正在采集，本轮跳过未引用原件检查，下次自检再查"));
+                checks.push(check(
+                    "orphan_objects",
+                    "skip",
+                    "正在采集，本轮跳过未引用原件检查，下次自检再查",
+                ));
             }
             Err(e) => return Err(e),
         }
@@ -145,8 +213,7 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
 
     // 6. memory_files 当前修订的对象都在（current_hash 悬空 = 详情页打不开）
     let cur_missing = {
-        let mut stmt =
-            conn.prepare("SELECT current_hash FROM memory_files")?;
+        let mut stmt = conn.prepare("SELECT current_hash FROM memory_files")?;
         let hashes: Vec<String> = stmt
             .query_map([], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -156,7 +223,11 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
     checks.push(if cur_missing == 0 {
         check("memory_files", "ok", "memory 文件当前修订对象齐全")
     } else {
-        check("memory_files", "fail", format!("{cur_missing} 个 memory 文件的当前修订对象缺失"))
+        check(
+            "memory_files",
+            "fail",
+            format!("{cur_missing} 个 memory 文件的当前修订对象缺失"),
+        )
     });
 
     // 7. 快照新鲜度：增量快照与独立数据库快照取较新者；bundle 可存到任意位置，
@@ -165,7 +236,10 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
     let mut count = 0usize;
     let files = vault::list_snapshots(home)?;
     count += files.len();
-    if let Some(t) = files.last().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()) {
+    if let Some(t) = files
+        .last()
+        .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+    {
         newest = Some(t);
     }
     if let Ok(Some((created_at, n))) = crate::snapshots::latest(home) {
@@ -176,9 +250,16 @@ pub fn run(conn: &Connection, home: &Path) -> Result<Value> {
         }
     }
     let detail = match newest {
-        None => ("warn", "尚无快照。此项不检查 .tar.gz 完整备份；完整备份请在设置的备份页校验。".to_string()),
+        None => (
+            "warn",
+            "尚无快照。此项不检查 .tar.gz 完整备份；完整备份请在设置的备份页校验。".to_string(),
+        ),
         Some(t) => {
-            let days = std::time::SystemTime::now().duration_since(t).unwrap_or_default().as_secs() / 86400;
+            let days = std::time::SystemTime::now()
+                .duration_since(t)
+                .unwrap_or_default()
+                .as_secs()
+                / 86400;
             let status = if days > 7 { "warn" } else { "ok" };
             (status, format!("最近快照 {days} 天前（共 {count} 份）"))
         }
@@ -205,7 +286,9 @@ mod tests {
         // 全新库：schema/fts/vault 全 ok；快照从未做过 → warn，但整体无 fail
         assert_eq!(r["ok"], true);
         let checks = r["checks"].as_array().unwrap();
-        assert!(checks.iter().any(|c| c["name"] == "db_snapshot" && c["status"] == "warn"));
+        assert!(checks
+            .iter()
+            .any(|c| c["name"] == "db_snapshot" && c["status"] == "warn"));
         assert!(checks.iter().all(|c| c["status"] != "fail"));
     }
 
@@ -222,7 +305,10 @@ mod tests {
         .unwrap();
         let r = run(&conn, dir.path()).unwrap();
         assert_eq!(r["ok"], false);
-        assert!(r["checks"].as_array().unwrap().iter()
+        assert!(r["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
             .any(|c| c["name"] == "vault_missing" && c["status"] == "fail"));
     }
 
@@ -234,8 +320,13 @@ mod tests {
         let hashes = store.put_many([b"unreferenced object".as_slice()]).unwrap();
         assert_eq!(hashes.len(), 1);
         let status_of = |r: &Value| {
-            r["checks"].as_array().unwrap().iter()
-                .find(|c| c["name"] == "orphan_objects").unwrap()["status"].clone()
+            r["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "orphan_objects")
+                .unwrap()["status"]
+                .clone()
         };
 
         // 无人采集：真泄漏如实上报
@@ -243,7 +334,8 @@ mod tests {
 
         // 有采集持锁（对象库先于引用提交，此时计数必然虚高）：让路不拉假警报
         let _import =
-            crate::ingest::ImportLockTx::acquire(dir.path(), std::time::Duration::from_secs(1)).unwrap();
+            crate::ingest::ImportLockTx::acquire(dir.path(), std::time::Duration::from_secs(1))
+                .unwrap();
         let r = run(&conn, dir.path()).unwrap();
         assert_eq!(status_of(&r), json!("skip"));
         assert_eq!(r["ok"], true, "skip 是中性结果，不算失败：{r}");

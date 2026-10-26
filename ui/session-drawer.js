@@ -37,6 +37,8 @@ async function showSession(sessionId, lineNo = null, precompact = false, offset 
   const msgHtml = (m) => `<div class="msg ${esc(m.kind)}" data-line="${m.line_no}" data-message="${m.message_id}"><div class="kind">${esc(m.kind)} · L${m.line_no} · ${fmtTime(m.timestamp)}</div><div class="content">${esc(m.content)}</div>${m.truncated ? `<button class="btn small" data-full-message="${m.message_id}">展开原文</button>` : ""}</div>`;
   // 每次最多 150 条（一页），前文/后文翻页；无定位目标时是最后一页
   const msgs = d.messages.map(msgHtml).join("");
+  const steps = (d.task_steps || []).map((step) => `<div class="work-session-step"><span class="pill ${esc(step.status)}">${esc(step.status)}</span><span>${esc(step.content)}</span><small>L${step.source_line_no} · ${fmtTime(step.occurred_at || step.observed_at)}</small></div>`).join("");
+  const stepsRow = steps ? `<details class="proof" open><summary>执行步骤（Agent Todo / plan，不是项目任务）</summary><div class="work-session-steps">${steps}</div></details>` : "";
   // §4 续聊支持：只展示与复制，不代为执行
   const copyRow = `
     <div class="meta" style="margin:8px 0">
@@ -68,6 +70,7 @@ async function showSession(sessionId, lineNo = null, precompact = false, offset 
     ${copyRow}
     ${compactRow}
     ${proofRow}
+    ${stepsRow}
     ${ltree.truncated ? `<div class="meta">仅显示部分谱系节点（上限 ${ltree.node_limit}）</div>` : ""}
     ${d.has_before || d.has_after ? `<div class="searchbar"><button class="btn small" id="context-before" ${d.has_before ? "" : "disabled"}>前文</button><span>${d.messages.length ? d.window_offset + 1 : 0}–${d.window_offset + d.messages.length} / ${d.total_messages}</span><button class="btn small" id="context-after" ${d.has_after ? "" : "disabled"}>后文</button></div>` : ""}
     ${msgs || '<div class="empty">无消息</div>'}

@@ -145,7 +145,8 @@ fn copy_verified(source: &Path, destination: &Path) -> Result<CopyStats> {
             }
             fs::copy(entry.path(), &target)?;
             anyhow::ensure!(
-                crate::vault::hash_reader(fs::File::open(entry.path())?)? == crate::vault::hash_reader(fs::File::open(&target)?)?,
+                crate::vault::hash_reader(fs::File::open(entry.path())?)?
+                    == crate::vault::hash_reader(fs::File::open(&target)?)?,
                 "迁移校验失败：{}",
                 entry.path().display()
             );

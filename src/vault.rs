@@ -13,7 +13,10 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, io::{Read, Write}};
+use std::{
+    collections::HashSet,
+    io::{Read, Write},
+};
 
 const COMPRESSED_MAGIC: &[u8; 8] = b"YMEMGZ1\0";
 const COMPRESS_MIN_BYTES: usize = 256;
@@ -64,13 +67,18 @@ impl Store {
              PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=30000; PRAGMA journal_size_limit=67108864;
              CREATE TABLE IF NOT EXISTS objects(hash TEXT PRIMARY KEY, data BLOB NOT NULL);",
         )?;
-        Ok(Store { conn, home: home.to_path_buf() })
+        Ok(Store {
+            conn,
+            home: home.to_path_buf(),
+        })
     }
 
     fn stored(&self, hash: &str) -> Result<Option<Vec<u8>>> {
         let row: Option<Vec<u8>> = self
             .conn
-            .query_row("SELECT data FROM objects WHERE hash = ?1", [hash], |r| r.get(0))
+            .query_row("SELECT data FROM objects WHERE hash = ?1", [hash], |r| {
+                r.get(0)
+            })
             .optional()?;
         if row.is_some() {
             return Ok(row);
@@ -95,17 +103,24 @@ impl Store {
     pub fn stored_len(&self, hash: &str) -> Result<Option<u64>> {
         let len: Option<i64> = self
             .conn
-            .query_row("SELECT length(data) FROM objects WHERE hash = ?1", [hash], |r| r.get(0))
+            .query_row(
+                "SELECT length(data) FROM objects WHERE hash = ?1",
+                [hash],
+                |r| r.get(0),
+            )
             .optional()?;
         if let Some(n) = len {
             return Ok(Some(n as u64));
         }
-        Ok(std::fs::metadata(object_path(&self.home, hash)).ok().map(|m| m.len()))
+        Ok(std::fs::metadata(object_path(&self.home, hash))
+            .ok()
+            .map(|m| m.len()))
     }
 
     /// Stored bytes as written (compressed form included), for archiving.
     pub fn raw(&self, hash: &str) -> Result<Vec<u8>> {
-        self.stored(hash)?.with_context(|| format!("missing vault object {hash}"))
+        self.stored(hash)?
+            .with_context(|| format!("missing vault object {hash}"))
     }
 
     /// Read an object. With `verify`, re-hash the bytes and compare against
@@ -125,8 +140,10 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let mut hashes = Vec::new();
         {
-            let mut exists = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)")?;
-            let mut insert = tx.prepare_cached("INSERT OR IGNORE INTO objects(hash, data) VALUES (?1, ?2)")?;
+            let mut exists =
+                tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM objects WHERE hash = ?1)")?;
+            let mut insert =
+                tx.prepare_cached("INSERT OR IGNORE INTO objects(hash, data) VALUES (?1, ?2)")?;
             for bytes in items {
                 let hash = hash_bytes(bytes);
                 let present: bool = exists.query_row([&hash], |r| r.get(0))?;
@@ -145,12 +162,17 @@ impl Store {
     pub fn put_raw(&self, hash: &str, stored: &[u8]) -> Result<()> {
         let existing: Option<Vec<u8>> = self
             .conn
-            .query_row("SELECT data FROM objects WHERE hash = ?1", [hash], |r| r.get(0))
+            .query_row("SELECT data FROM objects WHERE hash = ?1", [hash], |r| {
+                r.get(0)
+            })
             .optional()?;
         match existing {
             Some(data) if verified(hash, &data).is_ok() => {}
             Some(_) => {
-                self.conn.execute("UPDATE objects SET data = ?2 WHERE hash = ?1", rusqlite::params![hash, stored])?;
+                self.conn.execute(
+                    "UPDATE objects SET data = ?2 WHERE hash = ?1",
+                    rusqlite::params![hash, stored],
+                )?;
             }
             None => {
                 self.conn.execute(
@@ -177,20 +199,23 @@ impl Store {
             let mut rows = stmt.query([])?;
             while rows.next()?.is_some() {}
         }
-        self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         Ok(())
     }
 
     /// Rewrite the store compactly and switch it to incremental auto-vacuum,
     /// so later deletions free disk space right away.
     pub fn compact(&self) -> Result<()> {
-        self.conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+        self.conn
+            .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
         Ok(())
     }
 
     /// Remove an object from the store and any legacy file.
     pub fn remove(&self, hash: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM objects WHERE hash = ?1", [hash])?;
+        self.conn
+            .execute("DELETE FROM objects WHERE hash = ?1", [hash])?;
         match std::fs::remove_file(object_path(&self.home, hash)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
             _ => Ok(()),
@@ -199,9 +224,13 @@ impl Store {
 
     /// Every stored object with its stored size, legacy files included.
     pub fn inventory(&self) -> Result<Vec<(String, u64)>> {
-        let mut stmt = self.conn.prepare("SELECT hash, length(data) FROM objects")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash, length(data) FROM objects")?;
         let mut rows: Vec<(String, u64)> = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.extend(legacy_files(&self.home));
         Ok(rows)
@@ -222,13 +251,19 @@ pub fn verified(hash: &str, stored: &[u8]) -> Result<Vec<u8>> {
 pub fn store_disk_bytes(home: &Path) -> u64 {
     let db = store_db_path(home);
     let wal = home.join("objects.db-wal");
-    let files: u64 = [db, wal].iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+    let files: u64 = [db, wal]
+        .iter()
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum();
     files + legacy_files(home).iter().map(|x| x.1).sum::<u64>()
 }
 
 /// 64 位小写十六进制：对象地址格式。
 pub fn is_hash(name: &str) -> bool {
-    name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// Object files written by earlier versions (`objects/<shard>/<hash>`).
@@ -260,8 +295,13 @@ pub fn migrate_legacy(home: &Path, limit: usize) -> Result<Value> {
     let store = Store::open(home)?;
     let mut batch = Vec::new();
     let mut remaining = false;
-    for entry in walkdir::WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
-        let Some(name) = entry.file_name().to_str() else { continue };
+    for entry in walkdir::WalkDir::new(&root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let Some(name) = entry.file_name().to_str() else {
+            continue;
+        };
         if !entry.file_type().is_file() || !is_hash(name) {
             continue;
         }
@@ -315,11 +355,15 @@ pub fn read_object(home: &Path, hash: &str, verify: bool) -> Result<Vec<u8>> {
 }
 
 fn encode_object(bytes: &[u8]) -> Result<Vec<u8>> {
-    if bytes.len() < COMPRESS_MIN_BYTES { return Ok(bytes.to_vec()); }
+    if bytes.len() < COMPRESS_MIN_BYTES {
+        return Ok(bytes.to_vec());
+    }
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(bytes)?;
     let compressed = encoder.finish()?;
-    if compressed.len() + COMPRESSED_MAGIC.len() >= bytes.len() { return Ok(bytes.to_vec()); }
+    if compressed.len() + COMPRESSED_MAGIC.len() >= bytes.len() {
+        return Ok(bytes.to_vec());
+    }
     let mut stored = Vec::with_capacity(COMPRESSED_MAGIC.len() + compressed.len());
     stored.extend_from_slice(COMPRESSED_MAGIC);
     stored.extend_from_slice(&compressed);
@@ -327,7 +371,9 @@ fn encode_object(bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn decode_object(stored: &[u8]) -> Result<Vec<u8>> {
-    if !stored.starts_with(COMPRESSED_MAGIC) { return Ok(stored.to_vec()); }
+    if !stored.starts_with(COMPRESSED_MAGIC) {
+        return Ok(stored.to_vec());
+    }
     let mut decoded = Vec::new();
     GzDecoder::new(&stored[COMPRESSED_MAGIC.len()..]).read_to_end(&mut decoded)?;
     Ok(decoded)
@@ -353,13 +399,15 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 /// Rebuild the raw session JSONL from the vault, verifying every object's
 /// hash as it is read. Proves the backup is real.
 pub fn export_session(conn: &Connection, home: &Path, session_id: &str, out: &Path) -> Result<u64> {
-    let mut stmt = conn.prepare(
-        "SELECT hash FROM vault_lines WHERE session_id = ?1 ORDER BY line_no",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT hash FROM vault_lines WHERE session_id = ?1 ORDER BY line_no")?;
     let hashes: Vec<String> = stmt
         .query_map(rusqlite::params![session_id], |r| r.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    anyhow::ensure!(!hashes.is_empty(), "no vault manifest for session {session_id}");
+    anyhow::ensure!(
+        !hashes.is_empty(),
+        "no vault manifest for session {session_id}"
+    );
 
     let store = Store::open(home)?;
     let mut buf = Vec::new();
@@ -395,9 +443,8 @@ pub fn session_proof(conn: &Connection, home: &Path, session_id: &str) -> Result
         |r| r.get(0),
     )?;
     let hashes: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT hash FROM vault_lines WHERE session_id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT hash FROM vault_lines WHERE session_id = ?1")?;
         let rows = stmt.query_map(rusqlite::params![session_id], |r| r.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
@@ -423,9 +470,8 @@ pub fn session_proof(conn: &Connection, home: &Path, session_id: &str) -> Result
 /// 与 export_session 的校验同一纪律——保真是"验"出来的，不是假设的。
 pub fn verify_session(conn: &Connection, home: &Path, session_id: &str) -> Result<Value> {
     let hashes: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT hash FROM vault_lines WHERE session_id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT hash FROM vault_lines WHERE session_id = ?1")?;
         let rows = stmt.query_map(rusqlite::params![session_id], |r| r.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
@@ -450,8 +496,15 @@ pub fn verify_session(conn: &Connection, home: &Path, session_id: &str) -> Resul
 
 pub fn status(conn: &Connection, home: &Path) -> Result<Value> {
     let lines: i64 = conn.query_row("SELECT COUNT(*) FROM vault_lines", [], |r| r.get(0))?;
-    let distinct: i64 = conn.query_row("SELECT COUNT(DISTINCT hash) FROM vault_lines", [], |r| r.get(0))?;
-    let sessions: i64 = conn.query_row("SELECT COUNT(DISTINCT session_id) FROM vault_lines", [], |r| r.get(0))?;
+    let distinct: i64 =
+        conn.query_row("SELECT COUNT(DISTINCT hash) FROM vault_lines", [], |r| {
+            r.get(0)
+        })?;
+    let sessions: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT session_id) FROM vault_lines",
+        [],
+        |r| r.get(0),
+    )?;
 
     let inventory = Store::open(home)?.inventory()?;
     let objects = inventory.len() as u64;
@@ -486,10 +539,15 @@ pub fn tmp_files(home: &Path) -> Vec<PathBuf> {
 /// Unreferenced objects (by hash) and temp leftovers (by path), with sizes.
 fn orphan_inventory(conn: &Connection, home: &Path) -> Result<Vec<(String, u64)>> {
     let mut refs = HashSet::new();
-    for sql in ["SELECT DISTINCT hash FROM vault_lines", "SELECT DISTINCT hash FROM memory_revisions"] {
+    for sql in [
+        "SELECT DISTINCT hash FROM vault_lines",
+        "SELECT DISTINCT hash FROM memory_revisions",
+    ] {
         let mut stmt = conn.prepare(sql)?;
-        refs.extend(stmt.query_map([], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?);
+        refs.extend(
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
     }
     let mut rows: Vec<(String, u64)> = Store::open(home)?
         .inventory()?
@@ -506,14 +564,19 @@ fn orphan_inventory(conn: &Connection, home: &Path) -> Result<Vec<(String, u64)>
 
 pub fn orphan_cleanup_plan(conn: &Connection, home: &Path) -> Result<Value> {
     let rows = orphan_inventory(conn, home)?;
-    Ok(json!({"token":hash_bytes(&serde_json::to_vec(&rows)?),"files":rows.len(),
-        "bytes":rows.iter().map(|x|x.1).sum::<u64>()}))
+    Ok(
+        json!({"token":hash_bytes(&serde_json::to_vec(&rows)?),"files":rows.len(),
+        "bytes":rows.iter().map(|x|x.1).sum::<u64>()}),
+    )
 }
 
 pub fn orphan_cleanup(conn: &Connection, home: &Path, token: &str) -> Result<Value> {
     let _lock = crate::ingest::ImportLockTx::acquire(home, std::time::Duration::from_secs(120))?;
     let rows = orphan_inventory(conn, home)?;
-    anyhow::ensure!(hash_bytes(&serde_json::to_vec(&rows)?) == token, "对象库已变化，请重新预览");
+    anyhow::ensure!(
+        hash_bytes(&serde_json::to_vec(&rows)?) == token,
+        "对象库已变化，请重新预览"
+    );
     let store = Store::open(home)?;
     let disk_before = store_disk_bytes(home);
     let mut removed = 0u64;
@@ -568,7 +631,10 @@ pub fn snapshot_db(conn: &Connection, home: &Path, keep: usize) -> Result<Value>
     std::fs::create_dir_all(&dir)?;
     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f");
     let path = dir.join(format!("yourmem-{ts}.sqlite"));
-    conn.execute("VACUUM INTO ?1", rusqlite::params![path.to_string_lossy().as_ref()])?;
+    conn.execute(
+        "VACUUM INTO ?1",
+        rusqlite::params![path.to_string_lossy().as_ref()],
+    )?;
 
     let snapshots = list_snapshots(home)?;
     let mut pruned = 0u64;
@@ -584,7 +650,6 @@ pub fn snapshot_db(conn: &Connection, home: &Path, keep: usize) -> Result<Value>
         "pruned": pruned,
     }))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -642,13 +707,20 @@ mod tests {
 
         // 篡改一个字节级内容（直接改写对象库）→ 校验必须抓到
         let objects = Connection::open(store_db_path(dir.path())).unwrap();
-        objects.execute("UPDATE objects SET data = x'00' WHERE hash = ?1", [&hashes[0]]).unwrap();
+        objects
+            .execute(
+                "UPDATE objects SET data = x'00' WHERE hash = ?1",
+                [&hashes[0]],
+            )
+            .unwrap();
         let v = verify_session(&conn, dir.path(), "a:x").unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["failed"].as_array().unwrap().len(), 1);
 
         // 对象丢失 → proof 如实上报 missing，校验同样抓到
-        objects.execute("DELETE FROM objects WHERE hash = ?1", [&hashes[1]]).unwrap();
+        objects
+            .execute("DELETE FROM objects WHERE hash = ?1", [&hashes[1]])
+            .unwrap();
         let p = session_proof(&conn, dir.path(), "a:x").unwrap();
         assert_eq!(p["objects_missing"], 1);
         let v = verify_session(&conn, dir.path(), "a:x").unwrap();
@@ -661,7 +733,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let raw = "repeated tool output ".repeat(20_000).into_bytes();
         let hash = store_line(dir.path(), &raw).unwrap();
-        let stored = Store::open(dir.path()).unwrap().stored_len(&hash).unwrap().unwrap();
+        let stored = Store::open(dir.path())
+            .unwrap()
+            .stored_len(&hash)
+            .unwrap()
+            .unwrap();
         assert!(stored < raw.len() as u64 / 4);
         assert_eq!(read_object(dir.path(), &hash, true).unwrap(), raw);
         let legacy = b"legacy uncompressed object";
@@ -681,7 +757,8 @@ mod tests {
         conn.execute(
             "INSERT INTO vault_lines(session_id,line_no,hash) VALUES('test',1,?1)",
             rusqlite::params![keep],
-        ).unwrap();
+        )
+        .unwrap();
         let p = orphan_cleanup_plan(&conn, dir.path()).unwrap();
         assert_eq!(p["files"], 1);
         orphan_cleanup(&conn, dir.path(), p["token"].as_str().unwrap()).unwrap();
@@ -707,7 +784,10 @@ mod tests {
         std::fs::write(&bad_path, b"not the original").unwrap();
 
         let first = migrate_legacy(home, 1).unwrap();
-        assert_eq!(first["moved"].as_u64().unwrap() + first["skipped"].as_u64().unwrap(), 1);
+        assert_eq!(
+            first["moved"].as_u64().unwrap() + first["skipped"].as_u64().unwrap(),
+            1
+        );
         assert_eq!(first["remaining"], true);
         let rest = migrate_legacy(home, 100).unwrap();
         assert_eq!(rest["remaining"], false);
@@ -730,8 +810,13 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, encode_object(bytes).unwrap()).unwrap();
         Store::open(home).unwrap();
-        Connection::open(store_db_path(home)).unwrap()
-            .execute("INSERT INTO objects(hash, data) VALUES (?1, x'00')", [&hash]).unwrap();
+        Connection::open(store_db_path(home))
+            .unwrap()
+            .execute(
+                "INSERT INTO objects(hash, data) VALUES (?1, x'00')",
+                [&hash],
+            )
+            .unwrap();
         migrate_legacy(home, 10).unwrap();
         assert_eq!(Store::open(home).unwrap().get(&hash, true).unwrap(), bytes);
     }
@@ -741,13 +826,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         let conn = crate::db::open(home).unwrap();
-        let big: Vec<u8> = (0..2_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let big: Vec<u8> = (0..2_000_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
         store_line(home, &big).unwrap();
         Store::open(home).unwrap().release_space().unwrap();
         let p = orphan_cleanup_plan(&conn, home).unwrap();
         let r = orphan_cleanup(&conn, home, p["token"].as_str().unwrap()).unwrap();
         assert_eq!(r["removed"], 1);
         let deleted = r["reclaimed_bytes"].as_u64().unwrap();
-        assert!(r["disk_freed_bytes"].as_u64().unwrap() * 10 >= deleted * 9, "磁盘实际释放约等于删除的内容：{r}");
+        assert!(
+            r["disk_freed_bytes"].as_u64().unwrap() * 10 >= deleted * 9,
+            "磁盘实际释放约等于删除的内容：{r}"
+        );
     }
 }

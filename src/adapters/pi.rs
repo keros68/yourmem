@@ -21,11 +21,9 @@
 //! - 防御式：损坏行/未知类型/未知条目跳过，永不 panic；version 字段不拒收
 //!   （格式漂移只会少采，不会错采）。
 
-
 use serde_json::Value;
 
 use crate::models::{MessageKind, NewArtifact, NewMessage, ParseOutput, SessionMetaPatch};
-
 
 /// pi 的写文件工具（真机词表：bash/read/edit/write/grep/ls/find）。
 const FILE_TOOLS: [&str; 2] = ["write", "edit"];
@@ -53,7 +51,11 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                 }
             }
             Some("message") => {
-                let Some(ts) = v.get("timestamp").and_then(Value::as_str).map(str::to_string) else {
+                let Some(ts) = v
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                else {
                     continue;
                 };
                 track_min(meta, &ts);
@@ -68,7 +70,13 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                         for item in items {
                             if item.get("type").and_then(Value::as_str) == Some("text") {
                                 if let Some(t) = item.get("text").and_then(Value::as_str) {
-                                    push(&mut out.messages, *line_no, MessageKind::User, t, Some(&ts));
+                                    push(
+                                        &mut out.messages,
+                                        *line_no,
+                                        MessageKind::User,
+                                        t,
+                                        Some(&ts),
+                                    );
                                 }
                             }
                         }
@@ -78,25 +86,69 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                             match item.get("type").and_then(Value::as_str) {
                                 Some("text") => {
                                     if let Some(t) = item.get("text").and_then(Value::as_str) {
-                                        push(&mut out.messages, *line_no, MessageKind::Assistant, t, Some(&ts));
+                                        push(
+                                            &mut out.messages,
+                                            *line_no,
+                                            MessageKind::Assistant,
+                                            t,
+                                            Some(&ts),
+                                        );
                                     }
                                 }
                                 Some("thinking") => {
                                     if let Some(t) = item.get("thinking").and_then(Value::as_str) {
-                                        push(&mut out.messages, *line_no, MessageKind::Thinking, t, Some(&ts));
+                                        push(
+                                            &mut out.messages,
+                                            *line_no,
+                                            MessageKind::Thinking,
+                                            t,
+                                            Some(&ts),
+                                        );
                                     }
                                 }
                                 Some("toolCall") => {
-                                    let name = item.get("name").and_then(Value::as_str).unwrap_or("?");
-                                    let args = item.get("arguments").cloned().unwrap_or(Value::Null);
+                                    let name =
+                                        item.get("name").and_then(Value::as_str).unwrap_or("?");
+                                    let args =
+                                        item.get("arguments").cloned().unwrap_or(Value::Null);
                                     let display = serde_json::to_string(&args).unwrap_or_default();
-                                    push(&mut out.messages, *line_no, MessageKind::ToolCall,
-                                        &format!("[{name}] {display}"), Some(&ts));
+                                    push(
+                                        &mut out.messages,
+                                        *line_no,
+                                        MessageKind::ToolCall,
+                                        &format!("[{name}] {display}"),
+                                        Some(&ts),
+                                    );
+                                    if let Some(last) = out.messages.last_mut() {
+                                        last.native_tool_call_id = item
+                                            .get("id")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_string);
+                                    }
                                     if FILE_TOOLS.contains(&name) {
                                         if let Some(fp) = args.get("path").and_then(Value::as_str) {
                                             out.artifacts.push(NewArtifact {
                                                 path: fp.to_string(),
+                                                from_path: None,
                                                 tool: name.to_string(),
+                                                operation: if name == "write" {
+                                                    "create"
+                                                } else {
+                                                    "edit"
+                                                }
+                                                .to_string(),
+                                                native_tool_call_id: item
+                                                    .get("id")
+                                                    .and_then(Value::as_str)
+                                                    .map(str::to_string),
+                                                timestamp: Some(ts.clone()),
+                                                line_no: *line_no,
+                                                ord: out
+                                                    .artifacts
+                                                    .iter()
+                                                    .filter(|a| a.line_no == *line_no)
+                                                    .count()
+                                                    as u32,
                                             });
                                         }
                                     }
@@ -118,8 +170,23 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                                 }
                             }
                         }
-                        push(&mut out.messages, *line_no, MessageKind::ToolResult,
-                            &format!("[{name}] {text}"), Some(&ts));
+                        push(
+                            &mut out.messages,
+                            *line_no,
+                            MessageKind::ToolResult,
+                            &format!("[{name}] {text}"),
+                            Some(&ts),
+                        );
+                        if let Some(last) = out.messages.last_mut() {
+                            last.native_tool_call_id = msg
+                                .get("toolCallId")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            last.tool_success = msg
+                                .get("isError")
+                                .and_then(Value::as_bool)
+                                .map(|error| !error);
+                        }
                     }
                     _ => {} // 未知 role：跳过
                 }
@@ -131,7 +198,14 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
 }
 
 fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, text: &str, ts: Option<&str>) {
-    super::push_message(out, line_no, kind, text.to_string(), ts.map(str::to_string), None);
+    super::push_message(
+        out,
+        line_no,
+        kind,
+        text.to_string(),
+        ts.map(str::to_string),
+        None,
+    );
 }
 
 fn track_min(meta: &mut SessionMetaPatch, ts: &str) {

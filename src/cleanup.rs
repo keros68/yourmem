@@ -12,14 +12,29 @@ fn safe_directory(path: &Path) -> Result<PathBuf> {
         path.is_absolute() && path.parent().is_some(),
         "拒绝清理磁盘根目录"
     );
-    let resolved = if path.exists() { path.canonicalize()? } else { path.to_path_buf() };
-    let user_home = crate::home_dir().canonicalize().unwrap_or_else(|_| crate::home_dir());
-    ensure!(!user_home.starts_with(&resolved), "拒绝清理用户主目录或其上级目录");
+    let resolved = if path.exists() {
+        path.canonicalize()?
+    } else {
+        path.to_path_buf()
+    };
+    let user_home = crate::home_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| crate::home_dir());
+    ensure!(
+        !user_home.starts_with(&resolved),
+        "拒绝清理用户主目录或其上级目录"
+    );
     if let Ok(cwd) = std::env::current_dir().and_then(|p| p.canonicalize()) {
-        ensure!(!cwd.starts_with(&resolved), "拒绝清理当前工作区或其上级目录");
+        ensure!(
+            !cwd.starts_with(&resolved),
+            "拒绝清理当前工作区或其上级目录"
+        );
     }
     if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize()) {
-        ensure!(!exe.starts_with(&resolved), "拒绝清理程序所在目录或其上级目录");
+        ensure!(
+            !exe.starts_with(&resolved),
+            "拒绝清理程序所在目录或其上级目录"
+        );
     }
     Ok(resolved)
 }
@@ -31,7 +46,11 @@ pub fn plan(home: &Path, include_backups: bool) -> Result<Value> {
     let backup_separate = !backup.starts_with(&data);
     // 备份在数据目录内且选择保留：删除数据目录时绕开备份子树
     let backups_kept_inside = !include_backups && !backup_separate && backup.exists();
-    let data_bytes = if backups_kept_inside { crate::dir_bytes(home).saturating_sub(crate::dir_bytes(&backup)) } else { crate::dir_bytes(home) };
+    let data_bytes = if backups_kept_inside {
+        crate::dir_bytes(home).saturating_sub(crate::dir_bytes(&backup))
+    } else {
+        crate::dir_bytes(home)
+    };
     let payload = json!({
         "data_dir": data,
         "data_bytes": data_bytes,
@@ -58,13 +77,22 @@ fn remove_data_dir(data: &Path, keep_backup: Option<&Path>) -> Result<()> {
     if !data.exists() {
         return Ok(());
     }
-    let name = data.file_name().context("数据目录没有名称")?.to_string_lossy().to_string();
+    let name = data
+        .file_name()
+        .context("数据目录没有名称")?
+        .to_string_lossy()
+        .to_string();
     let moved = data.with_file_name(format!("{name}.removing-{}", std::process::id()));
     std::fs::rename(data, &moved).with_context(|| {
-        format!("资料库正在被使用（采集或其他操作），请稍后重试；未删除任何文件：{}", data.display())
+        format!(
+            "资料库正在被使用（采集或其他操作），请稍后重试；未删除任何文件：{}",
+            data.display()
+        )
     })?;
     if let Some(backup) = keep_backup {
-        let rel = backup.strip_prefix(data).context("备份目录不在数据目录内")?;
+        let rel = backup
+            .strip_prefix(data)
+            .context("备份目录不在数据目录内")?;
         let inside = moved.join(rel);
         if inside.exists() {
             if let Some(parent) = backup.parent() {
@@ -83,10 +111,22 @@ pub fn execute(home: &Path, include_backups: bool, token: &str) -> Result<Value>
         current["token"].as_str() == Some(token),
         "清理目标已变化，请重新预览"
     );
-    let data = PathBuf::from(current["cleanup"]["data_dir"].as_str().context("清理计划缺少数据目录")?);
-    let backup = PathBuf::from(current["cleanup"]["backup_dir"].as_str().context("清理计划缺少备份目录")?);
-    let backup_separate = current["cleanup"]["backup_separate"].as_bool().unwrap_or(false);
-    let backups_kept_inside = current["cleanup"]["backups_kept_inside"].as_bool().unwrap_or(false);
+    let data = PathBuf::from(
+        current["cleanup"]["data_dir"]
+            .as_str()
+            .context("清理计划缺少数据目录")?,
+    );
+    let backup = PathBuf::from(
+        current["cleanup"]["backup_dir"]
+            .as_str()
+            .context("清理计划缺少备份目录")?,
+    );
+    let backup_separate = current["cleanup"]["backup_separate"]
+        .as_bool()
+        .unwrap_or(false);
+    let backups_kept_inside = current["cleanup"]["backups_kept_inside"]
+        .as_bool()
+        .unwrap_or(false);
     let active_home = safe_directory(&crate::data_home()).ok();
     remove_data_dir(&data, backups_kept_inside.then_some(backup.as_path()))?;
     if active_home.as_ref() == Some(&data) {
@@ -154,8 +194,12 @@ mod tests {
         crate::ingest::write_config(&home, &json!({"backup_dir": backup})).unwrap();
         let p = plan(&home, false).unwrap();
         assert!(execute(&home, false, p["token"].as_str().unwrap()).is_err());
-        assert!(home.join("yourmem.db").exists() && home.join("objects.db").exists() && home.join("config.json").exists(),
-            "被占用时一个文件都不删");
+        assert!(
+            home.join("yourmem.db").exists()
+                && home.join("objects.db").exists()
+                && home.join("config.json").exists(),
+            "被占用时一个文件都不删"
+        );
         drop(conn);
         let p = plan(&home, false).unwrap();
         execute(&home, false, p["token"].as_str().unwrap()).unwrap();

@@ -7,7 +7,11 @@ use serde_json::{json, Value};
 use yourmem::{adapters, data_home, db, doctor, expand_home, ingest, vault};
 
 #[derive(Parser)]
-#[command(name = "yourmem", version, about = "Local-first session vault, memory and recall for AI coding agents")]
+#[command(
+    name = "yourmem",
+    version,
+    about = "Local-first session vault, memory and recall for AI coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -90,6 +94,35 @@ enum Cmd {
         day: Option<String>,
         #[arg(long)]
         markdown: bool,
+    },
+    /// Durable cross-agent project tasks and their evidence.
+    Task {
+        #[command(subcommand)]
+        cmd: TaskCmd,
+    },
+    /// Unified project/task event timeline (JSON, stable paging metadata).
+    Timeline {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        kinds: Option<String>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value = "50")]
+        limit: i64,
+    },
+    /// Reliable change_log delta. --cursor is a JSON object with generation and seq.
+    Changes {
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value = "100")]
+        limit: i64,
     },
     /// Memory: curated project knowledge with provenance and lifecycle.
     Memory {
@@ -234,6 +267,145 @@ enum SessionCmd {
 }
 
 #[derive(Subcommand)]
+enum TaskCmd {
+    List {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long, default_value = "50")]
+        limit: i64,
+    },
+    Create {
+        title: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        allow_duplicates: bool,
+    },
+    Show {
+        task_id: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "50")]
+        limit: i64,
+    },
+    Update {
+        task_id: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        expected_revision: Option<i64>,
+        #[arg(long)]
+        session: Option<String>,
+        /// Explicit user action: locks status against silent Agent overwrites.
+        #[arg(long)]
+        confirm: bool,
+    },
+    Link {
+        task_id: String,
+        session_id: String,
+        #[arg(long, default_value = "contribution")]
+        relation: String,
+    },
+    Unlink {
+        task_id: String,
+        session_id: String,
+    },
+    Claim {
+        task_id: String,
+        #[arg(long, default_value = "contribution")]
+        relation: String,
+    },
+    Claims {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    ResolveClaim {
+        claim_id: String,
+        session_id: String,
+    },
+    ResolveProposal {
+        proposal_id: String,
+        #[arg(long)]
+        reject: bool,
+    },
+    Verify {
+        task_id: String,
+        #[arg(long, default_value = "manual")]
+        kind: String,
+        #[arg(long, default_value = "passed")]
+        result: String,
+        #[arg(long)]
+        source_message: Option<i64>,
+        #[arg(long, default_value = "用户通过 CLI 明确确认")]
+        evidence: String,
+    },
+    Close {
+        task_id: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "")]
+        title: String,
+        #[arg(long, default_value = "")]
+        done: String,
+        #[arg(long, default_value = "")]
+        state: String,
+        #[arg(long, default_value = "")]
+        decisions: String,
+        #[arg(long, default_value = "")]
+        files: String,
+        #[arg(long, default_value = "")]
+        issues: String,
+        #[arg(long, default_value = "")]
+        next: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    Conflicts,
+    ResolveMerge {
+        conflict_id: String,
+        #[arg(long, conflicts_with = "local")]
+        incoming: bool,
+        #[arg(long)]
+        local: bool,
+    },
+    Records {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Record {
+        record_id: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Export {
+        task_id: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    Pin {
+        record_id: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "project_document")]
+        kind: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum MemoryCmd {
     Add {
         #[arg(long)]
@@ -280,8 +452,12 @@ enum MemoryCmd {
         #[arg(long, default_value = "20")]
         limit: u32,
     },
-    Confirm { id: String },
-    Archive { id: String },
+    Confirm {
+        id: String,
+    },
+    Archive {
+        id: String,
+    },
     Supersede {
         id: String,
         #[arg(long)]
@@ -453,6 +629,17 @@ enum BundleCmd {
         #[arg(long)]
         merge: bool,
     },
+    /// Apply bundled non-sensitive config with explicit path remapping.
+    RestoreConfig {
+        path: PathBuf,
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// JSON object: {"source/path":"/target/path"}.
+        #[arg(long)]
+        map: Option<String>,
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -477,7 +664,10 @@ enum BackupCmd {
 fn write_stdout(text: &str) {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
-    if let Err(e) = stdout.write_all(text.as_bytes()).and_then(|_| stdout.flush()) {
+    if let Err(e) = stdout
+        .write_all(text.as_bytes())
+        .and_then(|_| stdout.flush())
+    {
         if e.kind() == std::io::ErrorKind::BrokenPipe || e.raw_os_error() == Some(232) {
             std::process::exit(0);
         }
@@ -487,7 +677,10 @@ fn write_stdout(text: &str) {
 }
 
 fn print_json(v: &Value) {
-    write_stdout(&format!("{}\n", serde_json::to_string_pretty(v).expect("json")));
+    write_stdout(&format!(
+        "{}\n",
+        serde_json::to_string_pretty(v).expect("json")
+    ));
 }
 
 fn run_import(
@@ -502,8 +695,14 @@ fn run_import(
 ) -> Result<ingest::ImportOutcome> {
     // 显式指定的库不存在必须报错：默认路径缺失=未装是正常态；但旗标/环境变量
     // 指向的文件多半是手误，静默跳过会让人以为采到了
-    for (flag, var, name) in [(&opencode_db, "YOUMEM_OPENCODE_DB", "OpenCode"), (&hermes_db, "YOUMEM_HERMES_DB", "Hermes")] {
-        if let Some(p) = flag.clone().or_else(|| std::env::var_os(var).map(PathBuf::from)) {
+    for (flag, var, name) in [
+        (&opencode_db, "YOUMEM_OPENCODE_DB", "OpenCode"),
+        (&hermes_db, "YOUMEM_HERMES_DB", "Hermes"),
+    ] {
+        if let Some(p) = flag
+            .clone()
+            .or_else(|| std::env::var_os(var).map(PathBuf::from))
+        {
             anyhow::ensure!(p.is_file(), "显式指定的 {name} 库不存在: {}", p.display());
         }
     }
@@ -547,6 +746,9 @@ fn main() -> Result<()> {
         },
         Cmd::Dossier { .. } => "dossier",
         Cmd::Digest { .. } => "digest",
+        Cmd::Task { .. } => "task",
+        Cmd::Timeline { .. } => "timeline",
+        Cmd::Changes { .. } => "changes",
         Cmd::Memory { .. } => "memory",
         Cmd::MemoryFiles { .. } => "memory-files",
         Cmd::Docs { .. } => "docs",
@@ -586,8 +788,25 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Mcp => return yourmem::mcp::serve(&home),
 
-        Cmd::Import { claude_dir, codex_dir, zcode_dir, kimi_dir, pi_dir, opencode_db, hermes_db } => {
-            let outcome = run_import(&home, claude_dir, codex_dir, zcode_dir, kimi_dir, pi_dir, opencode_db, hermes_db)?;
+        Cmd::Import {
+            claude_dir,
+            codex_dir,
+            zcode_dir,
+            kimi_dir,
+            pi_dir,
+            opencode_db,
+            hermes_db,
+        } => {
+            let outcome = run_import(
+                &home,
+                claude_dir,
+                codex_dir,
+                zcode_dir,
+                kimi_dir,
+                pi_dir,
+                opencode_db,
+                hermes_db,
+            )?;
             print_json(&ingest::outcome_json(&outcome));
         }
 
@@ -597,11 +816,12 @@ fn main() -> Result<()> {
                 // 单轮失败不退出（持续采集定位）：最典型场景是 import_with 的锁
                 // fail-closed 30s 超时——另一个命令在等 stdin 确认时 watch 不该死
                 match run_import(&home, None, None, None, None, None, None, None) {
-                    Ok(outcome) if outcome.messages_added > 0
-                        || outcome.lines_archived > 0
-                        || outcome.memory_revisions_added > 0
-                        || outcome.cross_checks_updated > 0
-                        || outcome.cross_checks_removed > 0 =>
+                    Ok(outcome)
+                        if outcome.messages_added > 0
+                            || outcome.lines_archived > 0
+                            || outcome.memory_revisions_added > 0
+                            || outcome.cross_checks_updated > 0
+                            || outcome.cross_checks_removed > 0 =>
                     {
                         print_json(&ingest::outcome_json(&outcome));
                     }
@@ -612,9 +832,32 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Search { query, project, agent, kind, limit } => {
-            let result = db::open(&home).and_then(|conn| db::search(&conn, &db::SearchOpts { query, project, agent, kind, limit }));
-            yourmem::recall_status::record(&home, "cli", "search", result.is_ok(), result.as_ref().ok().map(|v| v.len() as u64));
+        Cmd::Search {
+            query,
+            project,
+            agent,
+            kind,
+            limit,
+        } => {
+            let result = db::open(&home).and_then(|conn| {
+                db::search(
+                    &conn,
+                    &db::SearchOpts {
+                        query,
+                        project,
+                        agent,
+                        kind,
+                        limit,
+                    },
+                )
+            });
+            yourmem::recall_status::record(
+                &home,
+                "cli",
+                "search",
+                result.is_ok(),
+                result.as_ref().ok().map(|v| v.len() as u64),
+            );
             let hits = result?;
             print_json(&json!({ "results": hits }));
         }
@@ -655,7 +898,9 @@ fn main() -> Result<()> {
                         eprint!("确认并入上级项目并废弃子项目？输入 y 继续: ");
                         let mut line = String::new();
                         std::io::stdin().read_line(&mut line)?;
-                        if line.trim() != "y" { anyhow::bail!("已取消"); }
+                        if line.trim() != "y" {
+                            anyhow::bail!("已取消");
+                        }
                     }
                     print_json(&db::merge_project(&conn, child_id, parent_id)?);
                 }
@@ -664,7 +909,9 @@ fn main() -> Result<()> {
 
         Cmd::Context { project, markdown } => {
             let conn = db::open(&home)?;
-            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
             let (pid, ..) = db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
             let mut d = db::project_context(&conn, pid)?;
             d["source_review"] = yourmem::project_review::status(&conn, &home, pid)?;
@@ -676,9 +923,15 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Dossier { project, markdown, out } => {
+        Cmd::Dossier {
+            project,
+            markdown,
+            out,
+        } => {
             let conn = db::open(&home)?;
-            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
             let (pid, ..) = db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
             let mut d = yourmem::dossier::project_dossier(&conn, pid)?;
             d["project_docs"] = yourmem::project_docs::attach(&conn, &home, pid);
@@ -695,12 +948,18 @@ fn main() -> Result<()> {
 
         Cmd::Docs { cmd, project } => {
             let conn = db::open(&home)?;
-            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
             let (pid, ..) = db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
             print_json(&match cmd {
                 None => yourmem::project_docs::status(&conn, &home, pid)?,
-                Some(DocsCmd::Track { path }) => yourmem::project_docs::track(&conn, &home, pid, &path)?,
-                Some(DocsCmd::Untrack { path }) => yourmem::project_docs::untrack(&conn, &home, pid, &path)?,
+                Some(DocsCmd::Track { path }) => {
+                    yourmem::project_docs::track(&conn, &home, pid, &path)?
+                }
+                Some(DocsCmd::Untrack { path }) => {
+                    yourmem::project_docs::untrack(&conn, &home, pid, &path)?
+                }
             });
         }
 
@@ -718,10 +977,16 @@ fn main() -> Result<()> {
         Cmd::Session { cmd } => {
             let mut conn = db::open(&home)?;
             match cmd {
-                SessionCmd::Show { session_id, max, line } => {
-                    print_json(&db::read_session(&conn, &session_id, max, line, false)?)
-                }
-                SessionCmd::Precompact { session_id, markdown, out } => {
+                SessionCmd::Show {
+                    session_id,
+                    max,
+                    line,
+                } => print_json(&db::read_session(&conn, &session_id, max, line, false)?),
+                SessionCmd::Precompact {
+                    session_id,
+                    markdown,
+                    out,
+                } => {
                     let d = db::read_session(&conn, &session_id, u32::MAX, None, true)?;
                     if markdown || out.is_some() {
                         let md = yourmem::dossier::render_session_markdown(&d);
@@ -741,32 +1006,53 @@ fn main() -> Result<()> {
                     db::set_session_deleted(&conn, &session_id, false)?;
                     print_json(&json!({ "session_id": session_id, "restored": true }));
                 }
-                SessionCmd::Purge { session_id, yes, force, keep_archive } => {
-                    let r = yourmem::trash::purge_cli(&mut conn, &home, &session_id, force, keep_archive, |plan| {
-                        print_json(plan);
-                        if plan["can_purge"] != true && !force {
-                            anyhow::bail!("不满足物理清除条件（见上方预览；保留期内可加 --force 强制）");
-                        }
-                        if !yes {
-                            eprint!("确认物理删除？将先归档到 backups/purge/。输入 y 继续: ");
-                            let mut line = String::new();
-                            std::io::stdin().read_line(&mut line)?;
-                            if line.trim() != "y" { anyhow::bail!("已取消"); }
-                        }
-                        Ok(())
-                    })?;
+                SessionCmd::Purge {
+                    session_id,
+                    yes,
+                    force,
+                    keep_archive,
+                } => {
+                    let r = yourmem::trash::purge_cli(
+                        &mut conn,
+                        &home,
+                        &session_id,
+                        force,
+                        keep_archive,
+                        |plan| {
+                            print_json(plan);
+                            if plan["can_purge"] != true && !force {
+                                anyhow::bail!(
+                                    "不满足物理清除条件（见上方预览；保留期内可加 --force 强制）"
+                                );
+                            }
+                            if !yes {
+                                eprint!("确认物理删除？将先归档到 backups/purge/。输入 y 继续: ");
+                                let mut line = String::new();
+                                std::io::stdin().read_line(&mut line)?;
+                                if line.trim() != "y" {
+                                    anyhow::bail!("已取消");
+                                }
+                            }
+                            Ok(())
+                        },
+                    )?;
                     print_json(&r);
                 }
                 SessionCmd::Empty { yes } => {
                     let r = yourmem::trash::empty_cli(&mut conn, &home, |plan| {
                         print_json(plan);
                         if !yes {
-                            let n = plan["overdue_sessions"].as_array().map(Vec::len).unwrap_or(0);
+                            let n = plan["overdue_sessions"]
+                                .as_array()
+                                .map(Vec::len)
+                                .unwrap_or(0);
                             eprint!("确认物理删除以上 {} 个超期会话（归档 {} 个对象 {} 字节）？输入 y 继续: ",
                                 n, plan["exclusive_objects"], plan["exclusive_bytes"]);
                             let mut line = String::new();
                             std::io::stdin().read_line(&mut line)?;
-                            if line.trim() != "y" { anyhow::bail!("已取消"); }
+                            if line.trim() != "y" {
+                                anyhow::bail!("已取消");
+                            }
                         }
                         Ok(())
                     })?;
@@ -778,33 +1064,307 @@ fn main() -> Result<()> {
             }
         }
 
+        Cmd::Task { cmd } => {
+            let conn = db::open(&home)?;
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
+            let result = match cmd {
+                TaskCmd::List {
+                    project,
+                    status,
+                    agent,
+                    limit,
+                } => {
+                    let pid = db::cwd_project(&conn, project.as_deref(), cwd.as_deref())?;
+                    json!({"tasks":yourmem::work::list_tasks(&conn,pid,status.as_deref(),agent.as_deref(),limit)?})
+                }
+                TaskCmd::Create {
+                    title,
+                    project,
+                    session,
+                    allow_duplicates,
+                } => {
+                    let pid = db::require_project(&conn, project.as_deref(), cwd.as_deref())?.0;
+                    yourmem::work::create_task(
+                        &conn,
+                        pid,
+                        &title,
+                        session.as_deref(),
+                        allow_duplicates,
+                    )?
+                }
+                TaskCmd::Show {
+                    task_id,
+                    project,
+                    limit,
+                } => {
+                    let pid = db::cwd_project(&conn, project.as_deref(), cwd.as_deref())?;
+                    let id = yourmem::work::resolve_task(&conn, &task_id, pid)?;
+                    yourmem::work::task_context(&conn, &home, &id, limit)?
+                }
+                TaskCmd::Update {
+                    task_id,
+                    project,
+                    title,
+                    status,
+                    expected_revision,
+                    session,
+                    confirm,
+                } => {
+                    let pid = db::cwd_project(&conn, project.as_deref(), cwd.as_deref())?;
+                    let id = yourmem::work::resolve_task(&conn, &task_id, pid)?;
+                    yourmem::work::update_task(
+                        &conn,
+                        &id,
+                        title.as_deref(),
+                        status.as_deref(),
+                        expected_revision,
+                        session.as_deref(),
+                        confirm,
+                    )?
+                }
+                TaskCmd::Link {
+                    task_id,
+                    session_id,
+                    relation,
+                } => {
+                    let pid = db::cwd_project(&conn, None, cwd.as_deref())?;
+                    let task_id = yourmem::work::resolve_task(&conn, &task_id, pid)?;
+                    yourmem::work::link_session(
+                        &conn,
+                        &task_id,
+                        &session_id,
+                        &relation,
+                        "user_confirmed",
+                    )?
+                }
+                TaskCmd::Unlink {
+                    task_id,
+                    session_id,
+                } => {
+                    let pid = db::cwd_project(&conn, None, cwd.as_deref())?;
+                    let task_id = yourmem::work::resolve_task(&conn, &task_id, pid)?;
+                    yourmem::work::unlink_session(&conn, &task_id, &session_id)?
+                }
+                TaskCmd::Claim { task_id, relation } => {
+                    let pid = db::cwd_project(&conn, None, cwd.as_deref())?;
+                    let task_id = yourmem::work::resolve_task(&conn, &task_id, pid)?;
+                    yourmem::work::issue_claim(&conn, &task_id, &relation)?
+                }
+                TaskCmd::Claims { project } => {
+                    let pid = db::cwd_project(&conn, project.as_deref(), cwd.as_deref())?;
+                    json!({"claims":yourmem::work::pending_claims(&conn,pid)?})
+                }
+                TaskCmd::ResolveClaim {
+                    claim_id,
+                    session_id,
+                } => yourmem::work::resolve_claim(&conn, &claim_id, &session_id)?,
+                TaskCmd::ResolveProposal {
+                    proposal_id,
+                    reject,
+                } => yourmem::work::resolve_proposal(&conn, &proposal_id, !reject)?,
+                TaskCmd::Verify {
+                    task_id,
+                    kind,
+                    result,
+                    source_message,
+                    evidence,
+                } => {
+                    let pid = db::cwd_project(&conn, None, cwd.as_deref())?;
+                    let task_id = yourmem::work::resolve_task(&conn, &task_id, pid)?;
+                    yourmem::work::add_verification(
+                        &conn,
+                        &task_id,
+                        &kind,
+                        &result,
+                        source_message,
+                        &evidence,
+                        true,
+                    )?
+                }
+                TaskCmd::Close {
+                    task_id,
+                    project,
+                    title,
+                    done,
+                    state,
+                    decisions,
+                    files,
+                    issues,
+                    next,
+                    status,
+                    session,
+                } => {
+                    let pid = db::require_project(&conn, project.as_deref(), cwd.as_deref())?.0;
+                    let id = yourmem::work::resolve_task(&conn, &task_id, Some(pid))?;
+                    let fields = db::HandoffFields {
+                        title: &title,
+                        done: &done,
+                        state: &state,
+                        decisions: &decisions,
+                        files_changed: &files,
+                        open_issues: &issues,
+                        next_steps: &next,
+                        session_id: session.as_deref(),
+                    };
+                    yourmem::work::close_work(&conn, pid, &id, &fields, status.as_deref())?
+                }
+                TaskCmd::Conflicts => {
+                    json!({"merge_conflicts":yourmem::work::merge_conflicts(&conn,true)?})
+                }
+                TaskCmd::ResolveMerge {
+                    conflict_id,
+                    incoming,
+                    local,
+                } => {
+                    let choice = if incoming {
+                        "incoming"
+                    } else if local {
+                        "local"
+                    } else {
+                        anyhow::bail!("请显式选择 --local 或 --incoming")
+                    };
+                    yourmem::work::resolve_merge_conflict(&conn, &conflict_id, choice)?
+                }
+                TaskCmd::Records { project } => {
+                    let pid = db::require_project(&conn, project.as_deref(), cwd.as_deref())?.0;
+                    json!({"records":yourmem::work::project_records(&conn,pid)?})
+                }
+                TaskCmd::Record { record_id, project } => {
+                    let pid = db::require_project(&conn, project.as_deref(), cwd.as_deref())?.0;
+                    yourmem::work::get_project_record(&conn, &home, pid, &record_id)?
+                }
+                TaskCmd::Export {
+                    task_id,
+                    project,
+                    out,
+                } => {
+                    let pid = db::cwd_project(&conn, project.as_deref(), cwd.as_deref())?;
+                    let id = yourmem::work::resolve_task(&conn, &task_id, pid)?;
+                    let markdown = yourmem::work::task_markdown(&conn, &home, &id)?;
+                    match out {
+                        Some(path) => {
+                            std::fs::write(&path, markdown)?;
+                            json!({"path":path,"format":"human_readable_evidence_not_full_backup"})
+                        }
+                        None => {
+                            json!({"markdown":markdown,"format":"human_readable_evidence_not_full_backup"})
+                        }
+                    }
+                }
+                TaskCmd::Pin {
+                    record_id,
+                    project,
+                    kind,
+                } => {
+                    let pid = db::require_project(&conn, project.as_deref(), cwd.as_deref())?.0;
+                    yourmem::work::pin_record(&conn, pid, &kind, &record_id)?
+                }
+            };
+            print_json(&result);
+        }
+
+        Cmd::Timeline {
+            project,
+            task,
+            from,
+            to,
+            kinds,
+            cursor,
+            limit,
+        } => {
+            let conn = db::open(&home)?;
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
+            let pid = db::cwd_project(&conn, project.as_deref(), cwd.as_deref())?;
+            let task_id = match task {
+                Some(id) => Some(yourmem::work::resolve_task(&conn, &id, pid)?),
+                None => None,
+            };
+            let kinds: Vec<String> = kinds
+                .map(|s| {
+                    s.split(',')
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            print_json(&yourmem::work::timeline(
+                &conn,
+                pid,
+                task_id.as_deref(),
+                from.as_deref(),
+                to.as_deref(),
+                &kinds,
+                cursor.as_deref(),
+                limit,
+            )?);
+        }
+
+        Cmd::Changes { cursor, limit } => {
+            let conn = db::open(&home)?;
+            let cursor = cursor
+                .map(|s| serde_json::from_str::<Value>(&s))
+                .transpose()?
+                .unwrap_or_else(|| json!({}));
+            print_json(&yourmem::work::changes(
+                &conn,
+                cursor["database_generation"].as_str(),
+                cursor["seq"].as_i64().unwrap_or(0),
+                limit,
+            )?);
+        }
+
         Cmd::Memory { cmd } => {
             let conn = db::open(&home)?;
-            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
             match cmd {
-                MemoryCmd::Add { r#type, content, project, scope, status, source_session, source_message } => {
+                MemoryCmd::Add {
+                    r#type,
+                    content,
+                    project,
+                    scope,
+                    status,
+                    source_session,
+                    source_message,
+                } => {
                     let pid = if scope == "global" {
                         None
                     } else {
                         Some(db::require_project(&conn, project.as_deref(), cwd.as_deref())?.0)
                     };
                     // 写路径纪律（engramory 吸收）：查重在 save 之前——知情门控，不拦截
-                    let (id, similar) = db::save_memory_with_similar(&conn, &db::MemoryInput {
-                        project_id: pid,
-                        scope: &scope,
-                        r#type: &r#type,
-                        content: &content,
-                        status: status.as_deref(),
-                        source_session_id: source_session.as_deref(),
-                        source_message_id: source_message,
-                    })?;
+                    let (id, similar) = db::save_memory_with_similar(
+                        &conn,
+                        &db::MemoryInput {
+                            project_id: pid,
+                            scope: &scope,
+                            r#type: &r#type,
+                            content: &content,
+                            status: status.as_deref(),
+                            source_session_id: source_session.as_deref(),
+                            source_message_id: source_message,
+                        },
+                    )?;
                     if !similar.is_empty() {
                         eprintln!("提示：疑似重复（纪律：更新优于复制，考虑 update_memory 取代而非新增）：");
                         for m in &similar {
-                            eprintln!("  [{}] {}…（id {}，重合 {}）",
+                            eprintln!(
+                                "  [{}] {}…（id {}，重合 {}）",
                                 m["status"].as_str().unwrap_or("?"),
-                                m["content"].as_str().unwrap_or("").chars().take(40).collect::<String>(),
-                                m["id"].as_str().unwrap_or("?"), m["shared_trigrams"]);
+                                m["content"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .chars()
+                                    .take(40)
+                                    .collect::<String>(),
+                                m["id"].as_str().unwrap_or("?"),
+                                m["shared_trigrams"]
+                            );
                         }
                     }
                     if let Some(hint) = db::promotion_hint(&r#type, &similar) {
@@ -812,18 +1372,51 @@ fn main() -> Result<()> {
                     }
                     print_json(&json!({ "memory_id": id, "similar_count": similar.len() }));
                 }
-                MemoryCmd::List { project, scope, r#type, status, agent, limit } => {
+                MemoryCmd::List {
+                    project,
+                    scope,
+                    r#type,
+                    status,
+                    agent,
+                    limit,
+                } => {
                     let pid = db::optional_project(&conn, project.as_deref(), cwd.as_deref())?;
-                    let mems = db::list_memories(&conn, &db::MemoryFilter {
-                        project_id: pid, scope, r#type, status, agent, include_global: pid.is_some(), limit,
-                    })?;
+                    let mems = db::list_memories(
+                        &conn,
+                        &db::MemoryFilter {
+                            project_id: pid,
+                            scope,
+                            r#type,
+                            status,
+                            agent,
+                            include_global: pid.is_some(),
+                            limit,
+                        },
+                    )?;
                     print_json(&json!({ "memories": mems }));
                 }
-                MemoryCmd::Search { query, project, r#type, status, agent, limit } => {
+                MemoryCmd::Search {
+                    query,
+                    project,
+                    r#type,
+                    status,
+                    agent,
+                    limit,
+                } => {
                     let pid = db::optional_project(&conn, project.as_deref(), cwd.as_deref())?;
-                    let mems = db::search_memory(&conn, &query, &db::MemoryFilter {
-                        project_id: pid, scope: None, r#type, status, agent, include_global: pid.is_some(), limit,
-                    })?;
+                    let mems = db::search_memory(
+                        &conn,
+                        &query,
+                        &db::MemoryFilter {
+                            project_id: pid,
+                            scope: None,
+                            r#type,
+                            status,
+                            agent,
+                            include_global: pid.is_some(),
+                            limit,
+                        },
+                    )?;
                     print_json(&json!({ "memories": mems }));
                 }
                 MemoryCmd::Confirm { id } => {
@@ -836,7 +1429,9 @@ fn main() -> Result<()> {
                 }
                 MemoryCmd::Supersede { id, by } => {
                     db::update_memory_status(&conn, &id, "supersede", Some(&by))?;
-                    print_json(&json!({ "memory_id": id, "status": "superseded", "superseded_by": by }));
+                    print_json(
+                        &json!({ "memory_id": id, "status": "superseded", "superseded_by": by }),
+                    );
                 }
             }
         }
@@ -860,22 +1455,48 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Artifacts { project, session, limit } => {
+        Cmd::Artifacts {
+            project,
+            session,
+            limit,
+        } => {
             let conn = db::open(&home)?;
-            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
             let pid = db::optional_project(&conn, project.as_deref(), cwd.as_deref())?;
-            print_json(&json!({ "artifacts": db::list_artifacts(&conn, pid, session.as_deref(), limit)? }));
+            print_json(
+                &json!({ "artifacts": db::list_artifacts(&conn, pid, session.as_deref(), limit)? }),
+            );
         }
 
         Cmd::Handoff { cmd } => {
             let conn = db::open(&home)?;
-            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
             match cmd {
-                HandoffCmd::Create { project, title, done, state, decisions, files, issues, next, session } => {
-                    let (pid, name, _) = db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
+                HandoffCmd::Create {
+                    project,
+                    title,
+                    done,
+                    state,
+                    decisions,
+                    files,
+                    issues,
+                    next,
+                    session,
+                } => {
+                    let (pid, name, _) =
+                        db::require_project(&conn, project.as_deref(), cwd.as_deref())?;
                     let fields = db::HandoffFields {
-                        title: &title, done: &done, state: &state, decisions: &decisions,
-                        files_changed: &files, open_issues: &issues, next_steps: &next,
+                        title: &title,
+                        done: &done,
+                        state: &state,
+                        decisions: &decisions,
+                        files_changed: &files,
+                        open_issues: &issues,
+                        next_steps: &next,
                         session_id: session.as_deref(),
                     };
                     let id = db::create_handoff(&conn, pid, &fields)?;
@@ -934,7 +1555,11 @@ fn main() -> Result<()> {
             print_json(&result);
         }
         Cmd::Bundle { cmd } => match cmd {
-            BundleCmd::Create { out, agent, project } => {
+            BundleCmd::Create {
+                out,
+                agent,
+                project,
+            } => {
                 let conn = db::open(&home)?;
                 let filter = yourmem::bundle::BundleFilter { agent, project };
                 print_json(&yourmem::bundle::create(&conn, &home, &out, &filter)?);
@@ -942,7 +1567,11 @@ fn main() -> Result<()> {
             BundleCmd::Verify { path } => {
                 print_json(&yourmem::bundle::verify(&path)?);
             }
-            BundleCmd::Restore { path, home: target, merge } => {
+            BundleCmd::Restore {
+                path,
+                home: target,
+                merge,
+            } => {
                 let target = target.unwrap_or_else(|| home.clone());
                 let restored = yourmem::bundle::restore(&path, &target, merge)?;
                 if let Ok(conn) = db::open(&target) {
@@ -950,9 +1579,27 @@ fn main() -> Result<()> {
                 }
                 print_json(&restored);
             }
+            BundleCmd::RestoreConfig {
+                path,
+                home: target,
+                map,
+                overwrite,
+            } => {
+                let target = target.unwrap_or_else(|| home.clone());
+                let mappings: std::collections::HashMap<String, String> =
+                    serde_json::from_str(map.as_deref().unwrap_or("{}"))?;
+                print_json(&yourmem::bundle::restore_config(
+                    &path, &target, &mappings, overwrite,
+                )?);
+            }
         },
 
-        Cmd::RestoreAgents { agent, session, force, yes } => {
+        Cmd::RestoreAgents {
+            agent,
+            session,
+            force,
+            yes,
+        } => {
             let conn = db::open(&home)?;
             // 门控 1/2：预览 + 确认（门控 3/4 在 execute 里：.bak 备份、字节级重建）
             let plan = yourmem::restore::plan(&conn, &agent, &session)?;
@@ -993,21 +1640,40 @@ fn main() -> Result<()> {
             print_json(&yourmem::setup::execute(&targets)?);
         }
 
-        Cmd::Teardown { delete_data, delete_backups, yes } => {
+        Cmd::Teardown {
+            delete_data,
+            delete_backups,
+            yes,
+        } => {
             let targets = yourmem::setup::Targets::default();
             let agents = yourmem::setup::SETUP_AGENTS.map(str::to_string);
             let disconnect = yourmem::setup::remove_plan_selected(&targets, &agents)?;
-            let cleanup = delete_data.then(|| yourmem::cleanup::plan(&home, delete_backups)).transpose()?;
+            let cleanup = delete_data
+                .then(|| yourmem::cleanup::plan(&home, delete_backups))
+                .transpose()?;
             print_json(&json!({"disconnect":disconnect,"cleanup":cleanup}));
             if !yes {
-                eprint!("确认解除全部 yourmem 接入{}？输入 y 继续: ", if delete_data { "并永久删除所选数据" } else { "" });
+                eprint!(
+                    "确认解除全部 yourmem 接入{}？输入 y 继续: ",
+                    if delete_data {
+                        "并永久删除所选数据"
+                    } else {
+                        ""
+                    }
+                );
                 let mut line = String::new();
                 std::io::stdin().read_line(&mut line)?;
-                if line.trim() != "y" { anyhow::bail!("已取消"); }
+                if line.trim() != "y" {
+                    anyhow::bail!("已取消");
+                }
             }
             let removed = yourmem::setup::remove_execute_selected(&targets, &agents)?;
             let cleaned = match cleanup {
-                Some(p) => Some(yourmem::cleanup::execute(&home, delete_backups, p["token"].as_str().unwrap_or_default())?),
+                Some(p) => Some(yourmem::cleanup::execute(
+                    &home,
+                    delete_backups,
+                    p["token"].as_str().unwrap_or_default(),
+                )?),
                 None => None,
             };
             print_json(&json!({"disconnect":removed,"cleanup":cleaned}));

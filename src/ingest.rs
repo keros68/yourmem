@@ -15,7 +15,10 @@ static PROGRESS_TOTAL: AtomicUsize = AtomicUsize::new(0);
 /// Files handled so far and files listed in the current (or last) import of
 /// this process.
 pub fn progress() -> (usize, usize) {
-    (PROGRESS_DONE.load(Ordering::Relaxed), PROGRESS_TOTAL.load(Ordering::Relaxed))
+    (
+        PROGRESS_DONE.load(Ordering::Relaxed),
+        PROGRESS_TOTAL.load(Ordering::Relaxed),
+    )
 }
 
 use anyhow::{Context, Result};
@@ -72,11 +75,22 @@ pub fn import_with(
     hermes_db: Option<&Path>,
 ) -> Result<ImportOutcome> {
     let result = import_with_inner(home, roots, opencode_db, hermes_db);
-    crate::recall_status::record(home, "ingest", "import", result.is_ok(), result.as_ref().ok().map(|o| o.messages_added));
+    crate::recall_status::record(
+        home,
+        "ingest",
+        "import",
+        result.is_ok(),
+        result.as_ref().ok().map(|o| o.messages_added),
+    );
     result
 }
 
-fn import_with_inner(home: &Path, roots: &[(&str, PathBuf)], opencode_db: Option<&Path>, hermes_db: Option<&Path>) -> Result<ImportOutcome> {
+fn import_with_inner(
+    home: &Path,
+    roots: &[(&str, PathBuf)],
+    opencode_db: Option<&Path>,
+    hermes_db: Option<&Path>,
+) -> Result<ImportOutcome> {
     // 锁覆盖全程：import_all + memfiles 采集 + .last_import（codex 复审：只锁
     // import_all 时，并发 import_with 可在 memfiles 的"读旧 hash→更新"竞态里
     // 重复插修订/撞 UNIQUE(agent,path)）。fail-closed：拿不到锁就报错——
@@ -133,8 +147,16 @@ pub fn import_overriding(home: &Path, overrides: &[(&str, PathBuf)]) -> Result<I
         .collect();
     apply_extra_roots_and_gates(home, &mut roots);
     let refs: Vec<(&str, PathBuf)> = roots.iter().map(|(a, p)| (a.as_str(), p.clone())).collect();
-    let oc = pick(adapters::opencode::AGENT_OPENCODE, "YOUMEM_OPENCODE_DB", adapters::opencode::default_db_path());
-    let hm = pick(adapters::hermes::AGENT_HERMES, "YOUMEM_HERMES_DB", adapters::hermes::default_db_path());
+    let oc = pick(
+        adapters::opencode::AGENT_OPENCODE,
+        "YOUMEM_OPENCODE_DB",
+        adapters::opencode::default_db_path(),
+    );
+    let hm = pick(
+        adapters::hermes::AGENT_HERMES,
+        "YOUMEM_HERMES_DB",
+        adapters::hermes::default_db_path(),
+    );
     import_with(home, &refs, oc.as_deref(), hm.as_deref())
 }
 
@@ -146,12 +168,32 @@ pub fn import_overriding(home: &Path, overrides: &[(&str, PathBuf)]) -> Result<I
 /// 文件型 agent：(名称, 根目录覆盖环境变量, 默认根)。都可登记额外根；
 /// 新增文件型 agent 只改这里。
 pub const FILE_AGENTS: [(&str, &str, fn() -> PathBuf); 6] = [
-    (adapters::AGENT_CLAUDE, "YOUMEM_CLAUDE_DIR", crate::default_claude_root),
-    (adapters::AGENT_CODEX, "YOUMEM_CODEX_DIR", crate::default_codex_root),
-    (adapters::AGENT_ZCODE, "YOUMEM_ZCODE_DIR", crate::default_zcode_root),
-    (adapters::AGENT_KIMI, "YOUMEM_KIMI_DIR", crate::default_kimi_root),
+    (
+        adapters::AGENT_CLAUDE,
+        "YOUMEM_CLAUDE_DIR",
+        crate::default_claude_root,
+    ),
+    (
+        adapters::AGENT_CODEX,
+        "YOUMEM_CODEX_DIR",
+        crate::default_codex_root,
+    ),
+    (
+        adapters::AGENT_ZCODE,
+        "YOUMEM_ZCODE_DIR",
+        crate::default_zcode_root,
+    ),
+    (
+        adapters::AGENT_KIMI,
+        "YOUMEM_KIMI_DIR",
+        crate::default_kimi_root,
+    ),
     (adapters::AGENT_PI, "YOUMEM_PI_DIR", crate::default_pi_root),
-    (adapters::AGENT_ANTIGRAVITY, "YOUMEM_ANTIGRAVITY_DIR", crate::default_antigravity_root),
+    (
+        adapters::AGENT_ANTIGRAVITY,
+        "YOUMEM_ANTIGRAVITY_DIR",
+        crate::default_antigravity_root,
+    ),
 ];
 
 fn is_file_agent(agent: &str) -> bool {
@@ -159,7 +201,8 @@ fn is_file_agent(agent: &str) -> bool {
 }
 
 pub fn read_config(home: &Path) -> Value {
-    std::fs::read_to_string(home.join("config.json")).ok()
+    std::fs::read_to_string(home.join("config.json"))
+        .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({}))
 }
@@ -178,13 +221,20 @@ pub fn write_config(home: &Path, cfg: &Value) -> Result<()> {
 /// → 修改 → tmp+rename 写回。首次创建（无文件）按空对象起步。
 pub fn update_config<T>(home: &Path, f: impl FnOnce(&mut Value) -> Result<T>) -> Result<T> {
     std::fs::create_dir_all(home)?;
-    let _lock = ImportLockTx::acquire_file(&home.join(".config.lock.db"), std::time::Duration::from_secs(5))?;
+    let _lock = ImportLockTx::acquire_file(
+        &home.join(".config.lock.db"),
+        std::time::Duration::from_secs(5),
+    )?;
     let path = home.join("config.json");
     let mut cfg = match std::fs::read_to_string(&path) {
         Ok(text) => {
-            let v: Value = serde_json::from_str(&text)
-                .map_err(|e| anyhow::anyhow!("config.json 无法解析，未写入（请修复或删除该文件）：{e}"))?;
-            anyhow::ensure!(v.is_object(), "config.json 不是 JSON 对象，未写入（请修复或删除该文件）");
+            let v: Value = serde_json::from_str(&text).map_err(|e| {
+                anyhow::anyhow!("config.json 无法解析，未写入（请修复或删除该文件）：{e}")
+            })?;
+            anyhow::ensure!(
+                v.is_object(),
+                "config.json 不是 JSON 对象，未写入（请修复或删除该文件）"
+            );
             v
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
@@ -197,9 +247,17 @@ pub fn update_config<T>(home: &Path, f: impl FnOnce(&mut Value) -> Result<T>) ->
 
 /// config.json 里登记的自定义根（agent, path）。文件缺失/损坏按空处理。
 pub fn extra_roots(home: &Path) -> Vec<(String, PathBuf)> {
-    read_config(home)["extra_roots"].as_array().cloned().unwrap_or_default()
+    read_config(home)["extra_roots"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
         .into_iter()
-        .filter_map(|r| Some((r["agent"].as_str()?.to_string(), PathBuf::from(r["path"].as_str()?))))
+        .filter_map(|r| {
+            Some((
+                r["agent"].as_str()?.to_string(),
+                PathBuf::from(r["path"].as_str()?),
+            ))
+        })
         .collect()
 }
 
@@ -219,7 +277,10 @@ pub fn apply_extra_roots_and_gates(home: &Path, roots: &mut Vec<(String, PathBuf
 /// 已停用的内置 agent（config.json disabled_agents，用户反馈 2026-08-29：卸载了
 /// opencode 就不该再扫它的库）。停用 = 不采集不检测；已入库历史保留可搜。
 pub fn disabled_agents(home: &Path) -> Vec<String> {
-    read_config(home)["disabled_agents"].as_array().cloned().unwrap_or_default()
+    read_config(home)["disabled_agents"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect()
@@ -227,12 +288,22 @@ pub fn disabled_agents(home: &Path) -> Vec<String> {
 
 pub fn set_agent_disabled(home: &Path, agent: &str, disabled: bool) -> Result<Value> {
     anyhow::ensure!(
-        is_file_agent(agent) || [adapters::opencode::AGENT_OPENCODE, adapters::hermes::AGENT_HERMES].contains(&agent),
+        is_file_agent(agent)
+            || [
+                adapters::opencode::AGENT_OPENCODE,
+                adapters::hermes::AGENT_HERMES
+            ]
+            .contains(&agent),
         "unknown agent: {agent}"
     );
     update_config(home, |cfg| {
-        let mut list: Vec<String> = cfg["disabled_agents"].as_array().cloned().unwrap_or_default()
-            .into_iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        let mut list: Vec<String> = cfg["disabled_agents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
         if disabled {
             if !list.iter().any(|a| a == agent) {
                 list.push(agent.to_string());
@@ -267,8 +338,10 @@ pub fn add_extra_root(home: &Path, agent: &str, path: &Path) -> Result<Value> {
     let p = path.to_string_lossy().to_string();
     let roots = update_config(home, |cfg| {
         let mut roots = cfg["extra_roots"].as_array().cloned().unwrap_or_default();
-        anyhow::ensure!(!roots.iter().any(|r| r["agent"] == agent && r["path"] == p),
-            "extra root already registered: {agent} {p}");
+        anyhow::ensure!(
+            !roots.iter().any(|r| r["agent"] == agent && r["path"] == p),
+            "extra root already registered: {agent} {p}"
+        );
         roots.push(json!({ "agent": agent, "path": p }));
         cfg["extra_roots"] = Value::Array(roots);
         Ok(cfg["extra_roots"].clone())
@@ -280,9 +353,15 @@ pub fn remove_extra_root(home: &Path, agent: &str, path: &Path) -> Result<Value>
     let p = path.to_string_lossy().to_string();
     let roots = update_config(home, |cfg| {
         let roots = cfg["extra_roots"].as_array().cloned().unwrap_or_default();
-        let kept: Vec<Value> = roots.iter()
-            .filter(|r| !(r["agent"] == agent && r["path"] == p)).cloned().collect();
-        anyhow::ensure!(kept.len() < roots.len(), "extra root not found: {agent} {p}");
+        let kept: Vec<Value> = roots
+            .iter()
+            .filter(|r| !(r["agent"] == agent && r["path"] == p))
+            .cloned()
+            .collect();
+        anyhow::ensure!(
+            kept.len() < roots.len(),
+            "extra root not found: {agent} {p}"
+        );
         cfg["extra_roots"] = Value::Array(kept);
         Ok(cfg["extra_roots"].clone())
     })?;
@@ -293,14 +372,14 @@ pub fn remove_extra_root(home: &Path, agent: &str, path: &Path) -> Result<Value>
 /// 会话数、已登记的自定义根、停用状态、最后采集时间；另附主流 agent 观察名单
 /// 的目录级检测。只读。
 pub fn agent_sources(home: &Path, conn: &Connection) -> Result<Value> {
-    let mut stmt = conn.prepare(
-        "SELECT agent, COUNT(*) FROM sessions WHERE deleted_at IS NULL GROUP BY agent",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT agent, COUNT(*) FROM sessions WHERE deleted_at IS NULL GROUP BY agent")?;
     let counts: std::collections::HashMap<String, i64> = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
         .collect::<std::result::Result<_, _>>()?;
     // 最后采集时间（source_files.updated_at）：文件型与单库源都记在 agent 列
-    let mut stmt = conn.prepare("SELECT agent, MAX(updated_at) FROM source_files GROUP BY agent")?;
+    let mut stmt =
+        conn.prepare("SELECT agent, MAX(updated_at) FROM source_files GROUP BY agent")?;
     let last_imported: std::collections::HashMap<String, String> = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
         .collect::<std::result::Result<_, _>>()?;
@@ -344,12 +423,15 @@ pub fn agent_sources(home: &Path, conn: &Connection) -> Result<Value> {
         "can_add_root": false,  // 单库源：YOUMEM_HERMES_DB 覆盖
     }));
     // 观察名单：目录级检测，解析支持待样本（不承诺采集）
-    let watchlist: Vec<Value> = WATCHLIST.iter()
-        .map(|(name, root)| json!({
-            "agent": name,
-            "root": root(),
-            "detected": root().is_dir(),
-        }))
+    let watchlist: Vec<Value> = WATCHLIST
+        .iter()
+        .map(|(name, root)| {
+            json!({
+                "agent": name,
+                "root": root(),
+                "detected": root().is_dir(),
+            })
+        })
         .collect();
     Ok(json!({ "agents": out, "watchlist": watchlist }))
 }
@@ -401,12 +483,18 @@ pub fn import_all(
                     // Windows 默认拒绝读被其他进程独占打开的文件（agent 正在写
                     // 会话文件）：跳过本轮，offset 未推进，下轮增量补采。
                     out.files_skipped += 1;
-                    eprintln!("yourmem import: 文件被占用，本轮跳过（下轮补采）：{}", path.display());
+                    eprintln!(
+                        "yourmem import: 文件被占用，本轮跳过（下轮补采）：{}",
+                        path.display()
+                    );
                     continue;
                 }
                 Err(e) if e.downcast_ref::<SourceShrunk>().is_some() => {
                     out.files_shrunk += 1;
-                    eprintln!("yourmem import: 源文件比已归档内容短，保留已归档内容并跳过：{}", path.display());
+                    eprintln!(
+                        "yourmem import: 源文件比已归档内容短，保留已归档内容并跳过：{}",
+                        path.display()
+                    );
                     continue;
                 }
                 Err(e) => {
@@ -442,11 +530,17 @@ pub fn import_all(
     }
     out.lineage_links = db::detect_lineage(conn)?;
     out.memory_sources_linked = db::link_memory_sources(conn)?;
+    crate::work::maintain_change_log(conn)?;
     Ok(out)
 }
 
 /// Import new lines of one file. Returns (messages added, lines archived).
-pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path) -> Result<(u64, u64)> {
+pub fn import_file(
+    conn: &mut Connection,
+    home: &Path,
+    agent: &str,
+    path: &Path,
+) -> Result<(u64, u64)> {
     let path_str = path.to_string_lossy().to_string();
     // 墓碑（v6）：被物理清除过的源文件不再导入——游标已删，放行会完整重导
     // 把被清会话"残缺复活"（codex 七审）。
@@ -516,7 +610,11 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
     let mut line_no = start_line;
     for raw in body.split(|b| *b == b'\n') {
         line_no += 1;
-        lines.push((line_no, raw.to_vec(), String::from_utf8_lossy(raw).to_string()));
+        lines.push((
+            line_no,
+            raw.to_vec(),
+            String::from_utf8_lossy(raw).to_string(),
+        ));
     }
     if lines.is_empty() {
         return Ok((0, 0));
@@ -529,14 +627,18 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
     let meta = match agent {
         adapters::AGENT_ZCODE => adapters::zcode::enrich_meta_from_db(&parsed.meta, &session_id),
         adapters::AGENT_KIMI => adapters::kimi::enrich_meta_from_state(&parsed.meta, path),
-        adapters::AGENT_ANTIGRAVITY => adapters::antigravity::enrich_meta_from_history(&parsed.meta, path),
+        adapters::AGENT_ANTIGRAVITY => {
+            adapters::antigravity::enrich_meta_from_history(&parsed.meta, path)
+        }
         _ => parsed.meta,
     };
 
     // 历史行（zcode 的全量快照）出现且该会话已有消息：chunk 内去重不够——
     // 旧消息在早前 chunk 已入账。整文件全量重导一次，重建无重复的消息集
     // （vault_lines 用 OR REPLACE 幂等；offset 照常推进，不影响增量）。
-    let (messages, lines, resync, artifacts, uuids, compact_line) = if parsed.history_resync && start_offset > 0 {
+    let (messages, lines, resync, artifacts, uuids, compact_line) = if parsed.history_resync
+        && start_offset > 0
+    {
         // 字节保真重读（codex 复审：read_to_string().lines() 会剥 CRLF 的 \r、
         // 跳过空行，再 OR REPLACE 会永久污染 vault manifest）。这里完全镜像
         // 正常路径：原始字节、截到最后一个换行（未换行尾部照旧留到下一轮）、
@@ -559,9 +661,23 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
         }
         let full_input: Vec<(u64, String)> = full.iter().map(|(n, _, t)| (*n, t.clone())).collect();
         let full_parsed = adapters::parse_chunk(agent, &full_input);
-        (full_parsed.messages, full, true, full_parsed.artifacts, full_parsed.uuids, full_parsed.compact_line)
+        (
+            full_parsed.messages,
+            full,
+            true,
+            full_parsed.artifacts,
+            full_parsed.uuids,
+            full_parsed.compact_line,
+        )
     } else {
-        (parsed.messages, lines, false, parsed.artifacts, parsed.uuids, parsed.compact_line)
+        (
+            parsed.messages,
+            lines,
+            false,
+            parsed.artifacts,
+            parsed.uuids,
+            parsed.compact_line,
+        )
     };
 
     let project_id = match meta.cwd.as_deref() {
@@ -577,16 +693,19 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
     // crash here only risks a few orphan objects, never DB inconsistency.
     // message_count 一律"插入后绝对重算"（codex 三审方向）：OR IGNORE 之后的
     // 真实行数就是真相，累加语义在重放/并发/清理场景全都容易虚。
-    let old_count: i64 = conn.query_row(
-        "SELECT message_count FROM sessions WHERE id = ?1",
-        rusqlite::params![session_id],
-        |r| r.get(0),
-    )
-    .unwrap_or(0);
+    let old_count: i64 = conn
+        .query_row(
+            "SELECT message_count FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
 
     let old_vault_hashes: Vec<String> = if resync {
-        let mut stmt = conn.prepare("SELECT DISTINCT hash FROM vault_lines WHERE session_id = ?1")?;
-        let rows = stmt.query_map(rusqlite::params![session_id], |r| r.get(0))?
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT hash FROM vault_lines WHERE session_id = ?1")?;
+        let rows = stmt
+            .query_map(rusqlite::params![session_id], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     } else {
@@ -610,6 +729,22 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
     // 重新挂回；对不上的指针置空。
     let mut pointed: Vec<(i64, i64, i64, String, String)> = Vec::new();
     if resync {
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS resync_verification_pointers(id TEXT PRIMARY KEY,line_no INTEGER,ord INTEGER);
+             DELETE FROM temp.resync_verification_pointers;
+             CREATE TEMP TABLE IF NOT EXISTS resync_memory_event_pointers(id TEXT PRIMARY KEY,line_no INTEGER,ord INTEGER);
+             DELETE FROM temp.resync_memory_event_pointers;"
+        )?;
+        for (table, source) in [
+            ("resync_verification_pointers", "task_verifications"),
+            ("resync_memory_event_pointers", "memory_events"),
+        ] {
+            tx.execute(&format!("INSERT INTO temp.{table} SELECT e.id,m.line_no,m.ord FROM {source} e JOIN messages m ON m.id=e.source_message_id WHERE e.session_id=?1"),[&session_id])?;
+            tx.execute(
+                &format!("UPDATE {source} SET source_message_id=NULL WHERE session_id=?1"),
+                [&session_id],
+            )?;
+        }
         let mut stmt = tx.prepare(
             "SELECT m.rowid, msg.line_no, msg.ord, msg.kind, msg.content
              FROM memories m JOIN messages msg ON msg.id = m.source_message_id
@@ -627,8 +762,14 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
             "UPDATE memories SET source_message_id = NULL WHERE source_session_id = ?1 AND source_message_id IS NOT NULL",
             rusqlite::params![session_id],
         )?;
-        tx.execute("DELETE FROM messages WHERE session_id = ?1", rusqlite::params![session_id])?;
-        tx.execute("DELETE FROM vault_lines WHERE session_id = ?1", rusqlite::params![session_id])?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        tx.execute(
+            "DELETE FROM vault_lines WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
         // 压缩点随全量重导重建：先清（文件被截断替换时旧边界行可能已不存在）
         tx.execute(
             "UPDATE sessions SET compact_line_no = NULL WHERE id = ?1",
@@ -645,6 +786,23 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
             rusqlite::params![session_id, line, ord, kind, content, memory_rowid],
         )?;
     }
+    if resync {
+        for (table, pointers) in [
+            ("task_verifications", "resync_verification_pointers"),
+            ("memory_events", "resync_memory_event_pointers"),
+        ] {
+            tx.execute(
+                &format!(
+                    "UPDATE {table} SET source_message_id=(
+                SELECT m.id FROM messages m JOIN temp.{pointers} p ON p.id={table}.id
+                WHERE m.session_id=?1 AND m.line_no=p.line_no AND m.ord=p.ord
+            ) WHERE id IN (SELECT id FROM temp.{pointers})"
+                ),
+                [&session_id],
+            )?;
+        }
+        tx.execute_batch("DROP TABLE temp.resync_verification_pointers; DROP TABLE temp.resync_memory_event_pointers;")?;
+    }
     tx.execute(
         "UPDATE sessions SET message_count = (SELECT COUNT(*) FROM messages WHERE session_id = ?1) WHERE id = ?1",
         rusqlite::params![session_id],
@@ -657,9 +815,19 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
         )?;
     }
     if resync {
+        tx.execute(
+            "DELETE FROM work_meta WHERE key=?1",
+            [format!("evidence_cursor:{session_id}")],
+        )?;
         // 重导时 artifacts/uuids 同样按整文件重建（先清后插，幂等）
-        tx.execute("DELETE FROM session_artifacts WHERE session_id = ?1", rusqlite::params![session_id])?;
-        tx.execute("DELETE FROM session_uuids WHERE session_id = ?1", rusqlite::params![session_id])?;
+        tx.execute(
+            "DELETE FROM session_artifacts WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        tx.execute(
+            "DELETE FROM session_uuids WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
     }
     db::insert_artifacts(&tx, &session_id, project_id, &artifacts)?;
     db::insert_uuid_sightings(&tx, &session_id, &uuids)?;
@@ -695,6 +863,10 @@ pub fn import_file(conn: &mut Connection, home: &Path, agent: &str, path: &Path)
             rusqlite::params![agent, path_str],
         )?;
     }
+    crate::work::infer_artifact_outcomes(&tx, &session_id)?;
+    crate::work::process_session_evidence(&tx, &session_id)?;
+    crate::work::record_session_steps(&tx, &session_id)?;
+    crate::work::mark_session_evidence_processed(&tx, &session_id)?;
     tx.commit()?;
     for hash in old_vault_hashes {
         let referenced: i64 = conn.query_row(
@@ -820,7 +992,8 @@ fn backfill_kimi_cwd(conn: &Connection, path: &Path, session_id: &str) -> Result
     if missing.is_none() {
         return Ok(());
     }
-    let meta = adapters::kimi::enrich_meta_from_state(&crate::models::SessionMetaPatch::default(), path);
+    let meta =
+        adapters::kimi::enrich_meta_from_state(&crate::models::SessionMetaPatch::default(), path);
     if let Some(cwd) = meta.cwd {
         // 会话与 artifact 同一事务（codex 三审：两条自动提交语句中途失败会让
         // cwd 已写、artifact 仍空，且 cwd IS NULL 门槛让重试永久跳过）
@@ -885,12 +1058,15 @@ mod tests {
         push_extra_root(&mut roots, "kimi".into(), PathBuf::from("/a"));
         push_extra_root(&mut roots, "claude".into(), PathBuf::from("/a"));
         push_extra_root(&mut roots, "claude".into(), PathBuf::from("/b"));
-        let summary: Vec<(&str, &str)> = roots.iter().map(|(a, p)| (a.as_str(), p.to_str().unwrap())).collect();
-        assert_eq!(summary, vec![
-            ("claude", "/a"),
-            ("kimi", "/a"),
-            ("claude", "/b"),
-        ], "按 path 去重会吞掉 kimi 的同路径根（codex 评审 blocker）");
+        let summary: Vec<(&str, &str)> = roots
+            .iter()
+            .map(|(a, p)| (a.as_str(), p.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![("claude", "/a"), ("kimi", "/a"), ("claude", "/b"),],
+            "按 path 去重会吞掉 kimi 的同路径根（codex 评审 blocker）"
+        );
     }
 
     #[test]
@@ -911,18 +1087,24 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("config.json"), "{ broken").unwrap();
         assert!(set_agent_disabled(home.path(), "codex", true).is_err());
-        assert_eq!(std::fs::read_to_string(home.path().join("config.json")).unwrap(), "{ broken");
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("config.json")).unwrap(),
+            "{ broken"
+        );
 
         std::fs::remove_file(home.path().join("config.json")).unwrap();
-        let threads: Vec<_> = (0..8).map(|i| {
-            let h = home.path().to_path_buf();
-            std::thread::spawn(move || {
-                update_config(&h, |cfg| {
-                    cfg[format!("k{i}")] = json!(i);
-                    Ok(())
-                }).unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let h = home.path().to_path_buf();
+                std::thread::spawn(move || {
+                    update_config(&h, |cfg| {
+                        cfg[format!("k{i}")] = json!(i);
+                        Ok(())
+                    })
+                    .unwrap();
+                })
             })
-        }).collect();
+            .collect();
         for t in threads {
             t.join().unwrap();
         }

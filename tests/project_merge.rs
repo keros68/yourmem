@@ -19,20 +19,49 @@ fn non_git_cwd_uses_nearest_active_project_and_its_context() {
     let (nested_id, _) = db::add_project(&conn, text(&nested)).unwrap();
 
     let (path, name) = db::project_root_for_conn(&conn, text(&cwd)).unwrap();
-    assert_eq!((path, name), (text(&nested).to_string(), "drafts".to_string()));
-    assert_eq!(db::resolve_project(&conn, None, Some(text(&cwd))).unwrap().unwrap().0, nested_id);
+    assert_eq!(
+        (path, name),
+        (text(&nested).to_string(), "drafts".to_string())
+    );
+    assert_eq!(
+        db::resolve_project(&conn, None, Some(text(&cwd)))
+            .unwrap()
+            .unwrap()
+            .0,
+        nested_id
+    );
 
-    db::save_memory(&conn, &db::MemoryInput {
-        project_id: Some(root_id), scope: "project", r#type: "fact",
-        content: "根项目的研究方法", status: None,
-        source_session_id: None, source_message_id: None,
-    }).unwrap();
+    db::save_memory(
+        &conn,
+        &db::MemoryInput {
+            project_id: Some(root_id),
+            scope: "project",
+            r#type: "fact",
+            content: "根项目的研究方法",
+            status: None,
+            source_session_id: None,
+            source_message_id: None,
+        },
+    )
+    .unwrap();
     db::set_project_archived(&conn, nested_id, true).unwrap();
-    let resolved = db::resolve_project(&conn, None, Some(text(&cwd))).unwrap().unwrap();
+    let resolved = db::resolve_project(&conn, None, Some(text(&cwd)))
+        .unwrap()
+        .unwrap();
     assert_eq!(resolved.0, root_id);
     let context = db::project_context(&conn, resolved.0).unwrap();
-    assert!(context["memories"]["confirmed"].as_array().unwrap().iter().any(|m| m["content"] == "根项目的研究方法"));
-    assert_eq!(db::resolve_project(&conn, Some(text(&nested)), None).unwrap().unwrap().0, nested_id);
+    assert!(context["memories"]["confirmed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["content"] == "根项目的研究方法"));
+    assert_eq!(
+        db::resolve_project(&conn, Some(text(&nested)), None)
+            .unwrap()
+            .unwrap()
+            .0,
+        nested_id
+    );
 }
 
 #[test]
@@ -57,22 +86,41 @@ fn home_temp_and_filesystem_root_cannot_capture_descendants() {
     let conn = db::open(home.path()).unwrap();
     let user_home = yourmem::home_dir();
     db::add_project(&conn, text(&user_home)).unwrap();
-    let under_home = user_home.join("Documents").join("Codex").join("2026-10-24").join("example");
-    assert_eq!(db::project_root_for_conn(&conn, text(&under_home)).unwrap().0, text(&under_home));
+    let under_home = user_home
+        .join("Documents")
+        .join("Codex")
+        .join("2026-10-24")
+        .join("example");
+    assert_eq!(
+        db::project_root_for_conn(&conn, text(&under_home))
+            .unwrap()
+            .0,
+        text(&under_home)
+    );
 
     let other_home = tempfile::tempdir().unwrap();
     let other = db::open(other_home.path()).unwrap();
     let temp = std::env::temp_dir();
     db::add_project(&other, text(&temp)).unwrap();
     let under_temp = temp.join("yourmem-parent-exclusion").join("child");
-    assert_eq!(db::project_root_for_conn(&other, text(&under_temp)).unwrap().0, text(&under_temp));
+    assert_eq!(
+        db::project_root_for_conn(&other, text(&under_temp))
+            .unwrap()
+            .0,
+        text(&under_temp)
+    );
 
     let third_home = tempfile::tempdir().unwrap();
     let third = db::open(third_home.path()).unwrap();
     let fs_root = third_home.path().ancestors().last().unwrap();
     db::upsert_project(&third, text(fs_root), "root").unwrap();
     let under_root = fs_root.join("yourmem-root-exclusion").join("child");
-    assert_eq!(db::project_root_for_conn(&third, text(&under_root)).unwrap().0, text(&under_root));
+    assert_eq!(
+        db::project_root_for_conn(&third, text(&under_root))
+            .unwrap()
+            .0,
+        text(&under_root)
+    );
 }
 
 #[cfg(windows)]
@@ -86,8 +134,17 @@ fn windows_ancestor_matching_ignores_case_and_separators() {
     let (pid, _) = db::add_project(&conn, text(&parent)).unwrap();
     let variant = text(&cwd).replace('\\', "/").to_uppercase();
 
-    assert_eq!(db::project_root_for_conn(&conn, &variant).unwrap().0, text(&parent));
-    assert_eq!(db::resolve_project(&conn, None, Some(&variant)).unwrap().unwrap().0, pid);
+    assert_eq!(
+        db::project_root_for_conn(&conn, &variant).unwrap().0,
+        text(&parent)
+    );
+    assert_eq!(
+        db::resolve_project(&conn, None, Some(&variant))
+            .unwrap()
+            .unwrap()
+            .0,
+        pid
+    );
 }
 
 #[test]
@@ -104,17 +161,26 @@ fn merge_previews_and_moves_all_assets_then_archives_without_revival() {
          VALUES ('claude:merge-test', 'claude', 'merge-test', ?1, 'fixture', ?2, '2026-10-24', '2026-10-24')",
         rusqlite::params![child_id, text(&child)],
     ).unwrap();
-    db::save_memory(&conn, &db::MemoryInput {
-        project_id: Some(child_id), scope: "project", r#type: "decision",
-        content: "保留当前稿作为主线", status: None,
-        source_session_id: None, source_message_id: None,
-    }).unwrap();
+    db::save_memory(
+        &conn,
+        &db::MemoryInput {
+            project_id: Some(child_id),
+            scope: "project",
+            r#type: "decision",
+            content: "保留当前稿作为主线",
+            status: None,
+            source_session_id: None,
+            source_message_id: None,
+        },
+    )
+    .unwrap();
     db::create_handoff(&conn, child_id, &db::HandoffFields::default()).unwrap();
     conn.execute(
         "INSERT INTO session_artifacts(session_id, project_id, path, tool, created_at)
          VALUES ('claude:merge-test', ?1, 'draft.md', 'Write', '2026-10-24')",
         [child_id],
-    ).unwrap();
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO cross_checks(project_id, run_id, path, role, model, vendor, header_hash, created_at, updated_at)
          VALUES (?1, 'run-merge', '.dispatch/review.md', '盲审', 'model', 'vendor', 'hash', '2026-10-24', '2026-10-24')",
@@ -132,27 +198,138 @@ fn merge_previews_and_moves_all_assets_then_archives_without_revival() {
 
     let merged = db::merge_project(&conn, child_id, parent_id).unwrap();
     assert_eq!(merged["merged"], true);
-    for table in ["sessions", "memories", "session_artifacts", "handoffs", "cross_checks"] {
-        let at_parent: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM {table} WHERE project_id = ?1"),
-            [parent_id],
-            |r| r.get(0),
-        ).unwrap();
+    for table in [
+        "sessions",
+        "memories",
+        "session_artifacts",
+        "handoffs",
+        "cross_checks",
+    ] {
+        let at_parent: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE project_id = ?1"),
+                [parent_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(at_parent, 1, "{table} must move to the parent");
     }
-    let archived: Option<String> = conn.query_row(
-        "SELECT archived_at FROM projects WHERE id = ?1", [child_id], |r| r.get(0),
-    ).unwrap();
+    let archived: Option<String> = conn
+        .query_row(
+            "SELECT archived_at FROM projects WHERE id = ?1",
+            [child_id],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert!(archived.is_some());
     assert!(db::project_merge_plan(&conn, child_id, None).is_err());
 
     db::upsert_project(&conn, text(&child), "current").unwrap();
-    let still_archived: Option<String> = conn.query_row(
-        "SELECT archived_at FROM projects WHERE id = ?1", [child_id], |r| r.get(0),
-    ).unwrap();
+    let still_archived: Option<String> = conn
+        .query_row(
+            "SELECT archived_at FROM projects WHERE id = ?1",
+            [child_id],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert!(still_archived.is_some());
-    assert_eq!(db::project_root_for_conn(&conn, text(&child)).unwrap().0, text(&parent));
-    assert_eq!(db::resolve_project(&conn, None, Some(text(&child))).unwrap().unwrap().0, parent_id);
+    assert_eq!(
+        db::project_root_for_conn(&conn, text(&child)).unwrap().0,
+        text(&parent)
+    );
+    assert_eq!(
+        db::resolve_project(&conn, None, Some(text(&child)))
+            .unwrap()
+            .unwrap()
+            .0,
+        parent_id
+    );
+}
+
+#[test]
+fn merge_moves_work_assets_without_task_number_or_label_conflicts() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(home.path()).unwrap();
+    let parent = Path::new("/work/pm-merge-work/research");
+    let child = parent.join("current");
+    let (parent_id, _) = db::add_project(&conn, text(parent)).unwrap();
+    let (child_id, _) = db::add_project(&conn, text(&child)).unwrap();
+    for (id, project_id, task_no, title) in [
+        ("parent-task", parent_id, 1, "父任务"),
+        ("child-task-1", child_id, 1, "子任务一"),
+        ("child-task-2", child_id, 2, "子任务二"),
+    ] {
+        conn.execute(
+            "INSERT INTO tasks(id,project_id,task_no,title,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,'2026-10-24','2026-10-24')",
+            rusqlite::params![id, project_id, task_no, title],
+        )
+        .unwrap();
+    }
+    for (id, project_id, name) in [
+        ("parent-shared", parent_id, "共享"),
+        ("child-shared", child_id, "共享"),
+        ("child-unique", child_id, "独有"),
+    ] {
+        conn.execute(
+            "INSERT INTO labels(id,name,scope,project_id,created_at)
+             VALUES (?1,?2,'project',?3,'2026-10-24')",
+            rusqlite::params![id, name, project_id],
+        )
+        .unwrap();
+    }
+    for (project_id, kind, record_id) in [
+        (parent_id, "handoff", "parent-wins"),
+        (child_id, "handoff", "child-loses"),
+        (child_id, "memory", "child-moves"),
+    ] {
+        conn.execute(
+            "INSERT INTO project_record_pins(project_id,record_kind,record_id,created_at)
+             VALUES (?1,?2,?3,'2026-10-24')",
+            rusqlite::params![project_id, kind, record_id],
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        db::project_merge_plan(&conn, child_id, None).unwrap()["tasks"],
+        2
+    );
+    db::merge_project(&conn, child_id, parent_id).unwrap();
+    let tasks: Vec<(String, i64)> = {
+        let mut stmt = conn
+            .prepare("SELECT id,task_no FROM tasks WHERE project_id=?1 ORDER BY task_no")
+            .unwrap();
+        stmt.query_map([parent_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        tasks,
+        [
+            ("parent-task".to_string(), 1),
+            ("child-task-1".to_string(), 2),
+            ("child-task-2".to_string(), 3),
+        ]
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM labels WHERE project_id=?1",
+            [parent_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(conn.query_row(
+        "SELECT record_id FROM project_record_pins WHERE project_id=?1 AND record_kind='handoff'",
+        [parent_id], |r| r.get::<_, String>(0),
+    ).unwrap(), "parent-wins");
+    assert_eq!(conn.query_row(
+        "SELECT record_id FROM project_record_pins WHERE project_id=?1 AND record_kind='memory'",
+        [parent_id], |r| r.get::<_, String>(0),
+    ).unwrap(), "child-moves");
 }
 
 #[test]
@@ -160,7 +337,8 @@ fn archived_scratch_cwd_never_falls_back_to_most_active_project() {
     let home = tempfile::tempdir().unwrap();
     let conn = db::open(home.path()).unwrap();
     // 最近活跃的普通项目：旧的"最近活跃"兜底会把它返回给任何未命中的 cwd
-    let active_id = db::upsert_project(&conn, "/work/reviewed-project", "reviewed-project").unwrap();
+    let active_id =
+        db::upsert_project(&conn, "/work/reviewed-project", "reviewed-project").unwrap();
     let scratch = yourmem::home_dir()
         .join(".aicross")
         .join("scratch")
@@ -169,12 +347,24 @@ fn archived_scratch_cwd_never_falls_back_to_most_active_project() {
     let scratch = text(&scratch);
     let scratch_id = db::upsert_project(&conn, scratch, "codex.openai").unwrap();
     let archived: Option<String> = conn
-        .query_row("SELECT archived_at FROM projects WHERE id = ?1", [scratch_id], |r| r.get(0))
+        .query_row(
+            "SELECT archived_at FROM projects WHERE id = ?1",
+            [scratch_id],
+            |r| r.get(0),
+        )
         .unwrap();
     assert!(archived.is_some(), "盲审目录新建即归档");
 
-    for cwd in [scratch.to_string(), Path::new(scratch).join("notes").to_string_lossy().to_string()] {
-        let hit = db::resolve_project(&conn, None, Some(&cwd)).unwrap().unwrap();
+    for cwd in [
+        scratch.to_string(),
+        Path::new(scratch)
+            .join("notes")
+            .to_string_lossy()
+            .to_string(),
+    ] {
+        let hit = db::resolve_project(&conn, None, Some(&cwd))
+            .unwrap()
+            .unwrap();
         assert_eq!(hit.0, scratch_id, "{cwd} 应命中已归档项目本身");
         assert_ne!(hit.0, active_id, "{cwd} 不得落到最近活跃项目");
     }
@@ -184,14 +374,17 @@ fn archived_scratch_cwd_never_falls_back_to_most_active_project() {
         .join("scratch")
         .join("20261016-103711-blind")
         .join("agy.google");
-    assert!(db::resolve_project(&conn, None, Some(text(&unregistered))).unwrap().is_none());
+    assert!(db::resolve_project(&conn, None, Some(text(&unregistered)))
+        .unwrap()
+        .is_none());
 }
 
 #[test]
 fn dispatch_dirs_under_non_git_project_stay_independent_archived_projects() {
     let home = tempfile::tempdir().unwrap();
     let conn = db::open(home.path()).unwrap();
-    let parent_id = db::upsert_project(&conn, "/work/research-non-git", "research-non-git").unwrap();
+    let parent_id =
+        db::upsert_project(&conn, "/work/research-non-git", "research-non-git").unwrap();
     for cwd in [
         "/work/research-non-git/.dispatch/runtime/runs/x",
         "/work/research-non-git/.dispatch/20261024-blind",
@@ -201,12 +394,20 @@ fn dispatch_dirs_under_non_git_project_stay_independent_archived_projects() {
         let id = db::upsert_project(&conn, &root, "run").unwrap();
         assert_ne!(id, parent_id);
         let archived: Option<String> = conn
-            .query_row("SELECT archived_at FROM projects WHERE id = ?1", [id], |r| r.get(0))
+            .query_row(
+                "SELECT archived_at FROM projects WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(archived.is_some(), "{cwd} 仍新建为已归档项目");
     }
     let parent_archived: Option<String> = conn
-        .query_row("SELECT archived_at FROM projects WHERE id = ?1", [parent_id], |r| r.get(0))
+        .query_row(
+            "SELECT archived_at FROM projects WHERE id = ?1",
+            [parent_id],
+            |r| r.get(0),
+        )
         .unwrap();
     assert!(parent_archived.is_none(), "所在项目本身保持活跃");
 }

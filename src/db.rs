@@ -1,7 +1,10 @@
 //! SQLite schema and queries. FTS5 with the trigram tokenizer so both
 //! Chinese and English content are searchable by substring.
 
-use std::{io::{BufRead, BufReader}, path::Path};
+use std::{
+    io::{BufRead, BufReader},
+    path::Path,
+};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -11,7 +14,7 @@ use crate::models::NewMessage;
 use crate::now_iso;
 
 mod session_window;
-pub use session_window::{session_window, message_content};
+pub use session_window::{message_content, session_window};
 mod memory_source;
 pub use memory_source::link_memory_sources;
 
@@ -52,7 +55,9 @@ CREATE TABLE IF NOT EXISTS messages (
   kind       TEXT NOT NULL,
   content    TEXT NOT NULL,
   timestamp  TEXT,
-  uuid       TEXT
+  uuid       TEXT,
+  native_tool_call_id TEXT,
+  tool_success INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, line_no, ord);
 -- v5 的唯一索引 idx_messages_slo 只在 migrate 里创建（去重之后）：老库若有
@@ -296,7 +301,12 @@ pub fn open(home: &Path) -> Result<Connection> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_size_limit=67108864;")?;
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(TRIGGERS_SQL)?;
+    let previous_schema: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     migrate(&conn)?;
+    crate::work::init(&conn)?;
+    if previous_schema < SCHEMA_VERSION {
+        crate::work::repair_schema(&conn)?;
+    }
     // 轻量收敛：config 期望轻量而工具索引还在（enable 后 config 写回失败的
     // 崩溃窗口、或用户手改 config）——收掉。期望全量时不自动重建（分钟级
     // 操作，显式走 index enable-tools），由 index_status 向 UI 报告未生效。
@@ -320,6 +330,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     if version >= SCHEMA_VERSION {
         return Ok(());
     }
+    conn.execute("DROP VIEW IF EXISTS work_events", [])?;
     let has_col = |table: &str, col: &str| -> Result<bool> {
         let cols: Vec<String> = conn
             .prepare(&format!("PRAGMA table_info({table})"))?
@@ -328,21 +339,74 @@ fn migrate(conn: &Connection) -> Result<()> {
         Ok(cols.iter().any(|c| c == col))
     };
     for (table, col, ddl) in [
-        ("sessions", "first_parent_uuid", "ALTER TABLE sessions ADD COLUMN first_parent_uuid TEXT"),
-        ("sessions", "compact_leaf_uuid", "ALTER TABLE sessions ADD COLUMN compact_leaf_uuid TEXT"),
+        (
+            "sessions",
+            "first_parent_uuid",
+            "ALTER TABLE sessions ADD COLUMN first_parent_uuid TEXT",
+        ),
+        (
+            "sessions",
+            "compact_leaf_uuid",
+            "ALTER TABLE sessions ADD COLUMN compact_leaf_uuid TEXT",
+        ),
         // OpenCode 增量游标的决胜值：同毫秒下最后一条 part 的 id。
-        ("source_files", "cursor_text", "ALTER TABLE source_files ADD COLUMN cursor_text TEXT"),
+        (
+            "source_files",
+            "cursor_text",
+            "ALTER TABLE source_files ADD COLUMN cursor_text TEXT",
+        ),
         // 0.3.2 软删回收站（§6）：NULL = 活跃；非 NULL = 在回收站，全端隐藏。
-        ("sessions", "deleted_at", "ALTER TABLE sessions ADD COLUMN deleted_at TEXT"),
+        (
+            "sessions",
+            "deleted_at",
+            "ALTER TABLE sessions ADD COLUMN deleted_at TEXT",
+        ),
         // v7：codex 新格式标志——event_msg 抑制要跨增量 chunk（见 codex adapter）。
-        ("source_files", "saw_response_item", "ALTER TABLE source_files ADD COLUMN saw_response_item INTEGER NOT NULL DEFAULT 0"),
+        (
+            "source_files",
+            "saw_response_item",
+            "ALTER TABLE source_files ADD COLUMN saw_response_item INTEGER NOT NULL DEFAULT 0",
+        ),
         // v10（0.3.8）：压缩点——zcode 同文件内压缩的边界行号（首个携带 harness
         // 摘要前缀的请求行）；NULL = 该会话未压缩过。源无关设计，其余 adapter
         // 样本到位后只加检测函数。
-        ("sessions", "compact_line_no", "ALTER TABLE sessions ADD COLUMN compact_line_no INTEGER"),
+        (
+            "sessions",
+            "compact_line_no",
+            "ALTER TABLE sessions ADD COLUMN compact_line_no INTEGER",
+        ),
         // v11：项目归档（"废弃"）——NULL = 活跃；非 NULL = 用户废弃，列表全端
         // 隐藏，会话与 vault 资产原样保留；导入不复活（upsert_project 不碰本列）。
-        ("projects", "archived_at", "ALTER TABLE projects ADD COLUMN archived_at TEXT"),
+        (
+            "projects",
+            "archived_at",
+            "ALTER TABLE projects ADD COLUMN archived_at TEXT",
+        ),
+        (
+            "handoffs",
+            "uuid",
+            "ALTER TABLE handoffs ADD COLUMN uuid TEXT",
+        ),
+        (
+            "handoffs",
+            "task_id",
+            "ALTER TABLE handoffs ADD COLUMN task_id TEXT",
+        ),
+        (
+            "memory_revisions",
+            "revision_uuid",
+            "ALTER TABLE memory_revisions ADD COLUMN revision_uuid TEXT",
+        ),
+        (
+            "messages",
+            "native_tool_call_id",
+            "ALTER TABLE messages ADD COLUMN native_tool_call_id TEXT",
+        ),
+        (
+            "messages",
+            "tool_success",
+            "ALTER TABLE messages ADD COLUMN tool_success INTEGER",
+        ),
     ] {
         if !has_col(table, col)? {
             // TOCTOU 防御（codex 复现）：两个进程同时初始化全新库时，都可能
@@ -410,11 +474,15 @@ fn migrate(conn: &Connection) -> Result<()> {
         };
         let composite_pk = || -> Result<bool> {
             let mut st = conn.prepare("PRAGMA table_info(source_files)")?;
-            let pks: Vec<i64> = st.query_map([], |r| r.get::<_, i64>(5))?
+            let pks: Vec<i64> = st
+                .query_map([], |r| r.get::<_, i64>(5))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(pks.iter().filter(|&&p| p > 0).count() >= 2)
         };
-        let (old_exists, new_exists) = (table_exists("source_files")?, table_exists("source_files_v8")?);
+        let (old_exists, new_exists) = (
+            table_exists("source_files")?,
+            table_exists("source_files_v8")?,
+        );
         if old_exists && !composite_pk()? {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS source_files_v8 (
@@ -526,7 +594,9 @@ fn merge_duplicate_projects(conn: &Connection) -> Result<()> {
     };
     for (key, keep) in groups {
         let dups: Vec<i64> = {
-            let mut stmt = conn.prepare(&format!("SELECT id FROM projects WHERE {PATH_KEY_SQL} = ?1 AND id <> ?2"))?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id FROM projects WHERE {PATH_KEY_SQL} = ?1 AND id <> ?2"
+            ))?;
             let rows = stmt.query_map(params![key, keep], |r| r.get(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -536,13 +606,25 @@ fn merge_duplicate_projects(conn: &Connection) -> Result<()> {
             |r| r.get(0),
         )?;
         for dup in dups {
-            for table in ["sessions", "handoffs", "memories", "session_artifacts", "cross_checks"] {
-                conn.execute(&format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"), params![keep, dup])?;
+            for table in [
+                "sessions",
+                "handoffs",
+                "memories",
+                "session_artifacts",
+                "cross_checks",
+            ] {
+                conn.execute(
+                    &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
+                    params![keep, dup],
+                )?;
             }
             conn.execute("DELETE FROM projects WHERE id = ?1", params![dup])?;
         }
         if any_active {
-            conn.execute("UPDATE projects SET archived_at = NULL WHERE id = ?1", params![keep])?;
+            conn.execute(
+                "UPDATE projects SET archived_at = NULL WHERE id = ?1",
+                params![keep],
+            )?;
         }
     }
     Ok(())
@@ -586,10 +668,11 @@ pub fn project_root_for(cwd: &str) -> (String, String) {
     (path, name)
 }
 
-/// SQL expression giving a project path's identity key. On Windows the same
-/// directory may arrive with different case or separators from different agents.
+/// SQL expression giving a project path's identity key, matching `path_key`.
 const PATH_KEY_SQL: &str = if cfg!(windows) {
     "lower(replace(rtrim(path, '/' || char(92)), '/', char(92)))"
+} else if cfg!(target_os = "macos") {
+    "lower(path)"
 } else {
     "path"
 };
@@ -597,7 +680,9 @@ const PATH_KEY_SQL: &str = if cfg!(windows) {
 pub fn path_key(path: &str) -> String {
     if cfg!(windows) {
         // 与 SQLite lower() 一致：只转 ASCII 字母
-        path.trim_end_matches(['/', '\\']).replace('/', "\\").to_ascii_lowercase()
+        path.trim_end_matches(['/', '\\'])
+            .replace('/', "\\")
+            .to_ascii_lowercase()
     } else if cfg!(target_os = "macos") {
         // macOS 默认文件系统大小写不敏感（保留大小写）：键同样折叠，否则
         // "PROGRESS.md" 与自动发现的 "progress.md" 会被当成两个文件
@@ -630,13 +715,23 @@ fn eligible_project_ancestor(path: &str, cwd: &str) -> bool {
 fn active_project_ancestors(conn: &Connection, cwd: &str) -> Result<Vec<(i64, String, String)>> {
     let mut stmt = conn.prepare("SELECT id, name, path FROM projects WHERE archived_at IS NULL")?;
     let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
     })?;
-    let mut projects = rows.collect::<std::result::Result<Vec<_>, _>>()?
+    let mut projects = rows
+        .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
         .filter(|(_, _, path)| eligible_project_ancestor(path, cwd))
         .collect::<Vec<_>>();
-    projects.sort_by(|a, b| path_key(&b.2).len().cmp(&path_key(&a.2).len()).then(a.0.cmp(&b.0)));
+    projects.sort_by(|a, b| {
+        path_key(&b.2)
+            .len()
+            .cmp(&path_key(&a.2).len())
+            .then(a.0.cmp(&b.0))
+    });
     Ok(projects)
 }
 
@@ -667,7 +762,10 @@ fn archive_projects_where(conn: &Connection, matches: fn(&str) -> bool) -> Resul
     };
     let now = now_iso();
     for id in ids {
-        conn.execute("UPDATE projects SET archived_at = ?2 WHERE id = ?1", params![id, now])?;
+        conn.execute(
+            "UPDATE projects SET archived_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
     }
     Ok(())
 }
@@ -683,7 +781,10 @@ pub fn upsert_project(conn: &Connection, path: &str, name: &str) -> Result<i64> 
             )
             .optional()?;
         if let Some(id) = existing {
-            conn.execute("UPDATE projects SET updated_at = ?2 WHERE id = ?1", params![id, now])?;
+            conn.execute(
+                "UPDATE projects SET updated_at = ?2 WHERE id = ?1",
+                params![id, now],
+            )?;
             return Ok(id);
         }
     }
@@ -695,7 +796,11 @@ pub fn upsert_project(conn: &Connection, path: &str, name: &str) -> Result<i64> 
          ON CONFLICT(path) DO UPDATE SET updated_at = excluded.updated_at",
         params![path, name, now, archived],
     )?;
-    let id: i64 = conn.query_row("SELECT id FROM projects WHERE path = ?1", params![path], |r| r.get(0))?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM projects WHERE path = ?1",
+        params![path],
+        |r| r.get(0),
+    )?;
     Ok(id)
 }
 
@@ -741,8 +846,8 @@ pub fn insert_messages(conn: &Connection, session_id: &str, msgs: &[NewMessage])
     // OR IGNORE：并发/重放路径的纵深防御——(session,line,ord) 已存在则跳过
     // （唯一索引 idx_messages_slo 兜底；FTS 触发器只在实际插入时触发）。
     let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO messages(session_id, line_no, ord, kind, content, timestamp, uuid)
-         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        "INSERT OR IGNORE INTO messages(session_id, line_no, ord, kind, content, timestamp, uuid, native_tool_call_id, tool_success)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
     )?;
     for m in msgs {
         let content = if m.kind == crate::models::MessageKind::ToolResult {
@@ -757,7 +862,9 @@ pub fn insert_messages(conn: &Connection, session_id: &str, msgs: &[NewMessage])
             m.kind.as_str(),
             content,
             m.timestamp,
-            m.uuid
+            m.uuid,
+            m.native_tool_call_id,
+            m.tool_success
         ])?;
     }
     Ok(())
@@ -790,14 +897,39 @@ pub fn delete_session_data(conn: &Connection, session_id: &str) -> Result<()> {
     // NULL（行号口径已变，置空比重映射诚实——5f6de93 修的正是这类错挂）；
     // artifacts/links 同清，对齐 purge_session，否则截断重导会复活已消失的
     // artifact（insert_artifacts 走 OR IGNORE 挡不住）。
+    for sql in [
+        "DELETE FROM artifact_occurrences WHERE artifact_id IN (SELECT id FROM artifact_events WHERE session_id=?1)",
+        "DELETE FROM artifact_events WHERE session_id=?1",
+        "DELETE FROM task_steps WHERE session_id=?1",
+        "DELETE FROM task_sessions WHERE session_id=?1",
+        "DELETE FROM task_verifications WHERE session_id=?1",
+        "DELETE FROM memory_events WHERE session_id=?1",
+        "DELETE FROM task_claims WHERE claimed_session_id=?1",
+        "UPDATE task_events SET session_id=NULL WHERE session_id=?1",
+        "UPDATE handoffs SET session_id=NULL WHERE session_id=?1",
+    ] {
+        conn.execute(sql,[session_id])?;
+    }
     conn.execute(
         "UPDATE memories SET source_message_id = NULL WHERE source_session_id = ?1 AND source_message_id IS NOT NULL",
         params![session_id],
     )?;
-    conn.execute("DELETE FROM messages WHERE session_id = ?1", params![session_id])?;
-    conn.execute("DELETE FROM vault_lines WHERE session_id = ?1", params![session_id])?;
-    conn.execute("DELETE FROM session_uuids WHERE session_id = ?1", params![session_id])?;
-    conn.execute("DELETE FROM session_artifacts WHERE session_id = ?1", params![session_id])?;
+    conn.execute(
+        "DELETE FROM messages WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM vault_lines WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM session_uuids WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    conn.execute(
+        "DELETE FROM session_artifacts WHERE session_id = ?1",
+        params![session_id],
+    )?;
     conn.execute(
         "DELETE FROM session_links WHERE child_session_id = ?1 OR parent_session_id = ?1",
         params![session_id],
@@ -806,7 +938,29 @@ pub fn delete_session_data(conn: &Connection, session_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn insert_uuid_sightings(conn: &Connection, session_id: &str, sightings: &[crate::models::UuidSighting]) -> Result<()> {
+pub fn replace_session_data(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE memories SET source_message_id = NULL WHERE source_session_id = ?1 AND source_message_id IS NOT NULL",
+        params![session_id],
+    )?;
+    for sql in [
+        "DELETE FROM messages WHERE session_id = ?1",
+        "DELETE FROM vault_lines WHERE session_id = ?1",
+        "DELETE FROM session_uuids WHERE session_id = ?1",
+        "DELETE FROM session_artifacts WHERE session_id = ?1",
+        "DELETE FROM session_links WHERE child_session_id = ?1 OR parent_session_id = ?1",
+        "DELETE FROM sessions WHERE id = ?1",
+    ] {
+        conn.execute(sql, [session_id])?;
+    }
+    Ok(())
+}
+
+pub fn insert_uuid_sightings(
+    conn: &Connection,
+    session_id: &str,
+    sightings: &[crate::models::UuidSighting],
+) -> Result<()> {
     let mut stmt = conn.prepare(
         "INSERT OR IGNORE INTO session_uuids(session_id, line_no, uuid) VALUES (?1,?2,?3)",
     )?;
@@ -831,19 +985,42 @@ pub struct SourceFileState {
 
 /// 游标按 (agent, path) 取（v8）：同一路径可被多个 agent 登记为采集根，
 /// 单 path 键会让第二个 agent 吃到第一个的游标直接漏采（codex 评审 blocker）
-pub fn source_file_state(conn: &Connection, agent: &str, path: &str) -> Result<Option<SourceFileState>> {
+pub fn source_file_state(
+    conn: &Connection,
+    agent: &str,
+    path: &str,
+) -> Result<Option<SourceFileState>> {
     let row = conn
         .query_row(
             "SELECT imported_bytes, line_count, cursor_text, saw_response_item FROM source_files
              WHERE agent = ?1 AND path = ?2",
             params![agent, path],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, i64>(3)?)),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            },
         )
         .optional()?;
-    Ok(row.map(|(b, l, c, s)| SourceFileState { imported_bytes: b as u64, line_count: l as u64, cursor_text: c, saw_response_item: s != 0 }))
+    Ok(row.map(|(b, l, c, s)| SourceFileState {
+        imported_bytes: b as u64,
+        line_count: l as u64,
+        cursor_text: c,
+        saw_response_item: s != 0,
+    }))
 }
 
-pub fn update_source_file(conn: &Connection, path: &str, agent: &str, bytes: u64, lines: u64, cursor_text: Option<&str>) -> Result<()> {
+pub fn update_source_file(
+    conn: &Connection,
+    path: &str,
+    agent: &str,
+    bytes: u64,
+    lines: u64,
+    cursor_text: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO source_files(path, agent, imported_bytes, line_count, cursor_text, updated_at)
          VALUES (?1,?2,?3,?4,?5,?6)
@@ -865,14 +1042,20 @@ pub struct SearchOpts {
 }
 
 /// LIKE 模式转义：用户输入里的 %/_/\ 按字面匹配（配套 `ESCAPE '\'` 子句）。
-fn like_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+pub(crate) fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// FTS5 trigram search, falling back to LIKE for tokens shorter than
 /// 3 chars (trigram cannot match those — common for 1-2 char CJK words).
 pub fn search(conn: &Connection, opts: &SearchOpts) -> Result<Vec<Value>> {
-    let use_fts = opts.query.split_whitespace().all(|t| t.chars().count() >= 3) && !opts.query.trim().is_empty();
+    let use_fts = opts
+        .query
+        .split_whitespace()
+        .all(|t| t.chars().count() >= 3)
+        && !opts.query.trim().is_empty();
     let project = opts.project.as_deref();
     let agent = opts.agent.as_deref();
     let kind = opts.kind.as_deref();
@@ -907,13 +1090,19 @@ pub fn search(conn: &Connection, opts: &SearchOpts) -> Result<Vec<Value>> {
         let tokens: Vec<String> = if opts.query.trim().is_empty() {
             vec![]
         } else {
-            opts.query.split_whitespace().map(|t| format!("%{}%", like_escape(t))).collect()
+            opts.query
+                .split_whitespace()
+                .map(|t| format!("%{}%", like_escape(t)))
+                .collect()
         };
         let n = tokens.len();
         let content_clause = if n == 0 {
             "1=1".to_string()
         } else {
-            (1..=n).map(|i| format!("m.content LIKE ?{i} ESCAPE '\\'")).collect::<Vec<_>>().join(" AND ")
+            (1..=n)
+                .map(|i| format!("m.content LIKE ?{i} ESCAPE '\\'"))
+                .collect::<Vec<_>>()
+                .join(" AND ")
         };
         let sql = format!(
             "{base_select}
@@ -930,11 +1119,16 @@ pub fn search(conn: &Connection, opts: &SearchOpts) -> Result<Vec<Value>> {
             l = n + 5,
         );
         use rusqlite::types::Value as SqlValue;
-        let opt = |o: Option<&str>| o.map(|s| SqlValue::from(s.to_string())).unwrap_or(SqlValue::Null);
+        let opt = |o: Option<&str>| {
+            o.map(|s| SqlValue::from(s.to_string()))
+                .unwrap_or(SqlValue::Null)
+        };
         let mut pv: Vec<SqlValue> = tokens.into_iter().map(SqlValue::from).collect();
         pv.extend([
             opt(project),
-            project.map(|s| SqlValue::from(like_escape(s))).unwrap_or(SqlValue::Null),
+            project
+                .map(|s| SqlValue::from(like_escape(s)))
+                .unwrap_or(SqlValue::Null),
             opt(agent),
             opt(kind),
             SqlValue::from(limit),
@@ -946,26 +1140,48 @@ pub fn search(conn: &Connection, opts: &SearchOpts) -> Result<Vec<Value>> {
 
     Ok(rows
         .into_iter()
-        .map(|(id, session_id, agent, pname, ppath, kind, ts, content, line_no)| {
-            json!({
-                "message_id": id,
-                "line_no": line_no,
-                "session_id": session_id,
-                "agent": agent,
-                "project": pname,
-                "project_path": ppath,
-                "kind": kind,
-                "timestamp": ts,
-                "snippet": snippet_for(&content, &opts.query),
-            })
-        })
+        .map(
+            |(id, session_id, agent, pname, ppath, kind, ts, content, line_no)| {
+                json!({
+                    "message_id": id,
+                    "line_no": line_no,
+                    "session_id": session_id,
+                    "agent": agent,
+                    "project": pname,
+                    "project_path": ppath,
+                    "kind": kind,
+                    "timestamp": ts,
+                    "snippet": snippet_for(&content, &opts.query),
+                })
+            },
+        )
         .collect())
 }
 
-type HitRow = (i64, String, String, Option<String>, Option<String>, String, Option<String>, String, i64);
+type HitRow = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    String,
+    i64,
+);
 
 fn hit_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<HitRow> {
-    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?))
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+    ))
 }
 
 /// One FTS5 phrase: wrap in quotes, doubling any embedded quote.
@@ -975,7 +1191,10 @@ fn fts_phrase(t: &str) -> String {
 
 /// Quote each whitespace-separated token and AND them together.
 fn fts_query(q: &str) -> String {
-    q.split_whitespace().map(fts_phrase).collect::<Vec<_>>().join(" AND ")
+    q.split_whitespace()
+        .map(fts_phrase)
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 // -------------------------------------------------------- 轻量索引（1.0.1）
@@ -989,7 +1208,9 @@ fn fts_query(q: &str) -> String {
 pub const CFG_TOOL_INDEX: &str = "index_tool_output";
 
 fn tool_index_wanted(home: &Path) -> bool {
-    crate::ingest::read_config(home)[CFG_TOOL_INDEX].as_bool().unwrap_or(false)
+    crate::ingest::read_config(home)[CFG_TOOL_INDEX]
+        .as_bool()
+        .unwrap_or(false)
 }
 
 /// 当前是否处于全量索引态（以工具层触发器的存在为准）。
@@ -1050,11 +1271,16 @@ pub fn index_status(conn: &Connection) -> Result<Value> {
     let page_count: i64 = conn.pragma_query_value(None, "page_count", |r| r.get(0))?;
     let freelist: i64 = conn.pragma_query_value(None, "freelist_count", |r| r.get(0))?;
     let tool_msgs: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE kind = 'tool_result'", [], |r| r.get(0))?;
+        "SELECT COUNT(*) FROM messages WHERE kind = 'tool_result'",
+        [],
+        |r| r.get(0),
+    )?;
     // 注意：external content 的 FTS5 表 COUNT(*) 会穿透到内容表（= messages 行数），
     // 已索引行数必须数 docsize 影子表。
-    let indexed: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages_tools_fts_docsize", [], |r| r.get(0))?;
+    let indexed: i64 =
+        conn.query_row("SELECT COUNT(*) FROM messages_tools_fts_docsize", [], |r| {
+            r.get(0)
+        })?;
     Ok(json!({
         "tool_index_full": full,
         "tool_messages": tool_msgs,
@@ -1129,7 +1355,11 @@ pub fn list_archived_projects(conn: &Connection) -> Result<Vec<Value>> {
 }
 
 fn list_projects_q(conn: &Connection, archived: bool) -> Result<Vec<Value>> {
-    let filter = if archived { "p.archived_at IS NOT NULL" } else { "p.archived_at IS NULL" };
+    let filter = if archived {
+        "p.archived_at IS NOT NULL"
+    } else {
+        "p.archived_at IS NULL"
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT p.id, p.name, p.path,
                 COUNT(DISTINCT s.id) AS sessions,
@@ -1210,14 +1440,22 @@ pub fn set_project_archived(conn: &Connection, id: i64, archived: bool) -> Resul
             params![id],
         )?
     };
-    let state = if archived { "not found or already archived" } else { "not archived" };
+    let state = if archived {
+        "not found or already archived"
+    } else {
+        "not archived"
+    };
     anyhow::ensure!(n > 0, "project {state}: {id}");
     Ok(())
 }
 
 /// Preview moving every project asset to an active strict ancestor. With no
 /// explicit parent, the nearest eligible ancestor is the suggested target.
-pub fn project_merge_plan(conn: &Connection, child_id: i64, parent_id: Option<i64>) -> Result<Value> {
+pub fn project_merge_plan(
+    conn: &Connection,
+    child_id: i64,
+    parent_id: Option<i64>,
+) -> Result<Value> {
     let (child_name, child_path): (String, String) = conn
         .query_row(
             "SELECT name, path FROM projects WHERE id = ?1 AND archived_at IS NULL",
@@ -1239,9 +1477,11 @@ pub fn project_merge_plan(conn: &Connection, child_id: i64, parent_id: Option<i6
             |r| r.get(0),
         )?)
     };
-    let target_json = |(id, name, path): &(i64, String, String)| json!({
-        "id": id, "name": name, "path": path,
-    });
+    let target_json = |(id, name, path): &(i64, String, String)| {
+        json!({
+            "id": id, "name": name, "path": path,
+        })
+    };
     Ok(json!({
         "child": { "id": child_id, "name": child_name, "path": child_path },
         "parent": target_json(target),
@@ -1251,6 +1491,8 @@ pub fn project_merge_plan(conn: &Connection, child_id: i64, parent_id: Option<i6
         "artifacts": count("session_artifacts")?,
         "handoffs": count("handoffs")?,
         "cross_checks": count("cross_checks")?,
+        "tasks": count("tasks")?,
+        "artifact_events": count("artifact_events")?,
     }))
 }
 
@@ -1259,12 +1501,75 @@ pub fn project_merge_plan(conn: &Connection, child_id: i64, parent_id: Option<i6
 pub fn merge_project(conn: &Connection, child_id: i64, parent_id: i64) -> Result<Value> {
     let tx = conn.unchecked_transaction()?;
     let mut plan = project_merge_plan(&tx, child_id, Some(parent_id))?;
-    for table in ["sessions", "handoffs", "memories", "session_artifacts", "cross_checks"] {
+    for table in [
+        "sessions",
+        "handoffs",
+        "memories",
+        "session_artifacts",
+        "cross_checks",
+        "artifact_events",
+    ] {
         tx.execute(
             &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
             params![parent_id, child_id],
         )?;
     }
+    let next_task_no: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(task_no),0)+1 FROM tasks WHERE project_id=?1",
+        [parent_id],
+        |r| r.get(0),
+    )?;
+    let task_ids: Vec<String> = {
+        let mut stmt =
+            tx.prepare("SELECT id FROM tasks WHERE project_id=?1 ORDER BY task_no,id")?;
+        let rows = stmt.query_map([child_id], |r| r.get(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    for (offset, task_id) in task_ids.iter().enumerate() {
+        tx.execute(
+            "UPDATE tasks SET project_id=?1,task_no=?2 WHERE id=?3",
+            params![parent_id, next_task_no + offset as i64, task_id],
+        )?;
+    }
+    let label_ids: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT id FROM labels WHERE project_id=?1")?;
+        let rows = stmt.query_map([child_id], |r| r.get(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    for label_id in label_ids {
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT parent.id FROM labels child JOIN labels parent
+             ON parent.name=child.name AND parent.scope=child.scope AND parent.project_id=?1
+             WHERE child.id=?2",
+                params![parent_id, label_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(parent_label) = existing {
+            tx.execute(
+                "INSERT OR IGNORE INTO memory_labels(memory_id,label_id)
+                 SELECT memory_id,?1 FROM memory_labels WHERE label_id=?2",
+                params![parent_label, label_id],
+            )?;
+            tx.execute("DELETE FROM memory_labels WHERE label_id=?1", [&label_id])?;
+            tx.execute("DELETE FROM labels WHERE id=?1", [&label_id])?;
+        } else {
+            tx.execute(
+                "UPDATE labels SET project_id=?1 WHERE id=?2",
+                params![parent_id, label_id],
+            )?;
+        }
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO project_record_pins(project_id,record_kind,record_id,created_at)
+         SELECT ?1,record_kind,record_id,created_at FROM project_record_pins WHERE project_id=?2",
+        params![parent_id, child_id],
+    )?;
+    tx.execute(
+        "DELETE FROM project_record_pins WHERE project_id=?1",
+        [child_id],
+    )?;
     tx.execute(
         "UPDATE projects SET archived_at = ?2, updated_at = ?2 WHERE id = ?1",
         params![child_id, now_iso()],
@@ -1276,19 +1581,95 @@ pub fn merge_project(conn: &Connection, child_id: i64, parent_id: i64) -> Result
 }
 
 /// `resolve_project`，找不到即报错。
-pub fn require_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>) -> Result<(i64, String, String)> {
+pub fn require_project(
+    conn: &Connection,
+    ident: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<(i64, String, String)> {
     resolve_project(conn, ident, cwd)?
         .ok_or_else(|| anyhow::anyhow!("no matching project; run `yourmem import` first"))
 }
 
 /// 只在显式给了项目时解析；未给 = 不限项目。
-pub fn optional_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>) -> Result<Option<i64>> {
-    ident.map(|p| require_project(conn, Some(p), cwd).map(|r| r.0)).transpose()
+pub fn optional_project(
+    conn: &Connection,
+    ident: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Option<i64>> {
+    ident
+        .map(|p| require_project(conn, Some(p), cwd).map(|r| r.0))
+        .transpose()
+}
+
+/// 显式项目优先；否则只按 cwd 精确归属项目，不回退"最近活跃项目"，匹配不到 = 不限项目。
+pub fn cwd_project(
+    conn: &Connection,
+    ident: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Option<i64>> {
+    if ident.is_some() {
+        return optional_project(conn, ident, cwd);
+    }
+    match cwd {
+        Some(cwd) => Ok(project_for_cwd(conn, cwd)?.map(|r| r.0)),
+        None => Ok(None),
+    }
+}
+
+fn project_for_cwd(conn: &Connection, cwd: &str) -> Result<Option<(i64, String, String)>> {
+    // 非 git 目录与导入共用归属规则。
+    let (root, _) = project_root_for_conn(conn, cwd)?;
+    let sep = if cfg!(windows) { "\\" } else { "/" };
+    let ancestor_match = if Path::new(&root).join(".git").exists() {
+        format!("OR substr(?1, 1, length({PATH_KEY_SQL}) + 1) = {PATH_KEY_SQL} || ?2")
+    } else {
+        String::new()
+    };
+    let mut query_params = vec![path_key(&root)];
+    if !ancestor_match.is_empty() {
+        query_params.push(sep.to_string());
+    }
+    let row = conn
+        .query_row(
+            &format!(
+                "SELECT id, name, path FROM projects
+             WHERE archived_at IS NULL AND ({PATH_KEY_SQL} = ?1 {ancestor_match})
+             ORDER BY LENGTH(path) DESC LIMIT 1"
+            ),
+            rusqlite::params_from_iter(query_params),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    if row.is_some() {
+        return Ok(row);
+    }
+    // cwd 落在已废弃项目（含其子目录）时返回该项目本身，不落"最近活跃"兜底。
+    let archived = conn.query_row(
+        &format!(
+            "SELECT id, name, path FROM projects
+             WHERE archived_at IS NOT NULL
+               AND ({PATH_KEY_SQL} = ?1 OR substr(?1, 1, length({PATH_KEY_SQL}) + 1) = {PATH_KEY_SQL} || ?2)
+             ORDER BY LENGTH(path) DESC LIMIT 1"
+        ),
+        params![path_key(cwd), sep],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).optional()?;
+    if archived.is_some() {
+        return Ok(archived);
+    }
+    if crate::is_scratch_path(cwd) {
+        return Ok(None);
+    }
+    Ok(None)
 }
 
 /// Resolve a project by exact name, else path/name substring.
 /// `None` matches a project whose path contains the given cwd, or the only project.
-pub fn resolve_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>) -> Result<Option<(i64, String, String)>> {
+pub fn resolve_project(
+    conn: &Connection,
+    ident: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Option<(i64, String, String)>> {
     if let Some(ident) = ident {
         let row = conn
             .query_row(
@@ -1303,51 +1684,9 @@ pub fn resolve_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>
         return Ok(row);
     }
     if let Some(cwd) = cwd {
-        // 非 git 目录与导入共用归属规则。
-        let (root, _) = project_root_for_conn(conn, cwd)?;
-        let sep = if cfg!(windows) { "\\" } else { "/" };
-        let ancestor_match = if Path::new(&root).join(".git").exists() {
-            format!("OR substr(?1, 1, length({PATH_KEY_SQL}) + 1) = {PATH_KEY_SQL} || ?2")
-        } else {
-            String::new()
-        };
-        let mut query_params = vec![path_key(&root)];
-        if !ancestor_match.is_empty() {
-            query_params.push(sep.to_string());
+        if let Some(row) = project_for_cwd(conn, cwd)? {
+            return Ok(Some(row));
         }
-        let row = conn
-            .query_row(
-                &format!(
-                    "SELECT id, name, path FROM projects
-                     WHERE archived_at IS NULL AND ({PATH_KEY_SQL} = ?1 {ancestor_match})
-                     ORDER BY LENGTH(path) DESC LIMIT 1"
-                ),
-                rusqlite::params_from_iter(query_params),
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        if row.is_some() {
-            return Ok(row);
-        }
-        // cwd 落在已废弃项目（含其子目录）时返回该项目本身，不落"最近活跃"兜底——
-        // 盲审等运行现场目录的上下文不应串到被审项目。
-        let archived = conn
-            .query_row(
-                &format!(
-                    "SELECT id, name, path FROM projects
-                     WHERE archived_at IS NOT NULL
-                       AND ({PATH_KEY_SQL} = ?1 OR substr(?1, 1, length({PATH_KEY_SQL}) + 1) = {PATH_KEY_SQL} || ?2)
-                     ORDER BY LENGTH(path) DESC LIMIT 1"
-                ),
-                params![path_key(cwd), sep],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        if archived.is_some() {
-            return Ok(archived);
-        }
-        // 未登记为项目的运行现场目录同样不落兜底：没有命中就是无项目，
-        // 不能把盲审/运行目录的上下文串到最近活跃项目。
         if crate::is_scratch_path(cwd) {
             return Ok(None);
         }
@@ -1370,10 +1709,11 @@ pub fn resolve_project(conn: &Connection, ident: Option<&str>, cwd: Option<&str>
 }
 
 pub fn project_context(conn: &Connection, project_id: i64) -> Result<Value> {
-    let (name, path): (String, String) =
-        conn.query_row("SELECT name, path FROM projects WHERE id = ?1", params![project_id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
+    let (name, path): (String, String) = conn.query_row(
+        "SELECT name, path FROM projects WHERE id = ?1",
+        params![project_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
 
     let mut stmt = conn.prepare(
         "SELECT agent, COUNT(*), COALESCE(SUM(message_count),0), MAX(ended_at)
@@ -1501,12 +1841,21 @@ pub struct HandoffFields<'a> {
 
 pub fn create_handoff(conn: &Connection, project_id: i64, f: &HandoffFields<'_>) -> Result<i64> {
     conn.execute(
-        "INSERT INTO handoffs(project_id, session_id, title, done, state, decisions,
+        "INSERT INTO handoffs(uuid, project_id, session_id, title, done, state, decisions,
                               files_changed, open_issues, next_steps, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
-            project_id, f.session_id, f.title, f.done, f.state, f.decisions,
-            f.files_changed, f.open_issues, f.next_steps, now_iso()
+            format!("handoff_{}", uuid::Uuid::new_v4().simple()),
+            project_id,
+            f.session_id,
+            f.title,
+            f.done,
+            f.state,
+            f.decisions,
+            f.files_changed,
+            f.open_issues,
+            f.next_steps,
+            now_iso()
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1652,10 +2001,15 @@ pub fn read_session(
         "tail_excerpt": tail_excerpt,
         "before_compact": before_compact,
         "messages": msgs,
+        "task_steps": crate::work::steps_for_session(conn,session_id)?,
     }))
 }
 
-pub fn recent_sessions(conn: &Connection, project_id: Option<i64>, limit: u32) -> Result<Vec<Value>> {
+pub fn recent_sessions(
+    conn: &Connection,
+    project_id: Option<i64>,
+    limit: u32,
+) -> Result<Vec<Value>> {
     let mut stmt = conn.prepare(
         "SELECT s.id, s.agent, p.name, s.started_at, s.ended_at, s.message_count,
                 (SELECT replace(substr(m.content, 1, 160), char(10), ' ')
@@ -1701,13 +2055,19 @@ pub fn set_session_deleted(conn: &Connection, session_id: &str, deleted: bool) -
             params![session_id, now_iso()],
         )?
     };
-    let state = if deleted { "not found or already in trash" } else { "not in trash" };
+    let state = if deleted {
+        "not found or already in trash"
+    } else {
+        "not in trash"
+    };
     anyhow::ensure!(n > 0, "session {state}: {session_id}");
     Ok(())
 }
 
 mod purge;
-pub use purge::{TRASH_RETENTION_DAYS, purge_plan, purge_session, gc_sweep, trash_overdue_plan, purge_trash};
+pub use purge::{
+    gc_sweep, purge_plan, purge_session, purge_trash, trash_overdue_plan, TRASH_RETENTION_DAYS,
+};
 
 pub fn trash_sessions(conn: &Connection) -> Result<Vec<Value>> {
     let mut stmt = conn.prepare(
@@ -1810,8 +2170,15 @@ pub fn usage_summary(conn: &Connection, days: u32) -> Result<Vec<Value>> {
 
 // ----------------------------------------------------------------- memory
 
-pub const MEMORY_TYPES: [&str; 7] =
-    ["fact", "decision", "rule", "task", "lesson", "preference", "context"];
+pub const MEMORY_TYPES: [&str; 7] = [
+    "fact",
+    "decision",
+    "rule",
+    "task",
+    "lesson",
+    "preference",
+    "context",
+];
 pub const MEMORY_SCOPES: [&str; 3] = ["global", "project", "session"];
 
 /// Days a memory stays current after its last update, by type; None = no expiry.
@@ -1829,7 +2196,10 @@ fn memory_is_stale(r#type: &str, status: &str, updated_at: &str) -> bool {
     if !matches!(status, "suggested" | "confirmed") {
         return false;
     }
-    let (Some(days), Ok(updated)) = (memory_ttl_days(r#type), chrono::DateTime::parse_from_rfc3339(updated_at)) else {
+    let (Some(days), Ok(updated)) = (
+        memory_ttl_days(r#type),
+        chrono::DateTime::parse_from_rfc3339(updated_at),
+    ) else {
         return false;
     };
     (chrono::Utc::now() - updated.with_timezone(&chrono::Utc)).num_days() > days
@@ -1855,7 +2225,10 @@ pub struct MemoryInput<'a> {
 }
 
 /// CLI/MCP 共用写入顺序；相似项是提示，不阻止保存，且不包含本次新记录。
-pub fn save_memory_with_similar(conn: &Connection, input: &MemoryInput<'_>) -> Result<(String, Vec<Value>)> {
+pub fn save_memory_with_similar(
+    conn: &Connection,
+    input: &MemoryInput<'_>,
+) -> Result<(String, Vec<Value>)> {
     let similar = find_similar(conn, input.content, input.project_id, input.r#type)?;
     let id = save_memory(conn, input)?;
     Ok((id, similar))
@@ -1865,16 +2238,30 @@ pub fn save_memory_with_similar(conn: &Connection, input: &MemoryInput<'_>) -> R
 /// future agent behavior, so a human should confirm them); everything else
 /// defaults to `confirmed`.
 pub fn save_memory(conn: &Connection, input: &MemoryInput<'_>) -> Result<String> {
-    anyhow::ensure!(MEMORY_TYPES.contains(&input.r#type), "invalid memory type: {}", input.r#type);
-    anyhow::ensure!(MEMORY_SCOPES.contains(&input.scope), "invalid memory scope: {}", input.scope);
+    anyhow::ensure!(
+        MEMORY_TYPES.contains(&input.r#type),
+        "invalid memory type: {}",
+        input.r#type
+    );
+    anyhow::ensure!(
+        MEMORY_SCOPES.contains(&input.scope),
+        "invalid memory scope: {}",
+        input.scope
+    );
     if let Some(s) = input.status {
         anyhow::ensure!(MEMORY_STATUSES.contains(&s), "invalid memory status: {s}");
     }
     anyhow::ensure!(!input.content.trim().is_empty(), "memory content is empty");
 
-    let project_id = if input.scope == "global" { None } else { input.project_id };
-    anyhow::ensure!(input.scope == "global" || project_id.is_some(),
-        "project/session-scoped memory requires a project");
+    let project_id = if input.scope == "global" {
+        None
+    } else {
+        input.project_id
+    };
+    anyhow::ensure!(
+        input.scope == "global" || project_id.is_some(),
+        "project/session-scoped memory requires a project"
+    );
     // 来源指针写入即校验：message 必须属于所指会话，否则行号会错挂（codex 复现）
     if let (Some(sid), Some(mid)) = (input.source_session_id, input.source_message_id) {
         let ok: Option<i64> = conn
@@ -1884,7 +2271,10 @@ pub fn save_memory(conn: &Connection, input: &MemoryInput<'_>) -> Result<String>
                 |r| r.get(0),
             )
             .optional()?;
-        anyhow::ensure!(ok.is_some(), "source_message_id {mid} 不属于会话 {sid}，拒绝写入");
+        anyhow::ensure!(
+            ok.is_some(),
+            "source_message_id {mid} 不属于会话 {sid}，拒绝写入"
+        );
     }
 
     let status = input.status.unwrap_or(match input.r#type {
@@ -1897,14 +2287,84 @@ pub fn save_memory(conn: &Connection, input: &MemoryInput<'_>) -> Result<String>
         "INSERT INTO memories(id, project_id, scope, type, content, status,
                               source_session_id, source_message_id, created_at, updated_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
-        params![id, project_id, input.scope, input.r#type, input.content, status,
-                input.source_session_id, input.source_message_id, now],
+        params![
+            id,
+            project_id,
+            input.scope,
+            input.r#type,
+            input.content,
+            status,
+            input.source_session_id,
+            input.source_message_id,
+            now
+        ],
     )?;
+    crate::work::record_memory_event(
+        conn,
+        &id,
+        "created",
+        None,
+        Some(input.content),
+        input.source_session_id,
+        input.source_message_id,
+    )?;
+    if input.r#type == "task" {
+        crate::work::migrate_legacy_tasks(conn)?;
+    }
     Ok(id)
 }
 
+pub fn revise_preference(
+    conn: &Connection,
+    id: &str,
+    content: &str,
+    expected_updated_at: Option<&str>,
+) -> Result<String> {
+    let tx = conn.unchecked_transaction()?;
+    let old = tx.query_row(
+        "SELECT project_id,scope,status,updated_at FROM memories WHERE id=?1 AND type='preference'",
+        [id], |row| Ok((row.get::<_,Option<i64>>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)),
+    ).optional()?.context("偏好不存在")?;
+    anyhow::ensure!(
+        expected_updated_at == Some(old.3.as_str()),
+        "偏好已被修改，请重新读取后再保存"
+    );
+    let replacement = save_memory(
+        &tx,
+        &MemoryInput {
+            project_id: old.0,
+            scope: &old.1,
+            r#type: "preference",
+            content,
+            status: Some(&old.2),
+            source_session_id: None,
+            source_message_id: None,
+        },
+    )?;
+    let now = now_iso();
+    tx.execute(
+        "UPDATE memories SET status='superseded',superseded_by=?2,updated_at=?3 WHERE id=?1",
+        params![id, replacement, now],
+    )?;
+    crate::work::record_memory_event(
+        &tx,
+        id,
+        "status_changed",
+        Some(&old.2),
+        Some("superseded"),
+        None,
+        None,
+    )?;
+    tx.commit()?;
+    Ok(replacement)
+}
+
 fn memory_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
-    let stale = memory_is_stale(&r.get::<_, String>(4)?, &r.get::<_, String>(6)?, &r.get::<_, String>(11)?);
+    let stale = memory_is_stale(
+        &r.get::<_, String>(4)?,
+        &r.get::<_, String>(6)?,
+        &r.get::<_, String>(11)?,
+    );
     Ok(json!({
         "id": r.get::<_, String>(0)?,
         "project_id": r.get::<_, Option<i64>>(1)?,
@@ -1992,19 +2452,26 @@ pub fn list_memories(conn: &Connection, f: &MemoryFilter) -> Result<Vec<Value>> 
         n => format!("{MEMORY_SELECT} {w} ORDER BY m.updated_at DESC LIMIT {n}"),
     };
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())), memory_json)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+        memory_json,
+    )?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 pub fn search_memory(conn: &Connection, query: &str, f: &MemoryFilter) -> Result<Vec<Value>> {
     let (w, mut args) = memory_where(f);
-    let use_fts = query.split_whitespace().all(|t| t.chars().count() >= 3) && !query.trim().is_empty();
+    let use_fts =
+        query.split_whitespace().all(|t| t.chars().count() >= 3) && !query.trim().is_empty();
     let cond = if use_fts {
         args.insert(0, Box::new(fts_query(query)));
         "m.rowid IN (SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?)".to_string()
     } else {
         // 多词回退保持 AND 语义（与 FTS 一致）；空查询沿用原语义（全命中）
-        let tokens: Vec<String> = query.split_whitespace().map(|t| format!("%{}%", like_escape(t))).collect();
+        let tokens: Vec<String> = query
+            .split_whitespace()
+            .map(|t| format!("%{}%", like_escape(t)))
+            .collect();
         let cond = if tokens.is_empty() {
             "1=1".to_string()
         } else {
@@ -2018,21 +2485,32 @@ pub fn search_memory(conn: &Connection, query: &str, f: &MemoryFilter) -> Result
     // limit=0 与 list_memories 同语义（无上限）：search 走 LIMIT 0 会返回空集，
     // 两处口径必须一致（自检 C7；当前调用方都传非零，防御性对齐）
     let sql = match f.limit {
-        0 => format!("{MEMORY_SELECT} {} ORDER BY m.updated_at DESC", w.replacen("1=1", &format!("1=1 AND {cond}"), 1)),
+        0 => format!(
+            "{MEMORY_SELECT} {} ORDER BY m.updated_at DESC",
+            w.replacen("1=1", &format!("1=1 AND {cond}"), 1)
+        ),
         n => format!(
             "{MEMORY_SELECT} {} ORDER BY m.updated_at DESC LIMIT {n}",
             w.replacen("1=1", &format!("1=1 AND {cond}"), 1),
         ),
     };
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())), memory_json)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+        memory_json,
+    )?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 /// 写路径纪律（吸收自 engramory 的"写前查重、更新而非复制"）：
 /// 保存前找疑似重复——同项目（或全局）、同类型、活跃状态的记忆里，
 /// 内容 trigram 重合度排序取前 3。确定性启发式，只提醒不拦截（知情门控）。
-pub fn find_similar(conn: &Connection, content: &str, project_id: Option<i64>, r#type: &str) -> Result<Vec<Value>> {
+pub fn find_similar(
+    conn: &Connection,
+    content: &str,
+    project_id: Option<i64>,
+    r#type: &str,
+) -> Result<Vec<Value>> {
     // 采样 trigram：中文无词边界，五点采样（1/4、1/2、3/4 处为主，首尾兜底）
     // 做 FTS 召回——重复内容通常共享主体，纯尾部追加（"（重申）"类）不能
     // 让探针全落空
@@ -2046,13 +2524,7 @@ pub fn find_similar(conn: &Connection, content: &str, project_id: Option<i64>, r
         let start = start.min(n - 3);
         chars[start..start + 3].iter().collect::<String>()
     };
-    let probes = [
-        tri(0),
-        tri(n / 4),
-        tri(n / 2),
-        tri(3 * n / 4),
-        tri(n - 3),
-    ];
+    let probes = [tri(0), tri(n / 4), tri(n / 2), tri(3 * n / 4), tri(n - 3)];
     let distinct: Vec<String> = {
         let mut v = probes.to_vec();
         v.sort();
@@ -2077,9 +2549,7 @@ pub fn find_similar(conn: &Connection, content: &str, project_id: Option<i64>, r
     let candidates: Vec<Value> = stmt
         .query_map(rusqlite::params![query, r#type, project_id], memory_json)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let shared = |c: &str| -> usize {
-        distinct.iter().filter(|t| c.contains(t.as_str())).count()
-    };
+    let shared = |c: &str| -> usize { distinct.iter().filter(|t| c.contains(t.as_str())).count() };
     let mut hits: Vec<Value> = candidates
         .into_iter()
         .filter(|m| shared(m["content"].as_str().unwrap_or("")) >= 2.min(distinct.len()))
@@ -2093,7 +2563,12 @@ pub fn find_similar(conn: &Connection, content: &str, project_id: Option<i64>, r
     Ok(hits)
 }
 
-pub fn update_memory_status(conn: &Connection, id: &str, action: &str, superseded_by: Option<&str>) -> Result<()> {
+pub fn update_memory_status(
+    conn: &Connection,
+    id: &str,
+    action: &str,
+    superseded_by: Option<&str>,
+) -> Result<()> {
     update_memory_status_at(conn, id, action, superseded_by, None)
 }
 
@@ -2110,7 +2585,9 @@ pub fn update_memory_status_at(
     let tx = conn.unchecked_transaction()?;
     if let Some(expected) = expected_updated_at {
         let current: Option<String> = tx
-            .query_row("SELECT updated_at FROM memories WHERE id = ?1", [id], |r| r.get(0))
+            .query_row("SELECT updated_at FROM memories WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
             .optional()?;
         let current = current.ok_or_else(|| anyhow::anyhow!("memory not found: {id}"))?;
         anyhow::ensure!(
@@ -2125,29 +2602,54 @@ pub fn update_memory_status_at(
         _ => anyhow::bail!("invalid action: {action} (confirm|archive|supersede)"),
     };
     if action == "supersede" {
-        anyhow::ensure!(superseded_by.is_some(), "supersede requires --by <memory_id>");
+        anyhow::ensure!(
+            superseded_by.is_some(),
+            "supersede requires --by <memory_id>"
+        );
         let target = superseded_by.unwrap();
         anyhow::ensure!(target != id, "memory cannot supersede itself");
-        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)", [target], |r| r.get(0))?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
+            [target],
+            |r| r.get(0),
+        )?;
         anyhow::ensure!(exists, "replacement memory not found: {target}");
         let cycle: bool = tx.query_row(
             "WITH RECURSIVE chain(id) AS (
                 SELECT ?1 UNION SELECT m.superseded_by FROM memories m JOIN chain c ON m.id = c.id
                 WHERE m.superseded_by IS NOT NULL
              ) SELECT EXISTS(SELECT 1 FROM chain WHERE id = ?2)",
-            params![target, id], |r| r.get(0),
+            params![target, id],
+            |r| r.get(0),
         )?;
         anyhow::ensure!(!cycle, "replacement would create a memory cycle");
     }
     // confirm 必须清掉 superseded_by：被取代的记忆重新确认后就不再是"被取代"，
     // 保留旧指针会让 A→B、B→A 成环，卷宗演变链遍历会死循环（codex 评审复现）。
-    let superseded_by = if action == "supersede" { superseded_by } else { None };
+    let superseded_by = if action == "supersede" {
+        superseded_by
+    } else {
+        None
+    };
+    let old_status: String =
+        tx.query_row("SELECT status FROM memories WHERE id=?1", [id], |r| {
+            r.get(0)
+        })?;
     let n = tx.execute(
         "UPDATE memories SET status = ?1, superseded_by = ?2, updated_at = ?3
          WHERE id = ?4",
         params![new_status, superseded_by, now_iso(), id],
     )?;
     anyhow::ensure!(n > 0, "memory not found: {id}");
+    crate::work::record_memory_event(
+        &tx,
+        id,
+        "status_changed",
+        Some(&old_status),
+        Some(new_status),
+        None,
+        None,
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -2155,43 +2657,75 @@ pub fn update_memory_status_at(
 /// Confirmed memories (project + global) and pending-suggestion count,
 /// for get_project_context.
 pub fn memories_for_context(conn: &Connection, project_id: i64) -> Result<Value> {
-    let confirmed = list_memories(conn, &MemoryFilter {
-        project_id: Some(project_id),
-        scope: None,
-        r#type: None,
-        status: Some("confirmed".into()),
-        agent: None,
-        include_global: true,
-        limit: 20,
-    })?;
+    let confirmed = list_memories(
+        conn,
+        &MemoryFilter {
+            project_id: Some(project_id),
+            scope: None,
+            r#type: None,
+            status: Some("confirmed".into()),
+            agent: None,
+            include_global: true,
+            limit: 20,
+        },
+    )?;
     let suggested_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM memories WHERE status = 'suggested' AND (project_id = ?1 OR project_id IS NULL)",
         params![project_id],
         |r| r.get(0),
     )?;
     // 待确认的建议也交给 agent（带 status 字段区分），否则 agent 看不到自己刚存的决定
-    let suggested = list_memories(conn, &MemoryFilter {
-        project_id: Some(project_id),
-        scope: None,
-        r#type: None,
-        status: Some("suggested".into()),
-        agent: None,
-        include_global: true,
-        limit: 10,
-    })?;
-    Ok(json!({ "confirmed": confirmed, "suggested": suggested, "suggested_pending": suggested_count }))
+    let suggested = list_memories(
+        conn,
+        &MemoryFilter {
+            project_id: Some(project_id),
+            scope: None,
+            r#type: None,
+            status: Some("suggested".into()),
+            agent: None,
+            include_global: true,
+            limit: 10,
+        },
+    )?;
+    Ok(
+        json!({ "confirmed": confirmed, "suggested": suggested, "suggested_pending": suggested_count }),
+    )
 }
 
 pub fn open_tasks(conn: &Connection, project_id: Option<i64>) -> Result<Vec<Value>> {
-    list_memories(conn, &MemoryFilter {
-        project_id,
-        scope: None,
-        r#type: Some("task".into()),
-        status: Some("confirmed".into()),
-        agent: None,
-        include_global: project_id.is_some(),
-        limit: 50,
-    })
+    let has_tasks: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks')",
+        [],
+        |r| r.get(0),
+    )?;
+    let legacy = list_memories(
+        conn,
+        &MemoryFilter {
+            project_id,
+            scope: None,
+            r#type: Some("task".into()),
+            status: Some("confirmed".into()),
+            agent: None,
+            include_global: project_id.is_some(),
+            limit: 50,
+        },
+    )?;
+    if !has_tasks {
+        return Ok(legacy);
+    }
+    let mut tasks = crate::work::list_tasks(conn, project_id, Some("active"), None, 50)?;
+    for memory in legacy {
+        let id = memory["id"].as_str().unwrap_or_default();
+        let migrated: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_meta WHERE key=?1)",
+            [format!("legacy_task:{id}")],
+            |row| row.get(0),
+        )?;
+        if !migrated {
+            tasks.push(memory);
+        }
+    }
+    Ok(tasks)
 }
 
 // ----------------------------------------------------------- memory files
@@ -2202,7 +2736,13 @@ pub fn open_tasks(conn: &Connection, project_id: Option<i64>) -> Result<Vec<Valu
 /// Upsert one monitored file. Returns (file_id, changed): `changed` means the
 /// hash differs from the stored one (or the file is new) and a new revision
 /// should be recorded.
-pub fn upsert_memory_file(conn: &Connection, agent: &str, scope: &str, path: &str, hash: &str) -> Result<(i64, bool)> {
+pub fn upsert_memory_file(
+    conn: &Connection,
+    agent: &str,
+    scope: &str,
+    path: &str,
+    hash: &str,
+) -> Result<(i64, bool)> {
     let existing = conn
         .query_row(
             "SELECT id, current_hash FROM memory_files WHERE agent = ?1 AND path = ?2",
@@ -2230,10 +2770,15 @@ pub fn upsert_memory_file(conn: &Connection, agent: &str, scope: &str, path: &st
     }
 }
 
-pub fn insert_memory_revision(conn: &Connection, file_id: i64, hash: &str, size: u64) -> Result<i64> {
+pub fn insert_memory_revision(
+    conn: &Connection,
+    file_id: i64,
+    hash: &str,
+    size: u64,
+) -> Result<i64> {
     conn.execute(
-        "INSERT INTO memory_revisions(file_id, hash, size, captured_at) VALUES (?1,?2,?3,?4)",
-        params![file_id, hash, size as i64, now_iso()],
+        "INSERT INTO memory_revisions(file_id, hash, size, captured_at, revision_uuid) VALUES (?1,?2,?3,?4,?5)",
+        params![file_id, hash, size as i64, now_iso(), uuid::Uuid::new_v4().to_string()],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -2241,7 +2786,10 @@ pub fn insert_memory_revision(conn: &Connection, file_id: i64, hash: &str, size:
 /// memory_fts indexes only the latest revision: delete + reinsert on change.
 pub fn set_memory_fts(conn: &Connection, file_id: i64, content: &str) -> Result<()> {
     conn.execute("DELETE FROM memory_fts WHERE rowid = ?1", params![file_id])?;
-    conn.execute("INSERT INTO memory_fts(rowid, content) VALUES (?1, ?2)", params![file_id, content])?;
+    conn.execute(
+        "INSERT INTO memory_fts(rowid, content) VALUES (?1, ?2)",
+        params![file_id, content],
+    )?;
     Ok(())
 }
 
@@ -2321,21 +2869,20 @@ pub fn insert_artifacts(
     project_id: Option<i64>,
     artifacts: &[crate::models::NewArtifact],
 ) -> Result<()> {
-    // 本批没带 cwd（pi 只在头行给、codex 无 turn_context 的增量）时项目取会话行的。
-    // 产物时间取所属会话的结束时间（调用方已写入本批消息的会话行）：实时采集时
-    // 即最新消息时间，补导历史时是会话实际结束时间，而不是导入时刻
-    let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO session_artifacts(session_id, project_id, path, tool, created_at)
-         VALUES (?1, COALESCE(?2, (SELECT project_id FROM sessions WHERE id = ?1)), ?3, ?4,
-                 COALESCE((SELECT ended_at FROM sessions WHERE id = ?1), ?5))",
+    let agent: String = conn.query_row(
+        "SELECT agent FROM sessions WHERE id=?1",
+        [session_id],
+        |r| r.get(0),
     )?;
-    for a in artifacts {
-        stmt.execute(params![session_id, project_id, a.path, a.tool, now_iso()])?;
-    }
-    Ok(())
+    crate::work::insert_artifacts(conn, session_id, project_id, &agent, artifacts)
 }
 
-pub fn list_artifacts(conn: &Connection, project_id: Option<i64>, session_id: Option<&str>, limit: u32) -> Result<Vec<Value>> {
+pub fn list_artifacts(
+    conn: &Connection,
+    project_id: Option<i64>,
+    session_id: Option<&str>,
+    limit: u32,
+) -> Result<Vec<Value>> {
     let mut stmt = conn.prepare(
         "SELECT a.path, a.tool, a.session_id, s.agent, p.name, a.created_at
          FROM session_artifacts a
@@ -2391,7 +2938,9 @@ pub fn detect_lineage(conn: &Connection) -> Result<u64> {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let Some((parent_id, _)) = owner else { continue };
+            let Some((parent_id, _)) = owner else {
+                continue;
+            };
             if parent_id == child_id {
                 continue;
             }
@@ -2410,7 +2959,11 @@ pub fn detect_lineage(conn: &Connection) -> Result<u64> {
                     params![parent_id, uuid],
                     |r| r.get(0),
                 )?;
-                if last_line - uuid_line <= 1 { "continuation" } else { "fork" }
+                if last_line - uuid_line <= 1 {
+                    "continuation"
+                } else {
+                    "fork"
+                }
             };
             added += conn.execute(
                 "INSERT OR IGNORE INTO session_links(child_session_id, parent_session_id, link_type, via_uuid, created_at)
@@ -2442,7 +2995,10 @@ fn detect_subagent_lineage(conn: &Connection) -> Result<u64> {
     let mut added = 0u64;
     for (child_id, agent, native_id, file_path) in rows {
         let parent_id = if agent == "kimi" {
-            native_id.split('#').next().map(|main| format!("kimi:{main}"))
+            native_id
+                .split('#')
+                .next()
+                .map(|main| format!("kimi:{main}"))
         } else {
             let dir = Path::new(&file_path).parent();
             dir.filter(|d| d.file_name().is_some_and(|n| n == "subagents"))
@@ -2468,20 +3024,22 @@ fn detect_subagent_lineage(conn: &Connection) -> Result<u64> {
 /// is admitted.  Subagent metadata takes precedence over `forked_from_id`
 /// because Codex records both on a forked subagent session.
 fn detect_codex_lineage(conn: &Connection) -> Result<u64> {
-    let mut stmt = conn.prepare(
-        "SELECT id, file_path FROM sessions WHERE agent = 'codex'",
-    )?;
+    let mut stmt = conn.prepare("SELECT id, file_path FROM sessions WHERE agent = 'codex'")?;
     let sessions: Vec<(String, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut added = 0;
     for (child_id, file_path) in sessions {
-        let Ok(file) = std::fs::File::open(file_path) else { continue };
+        let Ok(file) = std::fs::File::open(file_path) else {
+            continue;
+        };
         let mut link = None;
         for raw in BufReader::new(file).lines() {
             let Ok(raw) = raw else { continue };
-            let Ok(value) = serde_json::from_str::<Value>(&raw) else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
             if value["type"].as_str() != Some("session_meta") {
                 continue;
             }
@@ -2489,11 +3047,21 @@ fn detect_codex_lineage(conn: &Connection) -> Result<u64> {
             link = payload["source"]["subagent"]["thread_spawn"]["parent_thread_id"]
                 .as_str()
                 .map(|id| (id.to_string(), "subagent"))
-                .or_else(|| payload["forked_from_id"].as_str().map(|id| (id.to_string(), "fork")))
-                .or_else(|| payload["parent_thread_id"].as_str().map(|id| (id.to_string(), "continuation")));
+                .or_else(|| {
+                    payload["forked_from_id"]
+                        .as_str()
+                        .map(|id| (id.to_string(), "fork"))
+                })
+                .or_else(|| {
+                    payload["parent_thread_id"]
+                        .as_str()
+                        .map(|id| (id.to_string(), "continuation"))
+                });
             break;
         }
-        let Some((parent_native_id, link_type)) = link else { continue };
+        let Some((parent_native_id, link_type)) = link else {
+            continue;
+        };
         let parent_id = format!("codex:{parent_native_id}");
         if parent_id == child_id {
             continue;
@@ -2534,7 +3102,8 @@ pub fn lineage_for(conn: &Connection, session_id: &str) -> Result<Value> {
 pub fn lineage_tree(conn: &Connection, session_id: &str) -> Result<Value> {
     const MAX_NODES: usize = 300;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut edge_set: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut edge_set: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     let mut edges: Vec<Value> = Vec::new();
     seen.insert(session_id.to_string());
     let mut queue = std::collections::VecDeque::from([session_id.to_string()]);
@@ -2547,10 +3116,15 @@ pub fn lineage_tree(conn: &Connection, session_id: &str) -> Result<Value> {
     )?;
     while let Some(sid) = queue.pop_front() {
         let parents: Vec<(String, String)> = q_parents
-            .query_map(params![sid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .query_map(params![sid], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for (p, lt) in parents {
-            if !seen.contains(&p) && seen.len() >= MAX_NODES { truncated = true; continue; }
+            if !seen.contains(&p) && seen.len() >= MAX_NODES {
+                truncated = true;
+                continue;
+            }
             if edge_set.insert((p.clone(), sid.clone())) {
                 edges.push(json!({ "parent": p.clone(), "child": sid.clone(), "link_type": lt }));
             }
@@ -2559,10 +3133,15 @@ pub fn lineage_tree(conn: &Connection, session_id: &str) -> Result<Value> {
             }
         }
         let children: Vec<(String, String)> = q_children
-            .query_map(params![sid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .query_map(params![sid], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for (c, lt) in children {
-            if !seen.contains(&c) && seen.len() >= MAX_NODES { truncated = true; continue; }
+            if !seen.contains(&c) && seen.len() >= MAX_NODES {
+                truncated = true;
+                continue;
+            }
             if edge_set.insert((sid.clone(), c.clone())) {
                 edges.push(json!({ "parent": sid.clone(), "child": c.clone(), "link_type": lt }));
             }
@@ -2656,8 +3235,18 @@ mod tests {
         let conn = open(dir.path()).unwrap();
         seed_session(&conn, "claude:t1");
         seed_message(&conn, "claude:t1", "user", "讨论 QUICKUSER 方案");
-        seed_message(&conn, "claude:t1", "tool_call", "grep QUICKCALL src/main.rs");
-        seed_message(&conn, "claude:t1", "tool_result", "error QUICKRESULT QRMARK boom");
+        seed_message(
+            &conn,
+            "claude:t1",
+            "tool_call",
+            "grep QUICKCALL src/main.rs",
+        );
+        seed_message(
+            &conn,
+            "claude:t1",
+            "tool_result",
+            "error QUICKRESULT QRMARK boom",
+        );
         assert!(!tool_index_enabled(&conn).unwrap(), "默认轻量态");
         assert_eq!(search_hits(&conn, "QUICKUSER"), 1, "对话层可搜");
         assert_eq!(search_hits(&conn, "QUICKCALL"), 1, "tool_call 保留在对话层");
@@ -2674,21 +3263,41 @@ mod tests {
         let home = dir.path().to_path_buf();
         let conn = open(&home).unwrap();
         seed_session(&conn, "claude:t2");
-        seed_message(&conn, "claude:t2", "tool_result", "panic QUICKRESULT at runtime");
+        seed_message(
+            &conn,
+            "claude:t2",
+            "tool_result",
+            "panic QUICKRESULT at runtime",
+        );
 
         set_tool_index(&home, &conn, true).unwrap();
         assert!(tool_index_enabled(&conn).unwrap());
         assert_eq!(search_hits(&conn, "QUICKRESULT"), 1, "全量态回填可搜");
-        seed_message(&conn, "claude:t2", "tool_result", "second QUICKSECOND output");
-        assert_eq!(search_hits(&conn, "QUICKSECOND"), 1, "全量态新写入也被触发器索引");
-        assert_eq!(crate::ingest::read_config(&home)[CFG_TOOL_INDEX], json!(true));
+        seed_message(
+            &conn,
+            "claude:t2",
+            "tool_result",
+            "second QUICKSECOND output",
+        );
+        assert_eq!(
+            search_hits(&conn, "QUICKSECOND"),
+            1,
+            "全量态新写入也被触发器索引"
+        );
+        assert_eq!(
+            crate::ingest::read_config(&home)[CFG_TOOL_INDEX],
+            json!(true)
+        );
 
         set_tool_index(&home, &conn, false).unwrap();
         assert!(!tool_index_enabled(&conn).unwrap());
         assert_eq!(search_hits(&conn, "QUICKRESULT"), 0, "切回轻量后不可搜");
         seed_message(&conn, "claude:t2", "tool_result", "third QUICKTHIRD output");
         assert_eq!(search_hits(&conn, "QUICKTHIRD"), 0, "轻量态新写入不进索引");
-        assert_eq!(crate::ingest::read_config(&home)[CFG_TOOL_INDEX], json!(false));
+        assert_eq!(
+            crate::ingest::read_config(&home)[CFG_TOOL_INDEX],
+            json!(false)
+        );
     }
 
     #[test]
@@ -2716,9 +3325,18 @@ mod tests {
         let conn = open(dir.path()).unwrap(); // 走 v12 迁移
         assert!(!tool_index_enabled(&conn).unwrap());
         assert_eq!(search_hits(&conn, "QUICKUSER"), 1, "对话层迁移后保留");
-        assert_eq!(search_hits(&conn, "QUICKRESULT"), 0, "工具输出迁移后移出对话层索引");
+        assert_eq!(
+            search_hits(&conn, "QUICKRESULT"),
+            0,
+            "工具输出迁移后移出对话层索引"
+        );
         let r = crate::doctor::run(&conn, dir.path()).unwrap();
-        let fts = r["checks"].as_array().unwrap().iter().find(|c| c["name"] == "fts").unwrap();
+        let fts = r["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "fts")
+            .unwrap();
         assert_eq!(fts["status"], "ok", "doctor 两态对账: {fts}");
     }
 
@@ -2735,7 +3353,10 @@ mod tests {
             assert!(tool_index_enabled(&conn).unwrap());
         }
         let conn = open(&home).unwrap();
-        assert!(!tool_index_enabled(&conn).unwrap(), "open 收敛到 config 轻量态");
+        assert!(
+            !tool_index_enabled(&conn).unwrap(),
+            "open 收敛到 config 轻量态"
+        );
         assert_eq!(search_hits(&conn, "QUICKRESULT"), 0);
     }
 
@@ -2745,13 +3366,26 @@ mod tests {
         let home = dir.path().to_path_buf();
         let conn = open(&home).unwrap();
         seed_session(&conn, "claude:t5");
-        seed_message(&conn, "claude:t5", "tool_result", "first QUICKRESULT output");
+        seed_message(
+            &conn,
+            "claude:t5",
+            "tool_result",
+            "first QUICKRESULT output",
+        );
         set_tool_index(&home, &conn, true).unwrap();
         // resync 语义：先清后重插，索引两侧都要跟住
-        conn.execute("DELETE FROM messages WHERE content LIKE '%QUICKRESULT%'", [])
-            .unwrap();
+        conn.execute(
+            "DELETE FROM messages WHERE content LIKE '%QUICKRESULT%'",
+            [],
+        )
+        .unwrap();
         assert_eq!(search_hits(&conn, "QUICKRESULT"), 0, "删除后索引同步清空");
-        seed_message(&conn, "claude:t5", "tool_result", "replayed QUICKRESULT output");
+        seed_message(
+            &conn,
+            "claude:t5",
+            "tool_result",
+            "replayed QUICKRESULT output",
+        );
         assert_eq!(search_hits(&conn, "QUICKRESULT"), 1, "重插后索引同步恢复");
     }
 

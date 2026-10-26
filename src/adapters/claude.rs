@@ -9,9 +9,9 @@
 
 use serde_json::Value;
 
-use crate::models::{MessageKind, NewArtifact, NewMessage, ParseOutput, SessionMetaPatch, UuidSighting};
-
-
+use crate::models::{
+    MessageKind, NewArtifact, NewMessage, ParseOutput, SessionMetaPatch, UuidSighting,
+};
 
 pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
     let mut out = ParseOutput::default();
@@ -27,9 +27,15 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
             Err(_) => continue, // partial / corrupt line: vault still has it
         };
         if let Some(u) = v.get("uuid").and_then(Value::as_str) {
-            out.uuids.push(UuidSighting { line_no: *line_no, uuid: u.to_string() });
+            out.uuids.push(UuidSighting {
+                line_no: *line_no,
+                uuid: u.to_string(),
+            });
         }
-        let ts = v.get("timestamp").and_then(Value::as_str).map(str::to_string);
+        let ts = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         track_ts(meta, ts.as_deref());
         if let Some(cwd) = v.get("cwd").and_then(Value::as_str) {
             meta.cwd = Some(cwd.to_string());
@@ -50,8 +56,10 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                 // 当 fork 信号会误报（自检 A7）。
                 if !saw_first_bearing {
                     saw_first_bearing = true;
-                    meta.first_parent_uuid =
-                        v.get("parentUuid").and_then(Value::as_str).map(str::to_string);
+                    meta.first_parent_uuid = v
+                        .get("parentUuid")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
                 }
                 // 同文件压缩后紧跟的摘要行（isCompactSummary）是 harness 生成的
                 // 压缩摘要，不是用户输入。
@@ -62,7 +70,15 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                 } else {
                     MessageKind::Assistant
                 };
-                extract_blocks(&v["message"]["content"], base, *line_no, &ts, &uuid, &mut out.messages, &mut out.artifacts);
+                extract_blocks(
+                    &v["message"]["content"],
+                    base,
+                    *line_no,
+                    &ts,
+                    &uuid,
+                    &mut out.messages,
+                    &mut out.artifacts,
+                );
             }
             "system" => {
                 // 同文件压缩（Claude Code 2.1 起）：compact_boundary 行即压缩点，
@@ -71,7 +87,14 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                     out.compact_line = Some(out.compact_line.map_or(*line_no, |c| c.min(*line_no)));
                 }
                 if let Some(text) = v.get("content").and_then(Value::as_str) {
-                    push(&mut out.messages, *line_no, MessageKind::System, text.to_string(), ts, uuid);
+                    push(
+                        &mut out.messages,
+                        *line_no,
+                        MessageKind::System,
+                        text.to_string(),
+                        ts,
+                        uuid,
+                    );
                 }
             }
             "summary" => {
@@ -80,7 +103,14 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                     meta.compact_leaf_uuid = Some(leaf.to_string());
                 }
                 if let Some(text) = v.get("summary").and_then(Value::as_str) {
-                    push(&mut out.messages, *line_no, MessageKind::Summary, text.to_string(), ts, uuid);
+                    push(
+                        &mut out.messages,
+                        *line_no,
+                        MessageKind::Summary,
+                        text.to_string(),
+                        ts,
+                        uuid,
+                    );
                 }
             }
             _ => {}
@@ -111,18 +141,51 @@ fn extract_blocks(
                     }
                     Some("thinking") => {
                         if let Some(t) = item.get("thinking").and_then(Value::as_str) {
-                            push(out, line_no, MessageKind::Thinking, t.to_string(), ts.clone(), uuid.clone());
+                            push(
+                                out,
+                                line_no,
+                                MessageKind::Thinking,
+                                t.to_string(),
+                                ts.clone(),
+                                uuid.clone(),
+                            );
                         }
                     }
                     Some("tool_use") => {
                         let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
                         let input = compact(&item["input"], 2000);
                         if super::FILE_TOOLS.contains(&name) {
-                            if let Some(p) = item["input"].get("file_path").and_then(Value::as_str) {
-                                artifacts.push(NewArtifact { path: p.to_string(), tool: name.to_string() });
+                            if let Some(p) = item["input"].get("file_path").and_then(Value::as_str)
+                            {
+                                artifacts.push(NewArtifact {
+                                    path: p.to_string(),
+                                    from_path: None,
+                                    tool: name.to_string(),
+                                    operation: if name == "Write" { "create" } else { "edit" }
+                                        .to_string(),
+                                    native_tool_call_id: item
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string),
+                                    timestamp: ts.clone(),
+                                    line_no,
+                                    ord: artifacts.iter().filter(|a| a.line_no == line_no).count()
+                                        as u32,
+                                });
                             }
                         }
-                        push(out, line_no, MessageKind::ToolCall, format!("{name}: {input}"), ts.clone(), uuid.clone());
+                        push(
+                            out,
+                            line_no,
+                            MessageKind::ToolCall,
+                            format!("{name}: {input}"),
+                            ts.clone(),
+                            uuid.clone(),
+                        );
+                        if let Some(last) = out.last_mut() {
+                            last.native_tool_call_id =
+                                item.get("id").and_then(Value::as_str).map(str::to_string);
+                        }
                     }
                     Some("tool_result") => {
                         let text = match &item["content"] {
@@ -134,7 +197,22 @@ fn extract_blocks(
                                 .join("\n"),
                             other => compact(other, 2000),
                         };
-                        push(out, line_no, MessageKind::ToolResult, text, ts.clone(), uuid.clone());
+                        push(
+                            out,
+                            line_no,
+                            MessageKind::ToolResult,
+                            text,
+                            ts.clone(),
+                            uuid.clone(),
+                        );
+                        if let Some(last) = out.last_mut() {
+                            last.native_tool_call_id = item
+                                .get("tool_use_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                            last.tool_success =
+                                item.get("is_error").and_then(Value::as_bool).map(|v| !v);
+                        }
                     }
                     _ => {}
                 }
@@ -144,7 +222,14 @@ fn extract_blocks(
     }
 }
 
-fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, content: String, ts: Option<String>, uuid: Option<String>) {
+fn push(
+    out: &mut Vec<NewMessage>,
+    line_no: u64,
+    kind: MessageKind,
+    content: String,
+    ts: Option<String>,
+    uuid: Option<String>,
+) {
     super::push_message(out, line_no, kind, content, ts, uuid);
 }
 
@@ -171,7 +256,10 @@ mod tests {
     use super::*;
 
     fn lines(raw: &[&str]) -> Vec<(u64, String)> {
-        raw.iter().enumerate().map(|(i, s)| ((i + 1) as u64, s.to_string())).collect()
+        raw.iter()
+            .enumerate()
+            .map(|(i, s)| ((i + 1) as u64, s.to_string()))
+            .collect()
     }
 
     #[test]
@@ -197,7 +285,15 @@ mod tests {
         ]);
         let out = parse_lines(&input);
         let kinds: Vec<_> = out.messages.iter().map(|m| m.kind).collect();
-        assert_eq!(kinds, vec![MessageKind::Thinking, MessageKind::Assistant, MessageKind::ToolCall, MessageKind::ToolResult]);
+        assert_eq!(
+            kinds,
+            vec![
+                MessageKind::Thinking,
+                MessageKind::Assistant,
+                MessageKind::ToolCall,
+                MessageKind::ToolResult
+            ]
+        );
         assert!(out.messages[2].content.starts_with("Write:"));
         assert_eq!(out.messages[3].content, "file1.rs");
         assert_eq!(out.artifacts.len(), 1);

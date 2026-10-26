@@ -20,3 +20,6 @@ AGENTS.md
 
 # Local-only agent skills (desktop run/verify helpers)
 /.claude/
+
+# Local-only ai-cross review logs (raw material, model metadata)
+/.dispatch/

@@ -308,17 +308,23 @@ fn stale_expected_updated_at_rejects_governance_write() {
     // 不带期望时间戳：照旧放行（向后兼容）
     db::update_memory_status_at(&c, &id, "archive", None, None).unwrap();
     let read_version = || {
-        c.query_row("SELECT updated_at FROM memories WHERE id=?1", [&id], |r| r
-            .get::<_, String>(0))
-            .unwrap()
+        c.query_row("SELECT updated_at FROM memories WHERE id=?1", [&id], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap()
     };
 
     // 过期的期望时间戳：拒绝且状态不变
-    let err = db::update_memory_status_at(&c, &id, "confirm", None, Some("2000-01-01T00:00:00.000Z"))
-        .unwrap_err();
+    let err =
+        db::update_memory_status_at(&c, &id, "confirm", None, Some("2000-01-01T00:00:00.000Z"))
+            .unwrap_err();
     assert!(err.to_string().contains("已被修改"), "{err}");
     assert_eq!(
-        c.query_row("SELECT status FROM memories WHERE id=?1", [&id], |r| r.get::<_, String>(0)).unwrap(),
+        c.query_row("SELECT status FROM memories WHERE id=?1", [&id], |r| r
+            .get::<_, String>(
+            0
+        ))
+        .unwrap(),
         "archived",
         "拒绝后状态必须保持原样"
     );
@@ -327,5 +333,58 @@ fn stale_expected_updated_at_rejects_governance_write() {
     db::update_memory_status_at(&c, &id, "confirm", None, Some(&read_version())).unwrap();
 
     // 不存在的记忆：报 not found，不误判成过期
-    assert!(db::update_memory_status_at(&c, "mem_missing", "confirm", None, Some("2026-01-01T00:00:00.000Z")).is_err());
+    assert!(db::update_memory_status_at(
+        &c,
+        "mem_missing",
+        "confirm",
+        None,
+        Some("2026-01-01T00:00:00.000Z")
+    )
+    .is_err());
+}
+
+#[test]
+fn preference_revision_is_atomic_and_preserves_history() {
+    let home = tempfile::tempdir().unwrap();
+    let c = db::open(home.path()).unwrap();
+    let original = db::save_memory(
+        &c,
+        &db::MemoryInput {
+            project_id: None,
+            scope: "global",
+            r#type: "preference",
+            content: "旧偏好",
+            status: None,
+            source_session_id: None,
+            source_message_id: None,
+        },
+    )
+    .unwrap();
+    let version: String = c
+        .query_row(
+            "SELECT updated_at FROM memories WHERE id=?1",
+            [&original],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(db::revise_preference(&c, &original, "不该留下", Some("stale")).is_err());
+    assert_eq!(
+        c.query_row::<i64, _, _>("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    let replacement = db::revise_preference(&c, &original, "新偏好", Some(&version)).unwrap();
+    let state: (String, Option<String>) = c
+        .query_row(
+            "SELECT status,superseded_by FROM memories WHERE id=?1",
+            [&original],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, ("superseded".into(), Some(replacement)));
+    assert_eq!(
+        c.query_row::<i64, _, _>("SELECT COUNT(*) FROM memory_events", [], |r| r.get(0))
+            .unwrap(),
+        3
+    );
 }

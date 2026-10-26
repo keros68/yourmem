@@ -25,12 +25,13 @@ pub const INSTRUCTION_BLOCK: &str = r#"
 不要静默推翻；重新引入已被取代或归档的方案时，先说明当初被否的原因。
 
 - `search_history`：搜所有 agent（Codex/Claude/OpenCode/ZCode/Kimi/Hermes）的历史会话，命中后用 `read_session` 钻取
-- `get_project_context` / `get_recent_work`：项目背景、已确认记忆、最新 handoff、待办
+- `get_project_context` / `list_tasks` / `get_task_context`：项目背景与持久任务节点；开始或换对话时读取，读取不会自动关联会话
 - `read_native_memory`：查你自己 memory 文件（MEMORY.md / AGENTS.md）的历史版本与修订
 - `save_memory`：重要决定/规则/待办主动记录（decision/rule 会进入待确认队列）；
   保存前注意结果里的 similar 提示——疑似重复时更新/取代旧条而非再存一条；
   decision 写清问题、决定理由、被否方案与后果；lesson/preference 写清 Why 与 How to apply；git/代码/CLAUDE.md 已记录的不存
-- `create_handoff`：一段工作收尾时写交接，注明 session_id
+- `create_handoff`：不属于特定任务的普通工作也可写交接；`get_recent_work` 可查看近期工作
+- `close_work`：一段任务收尾时写任务交接并取得一次性 claim token；紧接着把 token 传给 `get_task_context`，让原生工具记录可认领会话。不知道 session_id 时不要编造；无法自动认领时请用户用桌面或 CLI 显式关联。自报完成不等于验证通过
 
 科研写入时机：定下分析方法或参数、某个数值或图表定稿、回应审稿意见的处理决定、放弃某条路线时，
 用 `save_memory` 的 decision 模板记录，被否方案一栏写明放弃的路线与否决原因。
@@ -58,15 +59,15 @@ fn instruction_status(content: &str) -> &'static str {
 
 /// 所有可能被触及的路径（预览就是打印这份清单）。测试注入临时目录。
 pub struct Targets {
-    pub claude_json: PathBuf,   // ~/.claude.json（user scope MCP 注册表）
-    pub claude_md: PathBuf,     // ~/.claude/CLAUDE.md
-    pub codex_config: PathBuf,  // ~/.codex/config.toml
-    pub codex_agents: PathBuf,  // ~/.codex/AGENTS.md
-    pub zcode_config: PathBuf,  // ~/.zcode/cli/config.json（mcp.servers）
-    pub kimi_mcp: PathBuf,      // ~/.kimi-code/mcp.json（mcpServers）
+    pub claude_json: PathBuf,     // ~/.claude.json（user scope MCP 注册表）
+    pub claude_md: PathBuf,       // ~/.claude/CLAUDE.md
+    pub codex_config: PathBuf,    // ~/.codex/config.toml
+    pub codex_agents: PathBuf,    // ~/.codex/AGENTS.md
+    pub zcode_config: PathBuf,    // ~/.zcode/cli/config.json（mcp.servers）
+    pub kimi_mcp: PathBuf,        // ~/.kimi-code/mcp.json（mcpServers）
     pub gemini_settings: PathBuf, // ~/.gemini/settings.json（mcpServers）
-    pub cursor_mcp: PathBuf,    // ~/.cursor/mcp.json（mcpServers）
-    pub hermes_config: PathBuf, // ~/.hermes/config.yaml（mcp_servers 段，0.3.9 起）
+    pub cursor_mcp: PathBuf,      // ~/.cursor/mcp.json（mcpServers）
+    pub hermes_config: PathBuf,   // ~/.hermes/config.yaml（mcp_servers 段，0.3.9 起）
 }
 
 impl Default for Targets {
@@ -89,12 +90,31 @@ impl Default for Targets {
 impl Targets {
     fn agent_present(&self, agent: &str) -> bool {
         match agent {
-            "claude" => self.claude_md.parent().map(|p| p.is_dir()).unwrap_or(false) || self.claude_json.is_file(),
-            "codex" => self.codex_config.parent().map(|p| p.is_dir()).unwrap_or(false),
-            "zcode" => self.zcode_config.parent().map(|p| p.is_dir()).unwrap_or(false),
+            "claude" => {
+                self.claude_md.parent().map(|p| p.is_dir()).unwrap_or(false)
+                    || self.claude_json.is_file()
+            }
+            "codex" => self
+                .codex_config
+                .parent()
+                .map(|p| p.is_dir())
+                .unwrap_or(false),
+            "zcode" => self
+                .zcode_config
+                .parent()
+                .map(|p| p.is_dir())
+                .unwrap_or(false),
             "kimi" => self.kimi_mcp.parent().map(|p| p.is_dir()).unwrap_or(false),
-            "gemini" => self.gemini_settings.parent().map(|p| p.is_dir()).unwrap_or(false),
-            "cursor" => self.cursor_mcp.parent().map(|p| p.is_dir()).unwrap_or(false),
+            "gemini" => self
+                .gemini_settings
+                .parent()
+                .map(|p| p.is_dir())
+                .unwrap_or(false),
+            "cursor" => self
+                .cursor_mcp
+                .parent()
+                .map(|p| p.is_dir())
+                .unwrap_or(false),
             "hermes" => self.hermes_config.is_file(),
             _ => false,
         }
@@ -104,9 +124,17 @@ impl Targets {
     /// 真机格式读取，不能把“都是 JSON”误当成相同 schema。
     fn registered_mcp_command(&self, agent: &str) -> Option<String> {
         match agent {
-            "hermes" => hermes_block_value(&std::fs::read_to_string(&self.hermes_config).unwrap_or_default(), "command"),
-            "codex" => codex_registered_command(&std::fs::read_to_string(&self.codex_config).unwrap_or_default()),
-            _ => json_registered_command(self.mcp_path(agent), &format!("{}/command", json_mcp_pointer(agent)?)),
+            "hermes" => hermes_block_value(
+                &std::fs::read_to_string(&self.hermes_config).unwrap_or_default(),
+                "command",
+            ),
+            "codex" => codex_registered_command(
+                &std::fs::read_to_string(&self.codex_config).unwrap_or_default(),
+            ),
+            _ => json_registered_command(
+                self.mcp_path(agent),
+                &format!("{}/command", json_mcp_pointer(agent)?),
+            ),
         }
     }
 
@@ -126,15 +154,18 @@ impl Targets {
     fn mcp_entry_present(&self, agent: &str) -> bool {
         match agent {
             "codex" => std::fs::read_to_string(&self.codex_config)
-                .map(|s| s.lines().any(|line| {
-                    let h = line.trim().split('#').next().unwrap_or("").trim();
-                    h == "[mcp_servers.yourmem]" || h.starts_with("[mcp_servers.yourmem.")
-                }))
+                .map(|s| {
+                    s.lines().any(|line| {
+                        let h = line.trim().split('#').next().unwrap_or("").trim();
+                        h == "[mcp_servers.yourmem]" || h.starts_with("[mcp_servers.yourmem.")
+                    })
+                })
                 .unwrap_or(false),
             "hermes" => std::fs::read_to_string(&self.hermes_config)
                 .map(|s| hermes_block_range(&s.lines().collect::<Vec<_>>()).is_some())
                 .unwrap_or(false),
-            _ => json_mcp_pointer(agent).is_some_and(|p| json_pointer_present(self.mcp_path(agent), p)),
+            _ => json_mcp_pointer(agent)
+                .is_some_and(|p| json_pointer_present(self.mcp_path(agent), p)),
         }
     }
 }
@@ -150,9 +181,11 @@ fn json_mcp_pointer(agent: &str) -> Option<&'static str> {
 
 fn json_pointer_present(path: &Path, pointer: &str) -> bool {
     std::fs::read_to_string(path)
-        .map(|s| serde_json::from_str::<Value>(&s)
-            .map(|v| v.pointer(pointer).is_some())
-            .unwrap_or_else(|_| s.contains("\"yourmem\"")))
+        .map(|s| {
+            serde_json::from_str::<Value>(&s)
+                .map(|v| v.pointer(pointer).is_some())
+                .unwrap_or_else(|_| s.contains("\"yourmem\""))
+        })
         .unwrap_or(false)
 }
 
@@ -169,7 +202,9 @@ fn json_registered_command(path: &Path, pointer: &str) -> Option<String> {
 /// config.yaml 有注释与手排结构，不能整体重写）。
 fn hermes_block_range<S: AsRef<str>>(lines: &[S]) -> Option<(usize, usize)> {
     let indent = |l: &str| l.len() - l.trim_start().len();
-    let ms = lines.iter().position(|l| l.as_ref().starts_with("mcp_servers:"))?;
+    let ms = lines
+        .iter()
+        .position(|l| l.as_ref().starts_with("mcp_servers:"))?;
     let section_end = (ms + 1..lines.len())
         .find(|&i| {
             let l = lines[i].as_ref();
@@ -191,7 +226,13 @@ fn hermes_block_value(content: &str, key: &str) -> Option<String> {
     lines[s + 1..e].iter().find_map(|l| {
         let (k, v) = l.trim().split_once(':')?;
         (k.trim() == key).then(|| {
-            v.split('#').next().unwrap_or("").trim().trim_matches('"').trim_matches('\'').to_string()
+            v.split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string()
         })
     })
 }
@@ -251,7 +292,11 @@ fn registered_version(cmd: &str) -> Option<String> {
     let mut out = String::new();
     use std::io::Read as _;
     child.stdout.take()?.read_to_string(&mut out).ok()?;
-    out.lines().next()?.split_whitespace().nth(1).map(str::to_string)
+    out.lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
 }
 
 /// MCP 注册状态：todo（未注册）/ done（已注册且是本版本）/ stale（注册的命令是旧版本
@@ -287,7 +332,9 @@ pub fn resolve_cli_exe() -> Result<PathBuf> {
 }
 
 /// 门控要素 1：预览。返回每个 agent 的每个动作及其当前状态（done/todo/skip）。
-pub const SETUP_AGENTS: [&str; 7] = ["claude", "codex", "zcode", "kimi", "gemini", "cursor", "hermes"];
+pub const SETUP_AGENTS: [&str; 7] = [
+    "claude", "codex", "zcode", "kimi", "gemini", "cursor", "hermes",
+];
 
 pub fn detected_setup_agents(targets: &Targets) -> Vec<Value> {
     SETUP_AGENTS
@@ -300,7 +347,10 @@ pub fn detected_setup_agents(targets: &Targets) -> Vec<Value> {
 pub fn plan_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
     anyhow::ensure!(!selected.is_empty(), "请至少选择一个要接入的 agent");
     for agent in selected {
-        anyhow::ensure!(SETUP_AGENTS.contains(&agent.as_str()), "不支持接入 agent: {agent}");
+        anyhow::ensure!(
+            SETUP_AGENTS.contains(&agent.as_str()),
+            "不支持接入 agent: {agent}"
+        );
     }
     let exe = resolve_cli_exe()?.to_string_lossy().to_string();
     let mut agents = Vec::new();
@@ -333,11 +383,15 @@ pub fn plan_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
         let (md_path, md_status) = match agent {
             "claude" => (
                 targets.claude_md.clone(),
-                instruction_status(&std::fs::read_to_string(&targets.claude_md).unwrap_or_default()),
+                instruction_status(
+                    &std::fs::read_to_string(&targets.claude_md).unwrap_or_default(),
+                ),
             ),
             _ => (
                 targets.codex_agents.clone(),
-                instruction_status(&std::fs::read_to_string(&targets.codex_agents).unwrap_or_default()),
+                instruction_status(
+                    &std::fs::read_to_string(&targets.codex_agents).unwrap_or_default(),
+                ),
             ),
         };
         agents.push(json!({
@@ -384,7 +438,11 @@ pub fn execute_selected(targets: &Targets, selected: &[String]) -> Result<Value>
             let kind = action["kind"].as_str().unwrap_or_default();
             match kind {
                 "register_mcp" if name == "zcode" => register_zcode_mcp(&path, &exe)?,
-                "register_mcp" if matches!(name.as_str(), "claude" | "kimi" | "gemini" | "cursor") => register_mcp_servers_json(&path, &exe)?,
+                "register_mcp"
+                    if matches!(name.as_str(), "claude" | "kimi" | "gemini" | "cursor") =>
+                {
+                    register_mcp_servers_json(&path, &exe)?
+                }
                 "register_mcp" if name == "hermes" => register_hermes_mcp(&path, &exe)?,
                 "register_mcp" => register_codex_mcp(&path, &exe)?,
                 _ => write_instructions(&path)?,
@@ -393,7 +451,9 @@ pub fn execute_selected(targets: &Targets, selected: &[String]) -> Result<Value>
         }
         results.push(json!({ "agent": name, "status": "configured", "actions": done }));
     }
-    Ok(json!({ "agents": results, "verify": "新开一个 agent 会话，在 MCP 或工具列表确认 yourmem；Claude Code/Codex 还会按全局指令在历史问题中主动调用。" }))
+    Ok(
+        json!({ "agents": results, "verify": "新开一个 agent 会话，在 MCP 或工具列表确认 yourmem；Claude Code/Codex 还会按全局指令在历史问题中主动调用。" }),
+    )
 }
 
 pub fn execute(targets: &Targets) -> Result<Value> {
@@ -402,13 +462,19 @@ pub fn execute(targets: &Targets) -> Result<Value> {
 
 fn instruction_block_present(path: &Path) -> bool {
     std::fs::read_to_string(path)
-        .map(|s| s.lines().any(|line| line.trim_start().starts_with('#') && line.contains(INSTRUCTION_MARKER)))
+        .map(|s| {
+            s.lines()
+                .any(|line| line.trim_start().starts_with('#') && line.contains(INSTRUCTION_MARKER))
+        })
         .unwrap_or(false)
 }
 
 pub fn remove_plan_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
     for agent in selected {
-        anyhow::ensure!(SETUP_AGENTS.contains(&agent.as_str()), "不支持解除接入 agent: {agent}");
+        anyhow::ensure!(
+            SETUP_AGENTS.contains(&agent.as_str()),
+            "不支持解除接入 agent: {agent}"
+        );
     }
     let mut agents = Vec::new();
     for agent in SETUP_AGENTS {
@@ -427,7 +493,9 @@ pub fn remove_plan_selected(targets: &Targets, selected: &[String]) -> Result<Va
         }
         agents.push(json!({"agent":agent,"status":if actions.is_empty(){"clean"}else{"detected"},"actions":actions}));
     }
-    Ok(json!({"agents":agents,"consequences":"只移除 yourmem 的 MCP 配置与指令块；写入前备份配置文件。"}))
+    Ok(
+        json!({"agents":agents,"consequences":"只移除 yourmem 的 MCP 配置与指令块；写入前备份配置文件。"}),
+    )
 }
 
 pub fn remove_execute_selected(targets: &Targets, selected: &[String]) -> Result<Value> {
@@ -480,15 +548,16 @@ fn remove_codex_mcp(path: &Path) -> Result<()> {
         let t = line.trim();
         if t.starts_with('[') {
             let header = t.split('#').next().unwrap_or("").trim();
-            skip = header == "[mcp_servers.yourmem]"
-                || header.starts_with("[mcp_servers.yourmem.");
+            skip = header == "[mcp_servers.yourmem]" || header.starts_with("[mcp_servers.yourmem.");
         }
         if !skip {
             out.push(line);
         }
     }
     let mut cleaned = out.join("\n");
-    if !cleaned.is_empty() { cleaned.push('\n'); }
+    if !cleaned.is_empty() {
+        cleaned.push('\n');
+    }
     if cleaned != content {
         backup_then_write(path, cleaned.as_bytes())?;
     }
@@ -508,11 +577,17 @@ fn remove_hermes_mcp(path: &Path) -> Result<()> {
         } else if in_servers && indent == 2 && !line.trim().is_empty() {
             skip = line.trim() == "yourmem:";
         }
-        if !skip { out.push(line); }
+        if !skip {
+            out.push(line);
+        }
     }
     let mut cleaned = out.join("\n");
-    if !cleaned.is_empty() { cleaned.push('\n'); }
-    if cleaned != content { backup_then_write(path, cleaned.as_bytes())?; }
+    if !cleaned.is_empty() {
+        cleaned.push('\n');
+    }
+    if cleaned != content {
+        backup_then_write(path, cleaned.as_bytes())?;
+    }
     Ok(())
 }
 
@@ -544,8 +619,12 @@ fn remove_instructions(path: &Path) -> Result<()> {
         out.push(line);
     }
     let mut cleaned = out.join("\n");
-    if !cleaned.is_empty() { cleaned.push('\n'); }
-    if cleaned != content { backup_then_write(path, cleaned.as_bytes())?; }
+    if !cleaned.is_empty() {
+        cleaned.push('\n');
+    }
+    if cleaned != content {
+        backup_then_write(path, cleaned.as_bytes())?;
+    }
     Ok(())
 }
 
@@ -574,7 +653,10 @@ mod tests {
     #[test]
     fn instruction_status_recognizes_current_and_stale_blocks() {
         assert_eq!(instruction_status(INSTRUCTION_BLOCK), "done");
-        assert_eq!(instruction_status(&format!("## {INSTRUCTION_MARKER}\n旧版内容\n")), "stale");
+        assert_eq!(
+            instruction_status(&format!("## {INSTRUCTION_MARKER}\n旧版内容\n")),
+            "stale"
+        );
         assert_eq!(instruction_status("# 用户自己的规则\n"), "todo");
         assert!(include_str!("../scripts/setup-agents.md").contains(INSTRUCTION_BLOCK.trim()));
     }
@@ -592,20 +674,33 @@ mod tests {
         .unwrap();
         write_instructions(&p).unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
-        assert!(out.contains("※ 参考 yourmem 跨 agent 记忆库 的说明"), "正文提及原样保留:\n{out}");
+        assert!(
+            out.contains("※ 参考 yourmem 跨 agent 记忆库 的说明"),
+            "正文提及原样保留:\n{out}"
+        );
         assert!(out.contains("## 我的节\n保留"), "用户内容不吞:\n{out}");
-        assert!(out.contains(INSTRUCTION_BLOCK.trim()), "块按无 marker 追加:\n{out}");
+        assert!(
+            out.contains(INSTRUCTION_BLOCK.trim()),
+            "块按无 marker 追加:\n{out}"
+        );
     }
 
     #[test]
     fn stale_block_upgrade_keeps_following_top_level_section() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("AGENTS.md");
-        std::fs::write(&p, format!("# 工作方式\nA\n\n## {INSTRUCTION_MARKER}\n旧版\n# 专项规则\n- foo\n")).unwrap();
+        std::fs::write(
+            &p,
+            format!("# 工作方式\nA\n\n## {INSTRUCTION_MARKER}\n旧版\n# 专项规则\n- foo\n"),
+        )
+        .unwrap();
         write_instructions(&p).unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
         assert!(!out.contains("旧版"), "旧块被替换:\n{out}");
-        assert!(out.contains("# 专项规则\n- foo"), "其后的一级段落保留:\n{out}");
+        assert!(
+            out.contains("# 专项规则\n- foo"),
+            "其后的一级段落保留:\n{out}"
+        );
         assert!(out.contains("# 工作方式\nA"), "{out}");
     }
 
@@ -647,12 +742,25 @@ mod tests {
     fn hermes_yourmem_key_outside_section_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("config.yaml");
-        std::fs::write(&p, "mcp_servers:\n  a:\n    command: x\nother:\n  yourmem:\n    foo: 1\n").unwrap();
-        assert_eq!(hermes_block_value(&std::fs::read_to_string(&p).unwrap(), "foo"), None);
+        std::fs::write(
+            &p,
+            "mcp_servers:\n  a:\n    command: x\nother:\n  yourmem:\n    foo: 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            hermes_block_value(&std::fs::read_to_string(&p).unwrap(), "foo"),
+            None
+        );
         register_hermes_mcp(&p, "/bin/yourmem").unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
-        assert!(out.contains("other:\n  yourmem:\n    foo: 1"), "段外键不动:\n{out}");
-        assert_eq!(hermes_block_value(&out, "command").as_deref(), Some("/bin/yourmem"));
+        assert!(
+            out.contains("other:\n  yourmem:\n    foo: 1"),
+            "段外键不动:\n{out}"
+        );
+        assert_eq!(
+            hermes_block_value(&out, "command").as_deref(),
+            Some("/bin/yourmem")
+        );
     }
 
     #[test]
@@ -663,9 +771,18 @@ mod tests {
         std::fs::write(&p, "profile_name: default\nplugins:\n  enabled: []\n").unwrap();
         register_hermes_mcp(&p, "/opt/homebrew/bin/yourmem").unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
-        assert!(out.contains("mcp_servers:\n  yourmem:\n    command: /opt/homebrew/bin/yourmem"), "追加段缺失:\n{out}");
-        assert!(out.starts_with("profile_name: default"), "用户原有内容不动:\n{out}");
-        assert_eq!(hermes_block_value(&out, "command").as_deref(), Some("/opt/homebrew/bin/yourmem"));
+        assert!(
+            out.contains("mcp_servers:\n  yourmem:\n    command: /opt/homebrew/bin/yourmem"),
+            "追加段缺失:\n{out}"
+        );
+        assert!(
+            out.starts_with("profile_name: default"),
+            "用户原有内容不动:\n{out}"
+        );
+        assert_eq!(
+            hermes_block_value(&out, "command").as_deref(),
+            Some("/opt/homebrew/bin/yourmem")
+        );
 
         // 场景二：已有段与 stale 的 yourmem 块 → 原位替换，邻居完好
         std::fs::write(
@@ -676,9 +793,15 @@ mod tests {
         register_hermes_mcp(&p, "/opt/homebrew/bin/yourmem").unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
         assert!(!out.contains("/old/yourmem-0.1.0"), "旧块应被替换:\n{out}");
-        assert!(out.contains("chrome-devtools:") && out.contains("scansci-pdf:"), "邻居保留:\n{out}");
+        assert!(
+            out.contains("chrome-devtools:") && out.contains("scansci-pdf:"),
+            "邻居保留:\n{out}"
+        );
         assert!(out.contains("  scansci-pdf:"), "后邻块不得被吞:\n{out}");
-        assert_eq!(hermes_block_value(&out, "command").as_deref(), Some("/opt/homebrew/bin/yourmem"));
+        assert_eq!(
+            hermes_block_value(&out, "command").as_deref(),
+            Some("/opt/homebrew/bin/yourmem")
+        );
 
         // 场景三：段存在但无 yourmem → 插入段键之后，不碰其他键
         std::fs::write(
@@ -688,7 +811,12 @@ mod tests {
         .unwrap();
         register_hermes_mcp(&p, "/opt/homebrew/bin/yourmem").unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
-        assert!(out.contains("yourmem:") && out.contains("other_top: 1") && out.contains("chrome-devtools:"), "插入后结构完整:\n{out}");
+        assert!(
+            out.contains("yourmem:")
+                && out.contains("other_top: 1")
+                && out.contains("chrome-devtools:"),
+            "插入后结构完整:\n{out}"
+        );
     }
 
     #[test]
@@ -702,8 +830,14 @@ mod tests {
         .unwrap();
         register_hermes_mcp(&p, "/opt/homebrew/bin/yourmem").unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
-        assert!(out.contains("enabled: false"), "用户手关的开关必须保留:\n{out}");
-        assert!(out.contains("command: /opt/homebrew/bin/yourmem"), "但命令版本要更新:\n{out}");
+        assert!(
+            out.contains("enabled: false"),
+            "用户手关的开关必须保留:\n{out}"
+        );
+        assert!(
+            out.contains("command: /opt/homebrew/bin/yourmem"),
+            "但命令版本要更新:\n{out}"
+        );
     }
 
     #[test]
@@ -712,19 +846,38 @@ mod tests {
         std::fs::write(dir.path().join("config.yaml"), "mcp_servers: {}\n").unwrap();
         let targets = hermes_targets(dir.path());
         let plan = plan(&targets).unwrap();
-        let hermes = plan["agents"].as_array().unwrap().iter().find(|a| a["agent"] == "hermes").unwrap();
+        let hermes = plan["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["agent"] == "hermes")
+            .unwrap();
         assert_eq!(hermes["status"], "detected");
         assert_eq!(hermes["actions"][0]["status"], "todo");
         // claude/codex 未安装 → skip
-        assert!(plan["agents"].as_array().unwrap().iter().any(|a| a["status"] == "skip"));
+        assert!(plan["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["status"] == "skip"));
 
         let res = execute(&targets).unwrap();
-        let h = res["agents"].as_array().unwrap().iter().find(|a| a["agent"] == "hermes").unwrap();
+        let h = res["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["agent"] == "hermes")
+            .unwrap();
         assert_eq!(h["actions"][0]["status"], "done");
         let after1 = std::fs::read_to_string(&targets.hermes_config).unwrap();
-        assert!(after1.starts_with("mcp_servers:
+        assert!(
+            after1.starts_with(
+                "mcp_servers:
   yourmem:
-"), "行内空映射须改为块写法：{after1}");
+"
+            ),
+            "行内空映射须改为块写法：{after1}"
+        );
         assert!(!after1.contains("{}"));
         // 幂等：测试环境的 exe 探不出版本会判 stale 重注册，但产物内容必须逐字节稳定
         execute(&targets).unwrap();
@@ -746,7 +899,11 @@ mod tests {
             &zcode,
             r#"{"skills":{"enabled":true},"mcp":{"servers":{"other":{"type":"http","url":"https://example.invalid"},"yourmem":{"enabled":false,"command":"old"}}}}"#,
         ).unwrap();
-        std::fs::write(&kimi, r#"{"mcpServers":{"kimi-cu":{"command":"node","args":["server.js"]}}}"#).unwrap();
+        std::fs::write(
+            &kimi,
+            r#"{"mcpServers":{"kimi-cu":{"command":"node","args":["server.js"]}}}"#,
+        )
+        .unwrap();
         std::fs::write(&gemini, r#"{"hooks":{"BeforeTool":[]}}"#).unwrap();
         std::fs::write(&cursor, r#"{"mcpServers":{"other":{"command":"node"}}}"#).unwrap();
 
@@ -811,8 +968,12 @@ fn read_json_config(path: &Path) -> Result<Value> {
     // 文件不存在 → 空对象起步；存在但读失败/不是合法 JSON → 拒绝：这份文件装着
     // 用户全部项目历史/配置，静默按空对象重写等于清空它（.bak 兜底救不了不知道的人）。
     let value = match std::fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s)
-            .with_context(|| format!("{} 不是合法 JSON，请先修复再 setup（不会自动重置）", path.display()))?,
+        Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s).with_context(|| {
+            format!(
+                "{} 不是合法 JSON，请先修复再 setup（不会自动重置）",
+                path.display()
+            )
+        })?,
         Ok(_) => json!({}),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(e) => {
@@ -825,7 +986,9 @@ fn read_json_config(path: &Path) -> Result<Value> {
 /// ZCode 0.16.5：~/.zcode/cli/config.json 的 mcp.servers，stdio 需显式 type。
 fn register_zcode_mcp(path: &Path, exe: &str) -> Result<()> {
     let mut v = read_json_config(path)?;
-    let enabled = v.pointer("/mcp/servers/yourmem/enabled").and_then(Value::as_bool);
+    let enabled = v
+        .pointer("/mcp/servers/yourmem/enabled")
+        .and_then(Value::as_bool);
     let mut entry = json!({ "type": "stdio", "command": exe, "args": ["mcp"] });
     if enabled == Some(false) {
         entry["enabled"] = json!(false);
@@ -849,31 +1012,33 @@ fn register_codex_mcp(path: &Path, exe: &str) -> Result<()> {
     let content = std::fs::read_to_string(path).unwrap_or_default();
     let block = format!("[mcp_servers.yourmem]\ncommand = {exe:?}\nargs = [\"mcp\"]");
     let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-    let new_content = if let Some(pos) =
-        lines.iter().position(|l| is_yourmem_table_header(l.trim()))
-    {
-        let mut end = lines.len();
-        for (i, l) in lines.iter().enumerate().skip(pos + 1) {
-            if l.trim_start().starts_with('[') {
-                end = i;
-                break;
+    let new_content =
+        if let Some(pos) = lines.iter().position(|l| is_yourmem_table_header(l.trim())) {
+            let mut end = lines.len();
+            for (i, l) in lines.iter().enumerate().skip(pos + 1) {
+                if l.trim_start().starts_with('[') {
+                    end = i;
+                    break;
+                }
             }
-        }
-        lines.splice(pos..end, block.lines().map(str::to_string).collect::<Vec<_>>());
-        let mut s = lines.join("\n");
-        s.push('\n');
-        s
-    } else {
-        // 追加路径自己控制接缝的空行；不做全局 \n\n\n 压缩——那会改动用户
-        // 无关区域的原有排版（自检 B4）
-        let mut s = content.trim_end_matches('\n').to_string();
-        if !s.is_empty() {
-            s.push_str("\n\n");
-        }
-        s.push_str(&block);
-        s.push('\n');
-        s
-    };
+            lines.splice(
+                pos..end,
+                block.lines().map(str::to_string).collect::<Vec<_>>(),
+            );
+            let mut s = lines.join("\n");
+            s.push('\n');
+            s
+        } else {
+            // 追加路径自己控制接缝的空行；不做全局 \n\n\n 压缩——那会改动用户
+            // 无关区域的原有排版（自检 B4）
+            let mut s = content.trim_end_matches('\n').to_string();
+            if !s.is_empty() {
+                s.push_str("\n\n");
+            }
+            s.push_str(&block);
+            s.push('\n');
+            s
+        };
     backup_then_write(path, new_content.as_bytes())?;
     Ok(())
 }
@@ -886,21 +1051,27 @@ fn register_hermes_mcp(path: &Path, exe: &str) -> Result<()> {
     let content = std::fs::read_to_string(path).unwrap_or_default();
     // 旧块里是否有关闭的 enabled：保留用户意图
     let enabled = hermes_block_value(&content, "enabled").map_or(true, |v| v == "true");
-    let block = format!(
-        "  yourmem:\n    command: {exe}\n    args:\n      - mcp\n    enabled: {enabled}"
-    );
+    let block =
+        format!("  yourmem:\n    command: {exe}\n    args:\n      - mcp\n    enabled: {enabled}");
     let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-    let ms = lines.iter().position(|l| {
-        !l.trim_start().starts_with('#') && l.starts_with("mcp_servers:")
-    });
+    let ms = lines
+        .iter()
+        .position(|l| !l.trim_start().starts_with('#') && l.starts_with("mcp_servers:"));
     if let Some(i) = ms {
         // 行内空值（`mcp_servers: {}` / `null` / `~`）改成块写法，否则下面插入的
         // 缩进子键会让整个文件解析失败；行内非空映射无法安全改写，交给用户处理
-        let inline = lines[i]["mcp_servers:".len()..].split(" #").next().unwrap_or("").trim();
+        let inline = lines[i]["mcp_servers:".len()..]
+            .split(" #")
+            .next()
+            .unwrap_or("")
+            .trim();
         match inline {
             "" => {}
             "{}" | "null" | "~" => lines[i] = "mcp_servers:".to_string(),
-            _ => bail!("{} 的 mcp_servers 使用行内写法，请改为多行写法后重试", path.display()),
+            _ => bail!(
+                "{} 的 mcp_servers 使用行内写法，请改为多行写法后重试",
+                path.display()
+            ),
         }
     }
     let new_content = match ms {
@@ -931,7 +1102,10 @@ fn register_hermes_mcp(path: &Path, exe: &str) -> Result<()> {
                 }
                 Some((pos, end)) => {
                     // yourmem 已在：原位替换到下一个 ≤2 空格缩进的非空行（或段尾）
-                    lines.splice(pos..end, block.lines().map(str::to_string).collect::<Vec<_>>());
+                    lines.splice(
+                        pos..end,
+                        block.lines().map(str::to_string).collect::<Vec<_>>(),
+                    );
                     lines.join("\n") + "\n"
                 }
             }
@@ -954,7 +1128,9 @@ fn write_instructions(path: &Path) -> Result<()> {
     let out = match block_line {
         Some(start) if !content.contains(INSTRUCTION_BLOCK.trim()) => {
             // 块止于下一个同级或更高级标题（`# ` 也算，否则会吞掉用户的一级段落）
-            let first = content[start..].find('\n').map_or(content.len(), |i| start + i);
+            let first = content[start..]
+                .find('\n')
+                .map_or(content.len(), |i| start + i);
             let end = content[first..]
                 .match_indices('\n')
                 .map(|(i, _)| first + i)

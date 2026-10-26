@@ -27,7 +27,11 @@ struct SessionRow {
 
 fn lookup_session(conn: &Connection, agent: &str, session: &str) -> Result<SessionRow> {
     // Accept both the full key ("claude:<uuid>") and the bare native id.
-    let key = if session.contains(':') { session.to_string() } else { format!("{agent}:{session}") };
+    let key = if session.contains(':') {
+        session.to_string()
+    } else {
+        format!("{agent}:{session}")
+    };
     let row = conn
         .query_row(
             "SELECT id, agent, native_id, file_path FROM sessions WHERE id = ?1",
@@ -73,7 +77,13 @@ pub fn plan(conn: &Connection, agent: &str, session: &str) -> Result<Value> {
 }
 
 /// 门控要素 2/3：确认后的执行。`confirmed` 由调用方（CLI 交互或 UI 弹窗）保证。
-pub fn execute(conn: &Connection, home: &Path, agent: &str, session: &str, force: bool) -> Result<Value> {
+pub fn execute(
+    conn: &Connection,
+    home: &Path,
+    agent: &str,
+    session: &str,
+    force: bool,
+) -> Result<Value> {
     let p = plan(conn, agent, session)?;
     let sid = p["session_id"].as_str().unwrap().to_string();
     let target = PathBuf::from(p["will_write"][0].as_str().unwrap());
@@ -99,9 +109,11 @@ pub fn execute(conn: &Connection, home: &Path, agent: &str, session: &str, force
     // 写 tmp 再 rename：写回也不留半截文件（同 vault 写盘纪律）；
     // 失败时清理 tmp——半截文件躺在 agent 数据目录里会吓到人（自检 B5）
     let tmp = crate::with_suffix(&target, &format!("yourmem-tmp.{}", std::process::id()));
-    let lines = match vault::export_session(conn, home, &sid, &tmp)
-        .and_then(|l| std::fs::rename(&tmp, &target).map(|_| l).map_err(Into::into))
-    {
+    let lines = match vault::export_session(conn, home, &sid, &tmp).and_then(|l| {
+        std::fs::rename(&tmp, &target)
+            .map(|_| l)
+            .map_err(Into::into)
+    }) {
         Ok(l) => l,
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);

@@ -26,8 +26,6 @@ use serde_json::Value;
 
 use crate::models::{MessageKind, NewArtifact, NewMessage, ParseOutput, SessionMetaPatch};
 
-
-
 pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
     let mut out = ParseOutput::default();
     let meta = &mut out.meta;
@@ -40,7 +38,10 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
             Ok(v) => v,
             Err(_) => continue, // partial / corrupt line: vault still has it
         };
-        let ts = v.get("time").and_then(Value::as_i64).and_then(super::ms_to_iso);
+        let ts = v
+            .get("time")
+            .and_then(Value::as_i64)
+            .and_then(super::ms_to_iso);
         if let Some(t) = ts.as_deref() {
             track_min(meta, t);
             track_max(meta, t);
@@ -53,7 +54,13 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                     for item in items {
                         if item.get("type").and_then(Value::as_str) == Some("text") {
                             if let Some(t) = item.get("text").and_then(Value::as_str) {
-                                push(&mut out.messages, *line_no, MessageKind::User, t, ts.clone());
+                                push(
+                                    &mut out.messages,
+                                    *line_no,
+                                    MessageKind::User,
+                                    t,
+                                    ts.clone(),
+                                );
                             }
                         }
                     }
@@ -67,14 +74,26 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                         match part.get("type").and_then(Value::as_str) {
                             Some("text") => {
                                 if let Some(t) = part.get("text").and_then(Value::as_str) {
-                                    push(&mut out.messages, *line_no, MessageKind::Assistant, t, ts.clone());
+                                    push(
+                                        &mut out.messages,
+                                        *line_no,
+                                        MessageKind::Assistant,
+                                        t,
+                                        ts.clone(),
+                                    );
                                 }
                             }
                             Some("think") => {
                                 // 真实 wire 的推理内容在 part.think（codex 一审：
                                 // 读 part.text 导致 1497 个 think 事件全丢）
                                 if let Some(t) = part.get("think").and_then(Value::as_str) {
-                                    push(&mut out.messages, *line_no, MessageKind::Thinking, t, ts.clone());
+                                    push(
+                                        &mut out.messages,
+                                        *line_no,
+                                        MessageKind::Thinking,
+                                        t,
+                                        ts.clone(),
+                                    );
                                 }
                             }
                             _ => {} // 未知 part 类型：跳过
@@ -84,12 +103,42 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                         let name = e.get("name").and_then(Value::as_str).unwrap_or("?");
                         let args = e.get("args").cloned().unwrap_or(Value::Null);
                         let display = serde_json::to_string(&args).unwrap_or_default();
-                        push(&mut out.messages, *line_no, MessageKind::ToolCall,
-                            &format!("[{name}] {display}"), ts.clone());
+                        push(
+                            &mut out.messages,
+                            *line_no,
+                            MessageKind::ToolCall,
+                            &format!("[{name}] {display}"),
+                            ts.clone(),
+                        );
+                        if let Some(last) = out.messages.last_mut() {
+                            last.native_tool_call_id = e
+                                .get("id")
+                                .or_else(|| e.get("toolCallId"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
+                        }
                         if super::FILE_TOOLS.contains(&name) {
                             // 真实 Kimi 的写文件参数是 args.path（相对 cwd 的路径）
                             if let Some(fp) = args.get("path").and_then(Value::as_str) {
-                                out.artifacts.push(NewArtifact { path: fp.to_string(), tool: name.to_string() });
+                                out.artifacts.push(NewArtifact {
+                                    path: fp.to_string(),
+                                    from_path: None,
+                                    tool: name.to_string(),
+                                    operation: if name == "Write" { "create" } else { "edit" }
+                                        .to_string(),
+                                    native_tool_call_id: e
+                                        .get("id")
+                                        .or_else(|| e.get("toolCallId"))
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string),
+                                    timestamp: ts.clone(),
+                                    line_no: *line_no,
+                                    ord: out
+                                        .artifacts
+                                        .iter()
+                                        .filter(|a| a.line_no == *line_no)
+                                        .count() as u32,
+                                });
                             }
                         }
                     }
@@ -102,8 +151,20 @@ pub fn parse_lines(lines: &[(u64, String)]) -> ParseOutput {
                                 other => serde_json::to_string(other).unwrap_or_default(),
                             })
                             .unwrap_or_default();
-                        push(&mut out.messages, *line_no, MessageKind::ToolResult,
-                            &format!("[{id}] {value}"), ts.clone());
+                        push(
+                            &mut out.messages,
+                            *line_no,
+                            MessageKind::ToolResult,
+                            &value,
+                            ts.clone(),
+                        );
+                        if let Some(last) = out.messages.last_mut() {
+                            last.native_tool_call_id = Some(id.to_string());
+                            last.tool_success = e
+                                .pointer("/result/is_error")
+                                .and_then(Value::as_bool)
+                                .map(|v| !v);
+                        }
                     }
                     _ => {} // step.begin/end 等元数据：跳过
                 }
@@ -133,7 +194,13 @@ pub fn enrich_meta_from_state(meta: &SessionMetaPatch, wire_path: &Path) -> Sess
     meta
 }
 
-fn push(out: &mut Vec<NewMessage>, line_no: u64, kind: MessageKind, text: &str, ts: Option<String>) {
+fn push(
+    out: &mut Vec<NewMessage>,
+    line_no: u64,
+    kind: MessageKind,
+    text: &str,
+    ts: Option<String>,
+) {
     super::push_message(out, line_no, kind, text.to_string(), ts, None);
 }
 
