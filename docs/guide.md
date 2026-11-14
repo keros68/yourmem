@@ -22,6 +22,8 @@
 
 一键接入支持 Claude Code、Codex、ZCode、Kimi Code、Gemini CLI、Cursor 和 Hermes。其他兼容 stdio MCP 的客户端可手动配置命令 `yourmem mcp`。
 
+「设置 → 接入」中的「提供给 agent 的工具」列出每个工具近 30 天的调用次数、返回量和说明大小。工具说明随每次请求发送给模型，停用长期不调用的工具可减少每个对话的固定开销；停用对新开的对话生效，可随时恢复。
+
 ## 日常使用
 
 - yourmem 启动后每 60 秒增量采集一次；点击侧栏「采集新对话」可立即采集。
@@ -86,6 +88,8 @@ yourmem snapshot list                  # 查看快照及仓库占用
 yourmem snapshot export <ID> -o move.tar.gz
 yourmem snapshot plan --keep-recent 3 --keep-monthly 3
 yourmem doctor                         # 本地自检（桌面端每天在后台运行）
+yourmem tools list                     # 查看各 MCP 工具的用量
+yourmem tools disable list_artifacts   # 停用一个工具（tools enable 恢复）
 yourmem teardown                       # 解除全部 Agent 接入
 yourmem teardown --delete-data         # 再删除核心数据
 yourmem teardown --delete-data --delete-backups

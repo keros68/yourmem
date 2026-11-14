@@ -868,14 +868,21 @@ pub fn import_file(
     crate::work::record_session_steps(&tx, &session_id)?;
     crate::work::mark_session_evidence_processed(&tx, &session_id)?;
     tx.commit()?;
-    for hash in old_vault_hashes {
+    // 本轮重新写入清单的对象必然仍被引用，只复查不再出现的（每次复查都是整表扫描）
+    let current: std::collections::HashSet<&str> = hashes.iter().map(String::as_str).collect();
+    let dropped: std::collections::HashSet<&str> = old_vault_hashes
+        .iter()
+        .map(String::as_str)
+        .filter(|h| !current.contains(h))
+        .collect();
+    for hash in dropped {
         let referenced: i64 = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM vault_lines WHERE hash=?1) OR EXISTS(SELECT 1 FROM memory_revisions WHERE hash=?1)",
             rusqlite::params![hash],
             |r| r.get(0),
         )?;
         if referenced == 0 {
-            let _ = store.remove(&hash);
+            let _ = store.remove(hash);
         }
     }
     if resync {

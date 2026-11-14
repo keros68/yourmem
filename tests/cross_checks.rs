@@ -33,7 +33,7 @@ fn collects_groups_updates_and_removes_only_readable_trace_metadata() {
     let first = cross_checks::collect(&conn, home.path()).unwrap();
     assert_eq!((first.files_seen, first.files_updated, first.files_removed), (3, 3, 0));
     assert_eq!(std::fs::read(dispatch.join("blind-review.md")).unwrap(), original);
-    assert_eq!(db::SCHEMA_VERSION, 18);
+    assert_eq!(db::SCHEMA_VERSION, 19);
 
     let second = cross_checks::collect(&conn, home.path()).unwrap();
     assert_eq!((second.files_seen, second.files_updated, second.files_removed), (3, 0, 0));

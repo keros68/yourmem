@@ -23,3 +23,4 @@ AGENTS.md
 
 # Local-only ai-cross review logs (raw material, model metadata)
 /.dispatch/
+/.aicross/

@@ -2,6 +2,7 @@ import { loadProjectRecall } from "./project-recall.js";
 import { graphDepths, treeSlots } from "./graph-layout.js";
 import { createSessionDrawer } from "./session-drawer.js";
 import { snapshotPanelHtml, bindSnapshotPanel } from "./snapshot-panel.js";
+import { mcpToolsHtml, bindMcpTools } from "./mcp-tools.js";
 import { activityPageHtml, aiSummaryHtml } from "./workbench.js";
 import { createProjectWorkspace } from "./project-workspace.js";
 import { createAssetGovernance } from "./asset-governance.js";
@@ -1360,6 +1361,7 @@ async function renderSettings() {
         </div>
         <div id="setup-report"></div>
       </div>
+      ${mcpToolsHtml()}
       <h2>调用状态</h2>
       <div class="memcard"><div class="meta">配置登记请点击下方检测。这里显示本机最近完成的调用；成功表示工具返回成功，不代表答案已被采用。MCP 记录不区分客户端。</div>
       <table><tr><th>入口 / 操作</th><th>最近结果</th><th>完成时间</th><th>上次成功</th></tr>${(info.recall_status || []).map(r => `<tr><td>${esc(r.source)} / ${esc(r.name)}</td><td>${r.ok === true ? `成功${r.result_count != null ? `（${r.result_count} 条）` : ""}` : r.ok === false ? "失败" : "暂无结果记录"}</td><td>${fmtTime(r.completed_at)}</td><td>${fmtTime(r.last_success)}</td></tr>`).join("")}</table></div>
@@ -1902,6 +1904,7 @@ async function renderSettings() {
     }
   };
   bindSnapshotPanel({ invoke, root: $("#page-settings"), bundleInput: $("#bundle-path"), esc });
+  bindMcpTools({ invoke, root: $("#page-settings"), esc });
   snapScrollboxTables($("#page-settings"));
 }
 

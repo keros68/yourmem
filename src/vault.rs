@@ -572,6 +572,7 @@ pub fn orphan_cleanup_plan(conn: &Connection, home: &Path) -> Result<Value> {
 
 pub fn orphan_cleanup(conn: &Connection, home: &Path, token: &str) -> Result<Value> {
     let _lock = crate::ingest::ImportLockTx::acquire(home, std::time::Duration::from_secs(120))?;
+    // 清单在导入锁内算出：到删除为止没有其他写入方，无引用的结论一直成立
     let rows = orphan_inventory(conn, home)?;
     anyhow::ensure!(
         hash_bytes(&serde_json::to_vec(&rows)?) == token,
@@ -585,12 +586,6 @@ pub fn orphan_cleanup(conn: &Connection, home: &Path, token: &str) -> Result<Val
         if !is_hash(&key) {
             std::fs::remove_file(&key)?;
         } else {
-            let referenced: i64 = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM vault_lines WHERE hash=?1) OR EXISTS(SELECT 1 FROM memory_revisions WHERE hash=?1)",
-                rusqlite::params![key], |r| r.get(0))?;
-            if referenced != 0 {
-                continue;
-            }
             store.remove(&key)?;
         }
         removed += 1;

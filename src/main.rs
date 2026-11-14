@@ -212,6 +212,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: IndexCmd,
     },
+    /// 提供给 agent 的 MCP 工具：查看各工具的用量，停用用不到的工具。
+    Tools {
+        #[command(subcommand)]
+        cmd: ToolsCmd,
+    },
     /// Database + vault overview.
     Stats,
     /// 本地自检（schema/FTS/vault 抽验/对象缺失/快照新鲜度），只读不改数据。
@@ -475,6 +480,16 @@ enum IndexCmd {
     DisableTools,
     /// 整理数据库空闲页（VACUUM）。索引切换 / 大量删除后使用。
     Compact,
+}
+
+#[derive(Subcommand)]
+enum ToolsCmd {
+    /// 各工具的定义大小、近 30 天调用次数与返回字节数、是否停用。
+    List,
+    /// 停用一个工具：不再提供给 agent，对新开的对话生效。
+    Disable { name: String },
+    /// 恢复一个已停用的工具。
+    Enable { name: String },
 }
 
 #[derive(Subcommand)]
@@ -761,6 +776,7 @@ fn main() -> Result<()> {
         Cmd::Setup { .. } => "setup",
         Cmd::Teardown { .. } => "teardown",
         Cmd::Agents { .. } => "agents",
+        Cmd::Tools { .. } => "tools",
         Cmd::Index { cmd } => match cmd {
             IndexCmd::Status => "index status",
             IndexCmd::EnableTools => "index enable-tools",
@@ -1698,6 +1714,15 @@ fn main() -> Result<()> {
             AgentsCmd::Enable { agent } => {
                 print_json(&ingest::set_agent_disabled(&home, &agent, false)?);
             }
+        },
+
+        Cmd::Tools { cmd } => match cmd {
+            ToolsCmd::List => {
+                let conn = db::open(&home)?;
+                print_json(&yourmem::mcp::tool_inventory(&home, &conn)?);
+            }
+            ToolsCmd::Disable { name } => print_json(&yourmem::mcp::set_tool_disabled(&home, &name, true)?),
+            ToolsCmd::Enable { name } => print_json(&yourmem::mcp::set_tool_disabled(&home, &name, false)?),
         },
 
         Cmd::Index { cmd } => match cmd {

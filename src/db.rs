@@ -260,7 +260,8 @@ CREATE TABLE IF NOT EXISTS usage_log (
   id     INTEGER PRIMARY KEY,
   ts     TEXT NOT NULL,
   source TEXT NOT NULL,  -- cli | mcp | app
-  name   TEXT NOT NULL   -- command or tool name
+  name   TEXT NOT NULL,  -- command or tool name
+  bytes  INTEGER         -- v19：MCP 工具返回内容的字节数（进入 agent 上下文的量）；其余来源为 NULL
 );
 CREATE INDEX IF NOT EXISTS idx_usage_log_ts ON usage_log(ts);
 "#;
@@ -319,7 +320,7 @@ pub fn open(home: &Path) -> Result<Connection> {
 /// Current schema version, stamped into `PRAGMA user_version` by migrate().
 /// Bump this (and add a migration step below) whenever the schema changes;
 /// bundle manifests record it (DESIGN-0.3 §5.1 `schema_version`).
-pub const SCHEMA_VERSION: i32 = 18;
+pub const SCHEMA_VERSION: i32 = 19;
 
 /// Idempotent column additions for databases created by older versions.
 /// `user_version` drives the fast path: a database already stamped with the
@@ -406,6 +407,12 @@ fn migrate(conn: &Connection) -> Result<()> {
             "messages",
             "tool_success",
             "ALTER TABLE messages ADD COLUMN tool_success INTEGER",
+        ),
+        // v19：MCP 工具返回内容的字节数，用于统计 yourmem 自身占用的上下文。
+        (
+            "usage_log",
+            "bytes",
+            "ALTER TABLE usage_log ADD COLUMN bytes INTEGER",
         ),
     ] {
         if !has_col(table, col)? {
@@ -572,6 +579,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         // 口径同 v14/v15（只动 archived_at 为 NULL 的；此前用户恢复过的会被
         // 重新归档，需再恢复一次）。
         archive_projects_where(conn, crate::is_run_site_path)?;
+    }
+    if version < 19 {
+        // 没有任何时间戳的会话，结束时间统一为 NULL（此前续导后会写成空字符串）
+        conn.execute_batch("UPDATE sessions SET ended_at = NULL WHERE ended_at = ''")?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -828,7 +839,7 @@ pub fn upsert_session(
            git_branch   = COALESCE(sessions.git_branch, excluded.git_branch),
            file_path    = excluded.file_path, -- 源文件会移动；purge 墓碑按 path 立碑，旧路径会让已清会话复活
            started_at   = COALESCE(sessions.started_at, excluded.started_at),
-           ended_at     = MAX(COALESCE(sessions.ended_at,''), COALESCE(excluded.ended_at,'')),
+           ended_at     = NULLIF(MAX(COALESCE(sessions.ended_at,''), COALESCE(excluded.ended_at,'')), ''),
            message_count= sessions.message_count + excluded.message_count,
            first_parent_uuid = COALESCE(sessions.first_parent_uuid, excluded.first_parent_uuid),
            compact_leaf_uuid = COALESCE(sessions.compact_leaf_uuid, excluded.compact_leaf_uuid),
@@ -1076,13 +1087,13 @@ pub fn search(conn: &Connection, opts: &SearchOpts) -> Result<Vec<Value>> {
                             UNION
                             SELECT rowid FROM messages_tools_fts WHERE messages_tools_fts MATCH ?1)
                AND s.deleted_at IS NULL
-               AND (?2 IS NULL OR p.name = ?2 OR p.path LIKE '%'||?2||'%')
+               AND (?2 IS NULL OR p.name = ?2 OR p.path LIKE '%'||?6||'%' ESCAPE '\\')
                AND (?3 IS NULL OR s.agent = ?3)
                AND (?4 IS NULL OR m.kind = ?4)
              ORDER BY m.timestamp DESC LIMIT ?5"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![match_q, project, agent, kind, limit], hit_row)?;
+        let rows = stmt.query_map(params![match_q, project, agent, kind, limit, project.map(like_escape)], hit_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     } else {
         // 多词回退保持 AND 语义（与 FTS 分支一致）：整串塞一个 LIKE 要求词项
@@ -1717,7 +1728,7 @@ pub fn project_context(conn: &Connection, project_id: i64) -> Result<Value> {
 
     let mut stmt = conn.prepare(
         "SELECT agent, COUNT(*), COALESCE(SUM(message_count),0), MAX(ended_at)
-         FROM sessions WHERE project_id = ?1 AND deleted_at IS NULL GROUP BY agent",
+         FROM sessions WHERE project_id = ?1 AND deleted_at IS NULL AND message_count > 0 GROUP BY agent",
     )?;
     let agents: Vec<Value> = stmt
         .query_map(params![project_id], |r| {
@@ -1732,7 +1743,8 @@ pub fn project_context(conn: &Connection, project_id: i64) -> Result<Value> {
 
     let mut stmt = conn.prepare(
         "SELECT id, agent, started_at, ended_at, message_count
-         FROM sessions WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY ended_at DESC LIMIT 5",
+         FROM sessions WHERE project_id = ?1 AND deleted_at IS NULL AND message_count > 0
+         ORDER BY ended_at DESC LIMIT 5",
     )?;
     let recent: Vec<Value> = stmt
         .query_map(params![project_id], |r| {
@@ -2142,9 +2154,14 @@ pub fn stats(conn: &Connection) -> Result<Value> {
 
 /// 使用侧指标（DESIGN-0.3 §11）：本地记录命令/工具名 + 时间戳，不外传不上报。
 pub fn log_usage(conn: &Connection, source: &str, name: &str) -> Result<()> {
+    log_usage_bytes(conn, source, name, None)
+}
+
+/// 同 `log_usage`，另记返回内容的字节数（MCP 工具调用：进入 agent 上下文的量）。
+pub fn log_usage_bytes(conn: &Connection, source: &str, name: &str, bytes: Option<u64>) -> Result<()> {
     conn.execute(
-        "INSERT INTO usage_log(ts, source, name) VALUES (?1, ?2, ?3)",
-        params![now_iso(), source, name],
+        "INSERT INTO usage_log(ts, source, name, bytes) VALUES (?1, ?2, ?3, ?4)",
+        params![now_iso(), source, name, bytes.map(|b| b as i64)],
     )?;
     Ok(())
 }
@@ -3397,5 +3414,94 @@ mod tests {
         assert!(preview.ends_with("TAIL"));
         assert!(preview.contains("完整内容保存在会话原文归档"));
         assert!(preview.len() < content.len());
+    }
+
+    #[test]
+    fn search_project_filter_matches_underscore_literally() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = open(home.path()).unwrap();
+        for (sid, path) in [("claude:u1", "/work/a_b"), ("claude:u2", "/work/axb")] {
+            let pid = upsert_project(&conn, path, "proj").unwrap();
+            seed_session(&conn, sid);
+            conn.execute("UPDATE sessions SET project_id = ?1 WHERE id = ?2", params![pid, sid]).unwrap();
+            seed_message(&conn, sid, "user", "UNDERSCOREPROBE");
+        }
+        for query in ["UNDERSCOREPROBE", "UN"] {
+            let hits = search(&conn, &SearchOpts {
+                query: query.into(), project: Some("a_b".into()), agent: None, kind: None, limit: 50,
+            }).unwrap();
+            assert_eq!(hits.len(), 1, "{query}: {hits:?}");
+            assert_eq!(hits[0]["session_id"], "claude:u1");
+        }
+    }
+
+    #[test]
+    fn upgrade_from_v18_adds_usage_bytes_and_clears_empty_ended_at() {
+        let home = tempfile::tempdir().unwrap();
+        {
+            let conn = open(home.path()).unwrap();
+            seed_session(&conn, "zcode:old");
+            conn.execute_batch(
+                "ALTER TABLE usage_log DROP COLUMN bytes;
+                 INSERT INTO usage_log(ts, source, name) VALUES ('2026-10-01T00:00:00.000Z','mcp','search_history');
+                 UPDATE sessions SET ended_at = '' WHERE id = 'zcode:old';
+                 PRAGMA user_version = 18;",
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let conn = open(home.path()).unwrap();
+            let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+            let (name, bytes): (String, Option<i64>) = conn
+                .query_row("SELECT name, bytes FROM usage_log ORDER BY id LIMIT 1", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!((name.as_str(), bytes), ("search_history", None));
+            let ended: Option<String> = conn
+                .query_row("SELECT ended_at FROM sessions WHERE id = 'zcode:old'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(ended, None);
+            log_usage_bytes(&conn, "mcp", "search_history", Some(7)).unwrap();
+        }
+        let conn = open(home.path()).unwrap();
+        let (rows, measured, total): (i64, i64, i64) = conn
+            .query_row("SELECT COUNT(*), COUNT(bytes), SUM(bytes) FROM usage_log", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!((rows, measured, total), (3, 2, 14));
+    }
+
+    #[test]
+    fn session_without_timestamps_keeps_null_ended_at() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = open(home.path()).unwrap();
+        let meta = crate::models::SessionMetaPatch::default();
+        for _ in 0..2 {
+            upsert_session(&conn, "zcode:n1", "zcode", "n1", None, "/tmp/n1.jsonl", &meta, 0).unwrap();
+        }
+        let ended: Option<String> =
+            conn.query_row("SELECT ended_at FROM sessions WHERE id = 'zcode:n1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ended, None);
+    }
+
+    #[test]
+    fn project_context_leaves_out_empty_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = open(home.path()).unwrap();
+        let pid = upsert_project(&conn, "/work/ctx", "ctx").unwrap();
+        for (sid, messages) in [("claude:c1", 3), ("claude:c2", 0)] {
+            seed_session(&conn, sid);
+            conn.execute(
+                "UPDATE sessions SET project_id = ?1, message_count = ?2 WHERE id = ?3",
+                params![pid, messages, sid],
+            ).unwrap();
+        }
+        let ctx = project_context(&conn, pid).unwrap();
+        assert_eq!(ctx["by_agent"][0]["sessions"], 1);
+        assert_eq!(ctx["recent_sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(list_projects(&conn).unwrap()[0]["sessions"], 1);
     }
 }

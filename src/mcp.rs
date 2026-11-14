@@ -89,7 +89,7 @@ pub fn handle(home: &Path, req: &Value) -> Option<Value> {
             }),
         )),
         "ping" => Some(result(id, json!({}))),
-        "tools/list" => Some(result(id, tools_list())),
+        "tools/list" => Some(result(id, visible_tools(home))),
         "tools/call" => Some(call_tool(home, id, &req["params"])),
         _ => Some(error(id, -32601, "method not found")),
     }
@@ -143,10 +143,18 @@ fn call_tool(home: &Path, id: Value, params: &Value) -> Value {
         .and_then(|v| v["results"].as_array().or_else(|| v["messages"].as_array()))
         .map(|v| v.len() as u64);
     crate::recall_status::record(home, "mcp", name, outcome.is_ok(), count);
-    match outcome {
-        Ok(v) => result(id, ok_text(v)),
-        Err(e) => result(id, err_text(&format!("{e:#}"))),
+    let content = match outcome {
+        Ok(v) => ok_text(v),
+        Err(e) => err_text(&format!("{e:#}")),
+    };
+    // 本地指标，失败静默。字节数是返回给 agent 的文本长度，即这次调用占用的上下文
+    let bytes = content["content"][0]["text"]
+        .as_str()
+        .map(|t| t.len() as u64);
+    if let Ok(conn) = db::open(home) {
+        let _ = db::log_usage_bytes(&conn, "mcp", name, bytes);
     }
+    result(id, content)
 }
 
 fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
@@ -180,7 +188,6 @@ fn run_tool(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
 
 fn run_tool_once(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value> {
     let conn = db::open(home)?;
-    let _ = db::log_usage(&conn, "mcp", name); // 本地指标，失败静默
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
@@ -602,6 +609,121 @@ fn run_tool_once(home: &Path, name: &str, args: &Value) -> anyhow::Result<Value>
     }
 }
 
+/// config.json 里用户停用的工具名（设置页 / `tools disable`）。
+pub const CFG_DISABLED_TOOLS: &str = "mcp_disabled_tools";
+
+/// 工具用量的统计窗口（天）。
+pub const TOOL_USAGE_DAYS: u32 = 30;
+
+fn disabled_tools(home: &Path) -> Vec<String> {
+    crate::ingest::read_config(home)[CFG_DISABLED_TOOLS]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+/// tools/list 的应答：去掉用户停用的工具。工具定义随每次请求发给模型，停用
+/// 用不到的工具可减少每个对话的固定开销。停用只影响列表：已在运行的对话
+/// 仍持有旧列表，对停用工具的调用照常执行。
+fn visible_tools(home: &Path) -> Value {
+    let off = disabled_tools(home);
+    let mut list = tools_list();
+    if let Some(tools) = list["tools"].as_array_mut() {
+        tools.retain(|t| !off.iter().any(|h| t["name"].as_str() == Some(h.as_str())));
+    }
+    list
+}
+
+/// 每个工具的定义大小、统计窗口内的调用次数与返回字节数、是否停用、接入指令
+/// 是否提到它（CLI `tools list` 与设置页共用）。调用次数与返回量的记录起点
+/// 不同（返回量自 schema v19 起才有），两个起点分别给出。
+pub fn tool_inventory(home: &Path, conn: &rusqlite::Connection) -> anyhow::Result<Value> {
+    let off = disabled_tools(home);
+    let mut stmt = conn.prepare(
+        "SELECT name, COUNT(*), COALESCE(SUM(bytes), 0) FROM usage_log
+         WHERE source = 'mcp' AND ts >= strftime('%Y-%m-%dT%H:%M:%fZ','now',?1) GROUP BY name",
+    )?;
+    let usage: HashMap<String, (i64, i64)> = stmt
+        .query_map([format!("-{TOOL_USAGE_DAYS} days")], |r| {
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
+        })?
+        .collect::<Result<_, _>>()?;
+    // import_on_init 是握手时的自动导入，不是工具调用
+    let (recorded_since, bytes_recorded_since): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT MIN(ts), MIN(CASE WHEN bytes IS NOT NULL THEN ts END) FROM usage_log
+             WHERE source = 'mcp' AND name <> 'import_on_init'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+    let tools: Vec<Value> = tools_list()["tools"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| {
+            let name = t["name"].as_str().unwrap_or_default().to_string();
+            let (calls, response_bytes) = usage.get(&name).copied().unwrap_or((0, 0));
+            json!({
+                "definition_chars": serde_json::to_string(&t).map(|s| s.chars().count()).unwrap_or(0),
+                "calls": calls,
+                "response_bytes": response_bytes,
+                "disabled": off.contains(&name),
+                "in_instructions": mentions(crate::setup::INSTRUCTION_BLOCK, &name),
+                "name": name,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "days": TOOL_USAGE_DAYS,
+        "recorded_since": recorded_since,
+        "bytes_recorded_since": bytes_recorded_since,
+        "tools": tools,
+    }))
+}
+
+/// 文本里是否出现这个工具名：按完整标识符匹配，`unlink_task` 不算提到 `link_task`。
+fn mentions(text: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(i, _)| {
+        !text[..i].chars().next_back().is_some_and(ident)
+            && !text[i + name.len()..].chars().next().is_some_and(ident)
+    })
+}
+
+/// 停用或恢复一个工具，对新开的对话生效。
+pub fn set_tool_disabled(home: &Path, name: &str, disabled: bool) -> anyhow::Result<Value> {
+    let known = tools_list()["tools"]
+        .as_array()
+        .is_some_and(|ts| ts.iter().any(|t| t["name"] == name));
+    anyhow::ensure!(known, "unknown tool: {name}");
+    crate::ingest::update_config(home, |cfg| {
+        let mut list: Vec<String> = cfg[CFG_DISABLED_TOOLS]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        list.retain(|t| t != name);
+        if disabled {
+            list.push(name.to_string());
+        }
+        list.sort();
+        cfg[CFG_DISABLED_TOOLS] = json!(list);
+        Ok(())
+    })?;
+    Ok(json!({
+        "ok": true,
+        "name": name,
+        "disabled": disabled,
+        "in_instructions": mentions(crate::setup::INSTRUCTION_BLOCK, name),
+    }))
+}
+
 fn tools_list() -> Value {
     let project = json!({"type":"string"});
     let text = json!({"type":"string"});
@@ -704,5 +826,78 @@ mod tests {
             &json!({"jsonrpc":"2.0","method":"notifications/initialized"})
         )
         .is_none());
+    }
+
+    #[test]
+    fn disabled_tool_leaves_the_list_and_usage_records_response_size() {
+        let home = tempfile::tempdir().unwrap();
+        let names = || -> Vec<String> {
+            let list = handle(
+                home.path(),
+                &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+            )
+            .unwrap();
+            list["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let started = crate::now_iso();
+        let all = names().len();
+        assert!(set_tool_disabled(home.path(), "no_such_tool", true).is_err());
+        set_tool_disabled(home.path(), "list_artifacts", true).unwrap();
+        assert_eq!(names().len(), all - 1);
+        assert!(!names().contains(&"list_artifacts".to_string()));
+
+        // 已在运行的对话仍持有旧列表：对停用工具的调用照常执行
+        let called = call_tool(
+            home.path(),
+            json!(2),
+            &json!({"name":"list_artifacts", "arguments":{}}),
+        );
+        assert_ne!(called["result"]["isError"], true);
+        let text_len = called["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .len();
+
+        let conn = db::open(home.path()).unwrap();
+        // 升级前的调用没有返回量；握手时的自动导入不算工具调用
+        conn.execute(
+            "INSERT INTO usage_log(ts, source, name) VALUES
+             ('2020-01-01T00:00:00.000Z','mcp','import_on_init'),
+             ('2020-01-02T00:00:00.000Z','mcp','get_recent_work')",
+            [],
+        )
+        .unwrap();
+        let inv = tool_inventory(home.path(), &conn).unwrap();
+        assert_eq!(inv["recorded_since"], "2020-01-02T00:00:00.000Z");
+        assert!(inv["bytes_recorded_since"].as_str().unwrap() >= started.as_str());
+        let tools = inv["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), all, "清单列出全部工具，含已停用的");
+        for t in tools {
+            let listed = tools_list()["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["name"] == t["name"])
+                .map(|d| serde_json::to_string(d).unwrap().chars().count())
+                .unwrap();
+            assert_eq!(t["definition_chars"], listed);
+        }
+        let row = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap();
+        assert_eq!(row("list_artifacts")["disabled"], true);
+        assert_eq!(row("list_artifacts")["calls"], 1);
+        assert_eq!(row("list_artifacts")["response_bytes"], text_len);
+        assert_eq!(row("get_dossier")["calls"], 0);
+        assert_eq!(row("search_history")["in_instructions"], true);
+        assert_eq!(row("list_artifacts")["in_instructions"], false);
+        assert!(mentions("先调 `link_task`，再继续", "link_task"));
+        assert!(!mentions("只提到 unlink_task", "link_task"));
+
+        set_tool_disabled(home.path(), "list_artifacts", false).unwrap();
+        assert_eq!(names().len(), all);
     }
 }

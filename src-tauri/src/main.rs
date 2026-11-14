@@ -1356,6 +1356,24 @@ async fn agents_detect() -> Result<Value, String> {
     .await
 }
 
+/// 提供给 agent 的 MCP 工具清单与用量（设置 → 接入）。
+#[tauri::command]
+async fn mcp_tools() -> Result<Value, String> {
+    run_blocking(|| yourmem::mcp::tool_inventory(&data_home(), &open()?).map_err(|e| e.to_string())).await
+}
+
+/// 只改 config.json：资料库暂时打不开时照常生效，只是不记这次操作。
+#[tauri::command]
+async fn mcp_tool_set_disabled(name: String, disabled: bool) -> Result<Value, String> {
+    run_blocking(move || {
+        if let Ok(conn) = open() {
+            let _ = db::log_usage(&conn, "app", "mcp_tool_set_disabled");
+        }
+        yourmem::mcp::set_tool_disabled(&data_home(), &name, disabled).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 #[tauri::command]
 fn agent_add_root(agent: String, path: String) -> Result<Value, String> {
     let conn = open()?;
@@ -1998,6 +2016,8 @@ fn main() {
             memory_files,
             memory_file_show,
             agents_detect,
+            mcp_tools,
+            mcp_tool_set_disabled,
             agent_add_root,
             agent_remove_root,
             bundle_create,

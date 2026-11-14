@@ -258,18 +258,26 @@ fn archive_objects(conn: &Connection, home: &Path, backup_dir: &Path) -> Result<
         let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
+    if pending.is_empty() {
+        return Ok((0, 0));
+    }
+    // 整个队列的引用一次查完：vault_lines 没有按 hash 的索引，逐个查询每次都是整表扫描
+    let referenced: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT hash FROM vault_lines WHERE hash IN (SELECT hash FROM gc_pending)
+             UNION
+             SELECT hash FROM memory_revisions WHERE hash IN (SELECT hash FROM gc_pending)",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
     let store = crate::vault::Store::open(home)?;
     let mut removed = 0u64;
     let mut kept = 0u64;
     for hash in pending {
-        let referenced: i64 = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM vault_lines WHERE hash = ?1)
-                + EXISTS(SELECT 1 FROM memory_revisions WHERE hash = ?1)",
-            params![hash],
-            |r| r.get(0),
-        )?;
-        if referenced > 0 || !store.contains(&hash)? {
-            if referenced > 0 {
+        let referenced = referenced.contains(&hash);
+        if referenced || !store.contains(&hash)? {
+            if referenced {
                 kept += 1;
             }
             conn.execute("DELETE FROM gc_pending WHERE hash = ?1", params![hash])?;
@@ -341,10 +349,16 @@ pub fn trash_overdue_plan(conn: &Connection, home: &Path) -> Result<Value> {
         .iter()
         .map(|h| store.stored_len(h).map(|n| n.unwrap_or(0)))
         .sum::<Result<u64>>()?;
+    // 每个会话只列消息数与归档行数；独占对象按集合在上面算过一次
     let mut plans = Vec::new();
     for sid in &overdue {
-        let p = purge_plan(conn, home, sid)?;
-        plans.push(json!({ "session_id": sid, "messages": p["messages"], "vault_lines": p["vault_lines"] }));
+        let (messages, vault_lines): (i64, i64) = conn.query_row(
+            "SELECT message_count, (SELECT COUNT(*) FROM vault_lines WHERE session_id = ?1)
+             FROM sessions WHERE id = ?1",
+            params![sid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        plans.push(json!({ "session_id": sid, "messages": messages, "vault_lines": vault_lines }));
     }
     Ok(json!({
         "overdue_sessions": plans,
